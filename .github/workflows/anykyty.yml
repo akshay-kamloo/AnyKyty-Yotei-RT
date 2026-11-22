@@ -155,7 +155,7 @@ jobs:
         run: |
           python3 -I tools/kyty_pgo.py check || echo "The Kyty PGO profile is older than the sources listed above; the report after the build says which hot functions lost their counts."
       - id: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.24
+        uses: hendrikmuhs/ccache-action@v1.2.26
         with:
           key: linux-${{ matrix.name }}
           max-size: 3G
@@ -298,7 +298,7 @@ jobs:
           llvm-profdata --version | head -2 || echo "::warning::llvm-profdata is missing from the LLVM release: kyty_gpu is built without its PGO profile"
           cmake --version | head -1
       - id: ccache
-        uses: hendrikmuhs/ccache-action@v1.2.24
+        uses: hendrikmuhs/ccache-action@v1.2.26
         with:
           key: windows-kyty
           max-size: 3G

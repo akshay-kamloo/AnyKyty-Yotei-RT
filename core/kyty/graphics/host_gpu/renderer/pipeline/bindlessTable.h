@@ -516,7 +516,9 @@ public:
 		std::array<uint32_t, 8> memo_resource {};
 		uint64_t    memo_address    = 0;
 		uint64_t    memo_size       = 0;
-		uint64_t    memo_page_sum   = 0; // DrawRepeat::ImagePageEpochSumExact
+		uint64_t    memo_page_sum      = 0; // DrawRepeat::ImagePageEpochSumExact
+		uint64_t    memo_global_epoch  = 0; // v20-global-epoch-everywhere
+		uint64_t    event_global_epoch = 0; // v20-global-epoch-everywhere
 		// Refresh events: the last refresh replayed (only touched the image; event_valid, above) for a table
 		// of this view (event_view, above); while the image's change serial and the range's page epochs stay, the next
 		// refresh would replay again.

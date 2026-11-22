@@ -137,7 +137,7 @@ public:
 		Class    klass = Create;
 		BufferId id {};
 		uint64_t offset       = 0;
-		uint64_t buffer_epoch = 0, image_sum = 0, region = 0;
+		uint64_t buffer_epoch = 0, image_sum = 0, image_global_epoch = 0, region = 0;
 		uint32_t epochs[2] {};
 		uint32_t regions = 0;
 		bool     bda     = false; // ObtainBdaRange's peek: no image in the proof

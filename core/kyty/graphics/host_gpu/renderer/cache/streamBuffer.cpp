@@ -449,6 +449,7 @@ std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignmen
 	const bool wrap = aligned_offset > Size() - mapped_size;
 	if (wrap) {
 		aligned_offset = 0;
+		++m_wrap_epoch;
 	}
 
 	auto wait_cursor = wrap ? size_t {0} : m_wait_cursor;

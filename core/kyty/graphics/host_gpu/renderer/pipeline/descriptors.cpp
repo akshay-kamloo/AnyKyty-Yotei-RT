@@ -1804,11 +1804,44 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
                                              std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto& command_buffer = context.GetCommandScheduler().Current();
+	auto& scheduler      = context.GetCommandScheduler();
+	auto& command_buffer = scheduler.Current();
 	EXIT_IF(command_buffer.IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
-	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
-	return {buffer.Handle(), offset, data.size_bytes()};
+	const auto bytes  = data.size_bytes();
+	// v19-rebind-dedup-opt: O(1) 64-slot per-tick content-dedup cache for small SRT / shader_data uploads (<= 256 B).
+	if (bytes <= 256u) {
+		struct UploadDedupSlot {
+			uint64_t   tick       = 0;
+			uint64_t   wrap_epoch = 0;
+			uint64_t   hash       = 0;
+			vk::Buffer handle {};
+			uint64_t   offset     = 0;
+			uint32_t   bytes      = 0;
+			uint32_t   words[64] {};
+		};
+		thread_local std::array<UploadDedupSlot, 64> t_upload_dedup {};
+		const uint64_t tick       = scheduler.CurrentTick();
+		const uint64_t wrap_epoch = buffer.WrapEpoch();
+		const uint64_t hash       = XXH3_64bits(data.data(), bytes);
+		auto&          slot       = t_upload_dedup[static_cast<size_t>(hash & 63u)];
+		if (slot.tick == tick && slot.wrap_epoch == wrap_epoch && slot.hash == hash &&
+		    slot.bytes == bytes && slot.handle == buffer.Handle() &&
+		    std::memcmp(slot.words, data.data(), bytes) == 0) {
+			return {slot.handle, slot.offset, bytes};
+		}
+		const auto offset = buffer.Copy(data.data(), bytes, 256);
+		slot.tick         = tick;
+		slot.wrap_epoch   = buffer.WrapEpoch();
+		slot.hash         = hash;
+		slot.handle       = buffer.Handle();
+		slot.offset       = offset;
+		slot.bytes        = static_cast<uint32_t>(bytes);
+		std::memcpy(slot.words, data.data(), bytes);
+		return {slot.handle, offset, bytes};
+	}
+	const auto offset = buffer.Copy(data.data(), bytes, 256);
+	return {buffer.Handle(), offset, bytes};
 }
 
 RenderExecutor::PlanImageFlags* RenderExecutor::PrepFlags() const {
@@ -3513,9 +3546,12 @@ void RenderExecutor::RefreshTableSlots(BindlessTable::Table& table, uint64_t fra
 	// The replay check: what the slot's last replay read is as then (the next refresh would replay again).
 	const auto unchanged = [&](const BindlessTable::TableSlotInfo& info, uint32_t generation) {
 		const auto* image = texture_cache.m_slot_images.try_get(info.image);
-		return info.event_valid && !info.gpu_written && info.event_view == view_tag && info.memo_generation == generation &&
-		       image != nullptr && image->registered && image->change_serial == info.event_serial &&
-		       DrawRepeat::ImagePageEpochSumExact(image->info.data.address, image->info.data.size) == info.event_image_sum &&
+		if (!(info.event_valid && !info.gpu_written && info.event_view == view_tag && info.memo_generation == generation &&
+		      image != nullptr && image->registered && image->change_serial == info.event_serial))
+			return false;
+		const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		if (info.event_global_epoch == cur_global && info.memo_global_epoch == cur_global) return true;
+		return DrawRepeat::ImagePageEpochSumExact(image->info.data.address, image->info.data.size) == info.event_image_sum &&
 		       DrawRepeat::ImagePageEpochSum(image->info.data.address, image->info.data.size) == info.event_image_alias_sum &&
 		       DrawRepeat::ImagePageEpochSumExact(info.memo_address, info.memo_size) == info.memo_page_sum;
 	};
@@ -3717,7 +3753,11 @@ bool RenderExecutor::RefreshTableSlot(BindlessTable::Table& table, uint32_t slot
 	// The memo's pages unchanged, by the epochs without aliasing (DrawRepeat::ImagePageEpochSumExact): a registry change in
 	// another 64 GiB lane does not force the full lookup.
 	const auto     pages_same    = [&] {
-		return DrawRepeat::ImagePageEpochSumExact(info.memo_address, info.memo_size) == info.memo_page_sum;
+		const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		if (info.memo_global_epoch == cur_global) return true;
+		if (DrawRepeat::ImagePageEpochSumExact(info.memo_address, info.memo_size) != info.memo_page_sum) return false;
+		info.memo_global_epoch = cur_global;
+		return true;
 	};
 	const ImageId  memo_image    = info.image;
 	ShaderRecompiler::IR::DescriptorValue value {};
@@ -3744,7 +3784,8 @@ bool RenderExecutor::RefreshTableSlot(BindlessTable::Table& table, uint32_t slot
 		info.event_valid      = !info.gpu_written;
 		info.event_serial     = image->change_serial;
 		info.event_view       = XXH3_64bits(&table.view, sizeof(table.view));
-		info.event_image_sum  = DrawRepeat::ImagePageEpochSumExact(image->info.data.address, image->info.data.size);
+		info.event_global_epoch    = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		info.event_image_sum       = DrawRepeat::ImagePageEpochSumExact(image->info.data.address, image->info.data.size);
 		info.event_image_alias_sum = DrawRepeat::ImagePageEpochSum(image->info.data.address, image->info.data.size);
 		// The slot journal: the page index lists the slot under the pages whose epochs this check reads.
 		if (info.event_valid)
@@ -3773,7 +3814,8 @@ bool RenderExecutor::RefreshTableSlot(BindlessTable::Table& table, uint32_t slot
 		info.memo_generation = generation;
 		info.memo_address    = resolved.desc.info.data.address;
 		info.memo_size       = resolved.desc.info.data.size;
-		info.memo_page_sum   = DrawRepeat::ImagePageEpochSumExact(info.memo_address, info.memo_size);
+		info.memo_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		info.memo_page_sum     = DrawRepeat::ImagePageEpochSumExact(info.memo_address, info.memo_size);
 	}
 	image           = texture_cache.m_slot_images.try_get(resolved.image_id);
 	if (image == nullptr || view == nullptr || !image->registered || !info.live || info.generation != generation)
@@ -3856,7 +3898,8 @@ struct ImageReplaySlot {
 	uint32_t                compare_funcs = 0;
 	uint32_t                dword_count   = 0;
 	uint64_t                shader_hash   = 0;
-	uint64_t                page_sum      = 0;
+	uint64_t                page_sum           = 0;
+	uint64_t                image_global_epoch = 0;
 	std::array<uint32_t, 8> words {};
 	ImageId                 id;
 	TextureCache::ImageDesc desc;
@@ -3881,9 +3924,13 @@ static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const
                                            uint32_t slot, const ShaderRecompiler::IR::DescriptorValue& value,
                                            uint32_t compare_funcs, Resolve&& resolve) {
 	auto&      memo = ImageReplaySlots()[reinterpret_cast<uint64_t>(&program) * 64u + slot];
-	const bool same = memo.valid && memo.shader_hash == program.shader_hash && memo.dword_count == value.dword_count &&
-	                  memo.words == value.dwords && memo.compare_funcs == compare_funcs && memo.soft == soft &&
-	                  memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.desc.info.data.address, memo.desc.info.data.size);
+	const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+	bool       same       = memo.valid && memo.shader_hash == program.shader_hash && memo.dword_count == value.dword_count &&
+	                  memo.words == value.dwords && memo.compare_funcs == compare_funcs && memo.soft == soft;
+	if (same && memo.image_global_epoch != cur_global) {
+		same = memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.desc.info.data.address, memo.desc.info.data.size);
+		if (same) memo.image_global_epoch = cur_global;
+	}
 	if (same) {
 		if (const auto id = cache.ReplayImage(memo.id)) {
 			g_slot_exact = true;
@@ -3904,14 +3951,16 @@ static TextureBinding ResolveTextureReplay(TextureCache& cache, bool soft, const
 	                              : static_cast<uint8_t>(cache.ImageReplayable(binding.image_id) ? 9u : 3u + cache.ImageReplayableWhy(binding.image_id));
 	if (memo.why == 8u && t_stencil_tail) memo.why = 10u; // a one-byte stencil reader (n3-s2b-one-byte.md)
 	if (plain && binding.desc.type == TextureCache::BindingType::Texture && replayable) {
-		const auto page_sum = DrawRepeat::ImagePageEpochSum(binding.desc.info.data.address, binding.desc.info.data.size);
+		const auto store_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		const auto page_sum     = DrawRepeat::ImagePageEpochSum(binding.desc.info.data.address, binding.desc.info.data.size);
 		if (DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == epoch) {
-			memo.valid         = true;
-			memo.soft          = soft;
-			memo.compare_funcs = compare_funcs;
-			memo.dword_count   = value.dword_count;
-			memo.shader_hash   = program.shader_hash;
-			memo.page_sum      = page_sum;
+			memo.valid              = true;
+			memo.soft               = soft;
+			memo.compare_funcs      = compare_funcs;
+			memo.dword_count        = value.dword_count;
+			memo.shader_hash        = program.shader_hash;
+			memo.page_sum           = page_sum;
+			memo.image_global_epoch = store_global;
 			memo.words         = value.dwords;
 			memo.id            = binding.image_id;
 			memo.desc          = binding.desc;
@@ -3966,6 +4015,7 @@ struct TableSet {
 	std::vector<TextureBinding> images;
 	std::vector<uint8_t>        memo;
 	std::vector<uint64_t>       page_sums;
+	uint64_t                    image_global_epoch = 0;
 	std::vector<ImageId>        member_ids;
 	std::vector<vk::Sampler>    samplers;
 };
@@ -4387,12 +4437,15 @@ bool RenderExecutor::PeekStageImages(const ShaderRecompiler::IR::CompiledShaderI
 			const size_t found = TableSetFindHashed(program, snapshot, soft, list);
 			const TableSet* candidate = found < list.size() ? list[found].get() : nullptr;
 			if (candidate != nullptr && candidate->views_ready) {
-				bool   pages  = true;
-				size_t member = 0;
-				for (size_t i = 0; i < candidate->images.size() && pages; i++) {
-					if (candidate->memo[i] == 0u) continue;
-					const auto& data = candidate->images[i].desc.info.data;
-					pages = DrawRepeat::ImagePageEpochSum(data.address, data.size) == candidate->page_sums[member++];
+				const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+				bool       pages      = true;
+				if (candidate->image_global_epoch != cur_global) {
+					size_t member = 0;
+					for (size_t i = 0; i < candidate->images.size() && pages; i++) {
+						if (candidate->memo[i] == 0u) continue;
+						const auto& data = candidate->images[i].desc.info.data;
+						pages = DrawRepeat::ImagePageEpochSum(data.address, data.size) == candidate->page_sums[member++];
+					}
 				}
 				if (pages && cache.TableReplayStageChecks(candidate->member_ids) &&
 				    cache.TableTexturesReadyChecks(candidate->member_ids)) {
@@ -4424,10 +4477,12 @@ bool RenderExecutor::PeekStageImages(const ShaderRecompiler::IR::CompiledShaderI
 		const auto&    slots         = ImageReplaySlots();
 		const auto     it            = slots.find(reinterpret_cast<uint64_t>(&program) * 64u + i);
 		const auto&    value         = snapshot.images[i];
+		const auto     cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
 		const bool     same = it != slots.end() && it->second.valid && it->second.shader_hash == program.shader_hash &&
 		                  it->second.dword_count == value.dword_count && it->second.words == value.dwords &&
 		                  it->second.compare_funcs == compare_funcs && it->second.soft == soft &&
-		                  it->second.page_sum == DrawRepeat::ImagePageEpochSum(it->second.desc.info.data.address, it->second.desc.info.data.size);
+		                  (it->second.image_global_epoch == cur_global ||
+		                   it->second.page_sum == DrawRepeat::ImagePageEpochSum(it->second.desc.info.data.address, it->second.desc.info.data.size));
 		const ImageId id = same ? cache.ReplayImageCheck(it->second.id) : ImageId {};
 		if (!id) {
 			klass = PeekImages::ReplayMiss;
@@ -4673,12 +4728,16 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 			table_set = list[0].get();
 		}
 		if (table_set != nullptr && table_set->views_ready) {
-			bool   pages  = true;
-			size_t member = 0;
-			for (size_t i = 0; i < table_set->images.size() && pages; i++) {
-				if (table_set->memo[i] == 0u) continue;
-				const auto& data = table_set->images[i].desc.info.data;
-				pages = DrawRepeat::ImagePageEpochSum(data.address, data.size) == table_set->page_sums[member++];
+			const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+			bool       pages      = true;
+			if (table_set->image_global_epoch != cur_global) {
+				size_t member = 0;
+				for (size_t i = 0; i < table_set->images.size() && pages; i++) {
+					if (table_set->memo[i] == 0u) continue;
+					const auto& data = table_set->images[i].desc.info.data;
+					pages = DrawRepeat::ImagePageEpochSum(data.address, data.size) == table_set->page_sums[member++];
+				}
+				if (pages) table_set->image_global_epoch = cur_global;
 			}
 			const bool ok = pages && m_context.GetTextureCache().TableReplayStage(table_set->member_ids);
 			if (ok) {
@@ -4757,6 +4816,7 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 				table_set->images      = prepared.images;
 				table_set->samplers    = prepared.samplers;
 				table_set->memo.assign(prepared.images.size(), 0u);
+				table_set->image_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
 				table_set->page_sums.clear();
 				table_set->member_ids.clear();
 				for (size_t i = 0; i < prepared.images.size(); i++) {

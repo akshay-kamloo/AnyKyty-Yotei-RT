@@ -37,6 +37,7 @@ namespace DrawRepeat {
 // record it changes (always under the texture cache's lock), and for every buffer the buffer cache registers or
 // unregisters. Equal values mean the registry is unchanged in between (they only rise).
 inline std::atomic<uint64_t> g_image_registry_epoch {1};
+inline std::atomic<uint64_t> g_image_page_global_epoch {1}; // v19-rebind-dedup-opt: O(1) fast-path guard for ImagePageEpochSum
 inline std::atomic<uint64_t> g_buffer_registry_epoch {1};
 inline void NoteImageRegistryChange() {
 	g_image_registry_epoch.fetch_add(1, std::memory_order_relaxed);
@@ -66,6 +67,7 @@ inline void NoteImagePagesChange(uint64_t address, uint64_t size) {
 		g_image_page_epochs[page & (kImagePageEpochCount - 1u)].fetch_add(1, std::memory_order_relaxed);
 		g_image_page_epochs_exact[page & (kImagePageEpochExactCount - 1u)].fetch_add(1, std::memory_order_relaxed);
 	}
+	g_image_page_global_epoch.fetch_add(1, std::memory_order_release);
 }
 inline void NoteImageRegistryChange(uint64_t address, uint64_t size) {
 	NoteImageRegistryChange();

@@ -2989,7 +2989,8 @@ struct ObtainMemoEntry {
 	uint64_t vaddr        = 0;
 	uint64_t size         = 0;
 	uint64_t buffer_epoch = 0;
-	uint64_t image_sum    = 0;
+	uint64_t image_sum          = 0;
+	uint64_t image_global_epoch = 0;
 	uint64_t region       = 0; // the first 4 MiB tracker region of the range
 	uint32_t epochs[2] {};
 	uint32_t regions = 0;      // 1 or 2; 0: empty
@@ -3052,7 +3053,8 @@ const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
 			return nullptr;
 		}
 	}
-	if (DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
+	if (e.image_global_epoch != DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire) &&
+	    DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
 		miss[4]++;
 		return nullptr;
 	}
@@ -3272,7 +3274,8 @@ uint32_t BufferCache::PeekProofFail(const BufferPeek& peek, uint64_t vaddr, uint
 	for (uint32_t i = 0; i < peek.regions; i++) {
 		if (table[peek.region + i].load(std::memory_order_acquire) != peek.epochs[i]) return 2;
 	}
-	return peek.bda || DrawRepeat::ImagePageEpochSum(vaddr, size) == peek.image_sum ? 0 : 3; // the BDA path touches no image
+	if (peek.bda || peek.image_global_epoch == DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire)) return 0;
+	return DrawRepeat::ImagePageEpochSum(vaddr, size) == peek.image_sum ? 0 : 3; // the BDA path touches no image
 }
 
 BufferCache::BufferPeek BufferCache::PeekBuffer(uint64_t vaddr, uint64_t size, bool is_written, bool is_texel_buffer, BufferId hint,
@@ -3350,7 +3353,8 @@ BufferCache::BufferPeek BufferCache::PeekBuffer(uint64_t vaddr, uint64_t size, b
 		}
 		static_cast<void>(is_texel_buffer); // a formatted read with no image at the address does nothing more today
 		const bool proof = ObtainMemoRegions(vaddr, size, p.region, p.regions, p.epochs);
-		p.image_sum      = DrawRepeat::ImagePageEpochSum(vaddr, size);
+		p.image_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		p.image_sum          = DrawRepeat::ImagePageEpochSum(vaddr, size);
 		const bool clean = m_memory_tracker.PeekCpuClean(vaddr, size);
 		if (!bda && size <= CACHING_PAGESIZE && !clean && !m_memory_tracker.PeekGpuModified(vaddr, size)) {
 			p.klass = BufferPeek::Stream;
@@ -3800,7 +3804,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 			fresh.vaddr        = vaddr;
 			fresh.size         = size;
 			fresh.buffer_epoch = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
-			fresh.image_sum    = DrawRepeat::ImagePageEpochSum(vaddr, size);
+			fresh.image_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+			fresh.image_sum          = DrawRepeat::ImagePageEpochSum(vaddr, size);
 			fresh.id           = id;
 			ObtainMemoStore(vaddr, size, fresh);
 			ObtainMemoStatsRef().stores++;

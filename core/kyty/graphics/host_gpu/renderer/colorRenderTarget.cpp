@@ -66,7 +66,8 @@ struct TargetReplaySlot {
 	bool            exact_format = false;
 	uint32_t        mask         = 0;
 	uint32_t        slice_offset = 0;
-	uint64_t        page_sum     = 0;
+	uint64_t        page_sum           = 0;
+	uint64_t        image_global_epoch = 0;
 	HW::RenderTarget rt {};
 	RenderColorInfo r;
 };
@@ -317,11 +318,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const bool                           replay = rt_slot < 8u;
 	static thread_local TargetReplaySlot replay_slots[8];
 	if (replay && rt.base.addr != 0 && mask != 0) {
-		const auto& memo = replay_slots[rt_slot];
-		if (memo.valid && memo.mask == mask && memo.slice_offset == render_target_slice_offset &&
-		    memo.ignore_mask == ignore_target_mask && memo.exact_format == exact_format &&
-		    std::memcmp(&memo.rt, &rt, sizeof(rt)) == 0 &&
-		    memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.r.desc.info.data.address, memo.r.desc.info.data.size)) {
+		auto&      memo       = replay_slots[rt_slot];
+		const auto cur_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		bool       rt_same    = memo.valid && memo.mask == mask && memo.slice_offset == render_target_slice_offset &&
+		                  memo.ignore_mask == ignore_target_mask && memo.exact_format == exact_format &&
+		                  std::memcmp(&memo.rt, &rt, sizeof(rt)) == 0;
+		if (rt_same && memo.image_global_epoch != cur_global) {
+			rt_same = memo.page_sum == DrawRepeat::ImagePageEpochSum(memo.r.desc.info.data.address, memo.r.desc.info.data.size);
+			if (rt_same) memo.image_global_epoch = cur_global;
+		}
+		if (rt_same) {
 			if (const auto id = m_context.GetTextureCache().ReplayImage(memo.r.image_id)) {
 				r          = memo.r;
 				r.image_id = id;
@@ -342,14 +348,16 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	auto& memo = replay_slots[rt_slot];
 	memo.valid = false;
 	if (plain && r.desc.info.metadata.kind == ImageMetadataKind::None && texture_cache.ImageReplayable(r.image_id)) {
-		const auto page_sum = DrawRepeat::ImagePageEpochSum(r.desc.info.data.address, r.desc.info.data.size);
+		const auto store_global = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+		const auto page_sum     = DrawRepeat::ImagePageEpochSum(r.desc.info.data.address, r.desc.info.data.size);
 		if (DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire) == epoch) {
-			memo.valid        = true;
-			memo.ignore_mask  = ignore_target_mask;
-			memo.exact_format = exact_format;
-			memo.mask         = mask;
-			memo.slice_offset = render_target_slice_offset;
-			memo.page_sum     = page_sum;
+			memo.valid              = true;
+			memo.ignore_mask        = ignore_target_mask;
+			memo.exact_format       = exact_format;
+			memo.mask               = mask;
+			memo.slice_offset       = render_target_slice_offset;
+			memo.page_sum           = page_sum;
+			memo.image_global_epoch = store_global;
 			memo.rt           = rt;
 			memo.r            = r;
 		}

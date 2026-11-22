@@ -217,6 +217,7 @@ void Run() {
 void StartIfEnabled() {
 	const char* value = std::getenv("KYTY_DIAG_STALL_WATCH");
 	if (value == nullptr || value[0] != '1') return;
+	g_enabled.store(true, std::memory_order_relaxed);
 	std::fprintf(stderr, "DIAG_STALL_WATCH enabled\n");
 	std::thread(Run).detach();
 }

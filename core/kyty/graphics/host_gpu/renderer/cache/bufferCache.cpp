@@ -1532,9 +1532,10 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 		plan.fallback = CallerFallback::NoMapping;
 		return plan;
 	}
-	std::vector<std::pair<uint64_t, uint64_t>> intervals;
-	uint64_t                                   newest = 0;
-	uint64_t                                   total  = 0;
+	static thread_local std::vector<std::pair<uint64_t, uint64_t>> intervals;
+	intervals.clear();
+	uint64_t                                                       newest = 0;
+	uint64_t                                                       total  = 0;
 	if (const int scan = ScanBarDownload(buffer, lo, hi - lo, intervals, newest, total); scan >= 0) {
 		if (scan != 6) plan.fallback = scan == 5 ? CallerFallback::Outside : CallerFallback::UnknownTick;
 		return plan;
@@ -1568,8 +1569,7 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 	}
 	if (!m_bar_pending_writes.empty()) {
 		for (const auto& [start, end]: intervals) {
-			if (std::ranges::any_of(m_bar_pending_writes,
-			                        [&](const auto& w) { return w.first < end && start < w.first + w.second; })) {
+			if (HasBarPendingOverlap(start, end)) {
 				plan.fallback = CallerFallback::Pending;
 				return plan;
 			}
@@ -1759,7 +1759,7 @@ BufferCache::CpWriteDecline BufferCache::CpWriteThroughOwnedPage(uint64_t addres
 	if (replaces_gpu_bytes && !replace) return CpWriteDecline::Overlap;
 	// A binding obtained for writing whose tick is not final, or an eager copy that will publish the page's older bytes.
 	// (An eager copy in flight that holds none of the written bytes publishes only its own bytes: no conflict.)
-	if (std::ranges::any_of(m_bar_pending_writes, [&](const auto& w) { return w.first < address + size && address < w.first + w.second; }) ||
+	if (HasBarPendingOverlap(address, address + size) ||
 	    PendingReadbackCovers(address, size)) {
 		return CpWriteDecline::Pending;
 	}
@@ -3832,7 +3832,7 @@ void BufferCache::NoteObtainedWrite(uint64_t vaddr, uint64_t size) {
 		const DispatchSubTimer tick_timer(DispatchSub::OwWriteTick); // KYTY_TRACE_DISPATCH_CENSUS
 		NoteGpuWriteTick(vaddr, size);
 	}
-	m_bar_pending_writes.emplace_back(vaddr, size);
+	AddBarPendingWrite(vaddr, size);
 }
 
 void BufferCache::NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool same_tick) {
@@ -3846,7 +3846,7 @@ void BufferCache::NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool sa
 	if (m_gpu_write_observer) m_gpu_write_observer(vaddr, size);
 	BumpHotGeneration(vaddr, size);
 	if (!same_tick) NoteGpuWriteTick(vaddr, size);
-	m_bar_pending_writes.emplace_back(vaddr, size); // the recording command buffer's tick is final
+	AddBarPendingWrite(vaddr, size); // the recording command buffer's tick is final
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRange(uint64_t vaddr, uint64_t size, bool is_written,
@@ -4184,18 +4184,37 @@ void BufferCache::RecordHotRead(uint64_t vaddr) {
 		hot.last_use = m_hot_clock;
 		return;
 	}
-	constexpr size_t MaxHot = 64;
+	constexpr size_t MaxHot = 512;
 	if (m_hot_reads.size() >= MaxHot) {
-		auto         oldest = std::ranges::min_element(m_hot_reads, {}, &HotRead::last_use);
-		const size_t slot   = static_cast<size_t>(oldest - m_hot_reads.begin());
-		m_hot_read_index.erase(oldest->start);
-		*oldest             = {};
-		oldest->start       = start;
-		oldest->end         = start + Window;
-		oldest->hits        = 1;
-		oldest->last_use    = m_hot_clock;
-		m_hot_read_index.emplace(start, slot);
-		RecomputeHotBounds();
+		size_t   victim   = m_hot_evict_cursor % m_hot_reads.size();
+		uint64_t best_use = m_hot_reads[victim].last_use;
+		for (size_t probe = 0; probe < 8u; ++probe) {
+			const size_t idx = (m_hot_evict_cursor + probe) % m_hot_reads.size();
+			if (m_hot_clock - m_hot_reads[idx].last_use > 256u) {
+				victim = idx;
+				break;
+			}
+			if (m_hot_reads[idx].last_use < best_use) {
+				best_use = m_hot_reads[idx].last_use;
+				victim   = idx;
+			}
+		}
+		m_hot_evict_cursor = (victim + 1u) % m_hot_reads.size();
+		auto&      old     = m_hot_reads[victim];
+		const bool on_edge = (old.start == m_hot_min_start || old.end == m_hot_max_end);
+		m_hot_read_index.erase(old.start);
+		old          = {};
+		old.start    = start;
+		old.end      = start + Window;
+		old.hits     = 1;
+		old.last_use = m_hot_clock;
+		m_hot_read_index.emplace(start, victim);
+		if (on_edge) {
+			RecomputeHotBounds();
+		} else {
+			if (start < m_hot_min_start) m_hot_min_start = start;
+			if (start + Window > m_hot_max_end) m_hot_max_end = start + Window;
+		}
 		return;
 	}
 	const size_t slot = m_hot_reads.size();
@@ -4206,7 +4225,18 @@ void BufferCache::RecordHotRead(uint64_t vaddr) {
 }
 
 void BufferCache::BumpHotGeneration(uint64_t vaddr, uint64_t size) {
-	if (m_hot_reads.empty() || vaddr >= m_hot_max_end || vaddr + size <= m_hot_min_start) return;
+	if (size == 0u || m_hot_reads.empty() || vaddr >= m_hot_max_end || vaddr + size <= m_hot_min_start) return;
+	constexpr uint64_t Window = 64u * 1024u;
+	const uint64_t     first  = vaddr & ~(Window - 1u);
+	const uint64_t     last   = (vaddr + size - 1u) & ~(Window - 1u);
+	if (last - first <= 4u * Window) {
+		for (uint64_t w = first; w <= last; w += Window) {
+			if (const auto it = m_hot_read_index.find(w); it != m_hot_read_index.end()) {
+				m_hot_reads[it->second].generation++;
+			}
+		}
+		return;
+	}
 	for (auto& hot: m_hot_reads) {
 		if (vaddr < hot.end && hot.start < vaddr + size) hot.generation++;
 	}
@@ -4242,12 +4272,23 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 		// The copy published every byte it removed from m_gpu_modified_ranges. A tracker page
 		// with no remaining (newer) GPU bytes now holds current data in guest memory; a page that
 		// still has GPU bytes stays modified, keeping "GPU-modified page <=> bytes to download".
+		uint64_t run_start = 0;
+		uint64_t run_end   = 0;
 		for (uint64_t page = entry.start; page < entry.end; page += TRACKER_PAGE_SIZE) {
-			if (!m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
-			    m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE)) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(page, TRACKER_PAGE_SIZE);
+			const bool clean = !m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE) &&
+			                   m_memory_tracker.IsRegionGpuModified(page, TRACKER_PAGE_SIZE);
+			if (clean) {
+				if (run_start == run_end) run_start = page;
+				run_end = page + TRACKER_PAGE_SIZE;
+			} else if (run_start < run_end) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(run_start, run_end - run_start);
+				run_start = run_end = 0;
 			}
 		}
+		if (run_start < run_end) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(run_start, run_end - run_start);
+		}
+		m_eager_starts.erase(entry.start);
 		entry = std::move(m_eager_readbacks.back());
 		m_eager_readbacks.pop_back();
 	}
@@ -4260,9 +4301,7 @@ void BufferCache::IssueEagerReadbacks() {
 	for (const auto& hot: m_hot_reads) {
 		if (hot.hits < 2u || m_hot_clock - hot.last_use > 256u) continue;
 		if (!m_gpu_modified_ranges.Intersects(hot.start, hot.end - hot.start)) continue;
-		if (std::ranges::any_of(m_eager_readbacks, [&](const EagerReadback& entry) {
-			    return entry.start == hot.start;
-		    })) continue;
+		if (m_eager_starts.contains(hot.start)) continue;
 		bool any = false;
 		std::vector<std::pair<uint64_t, uint64_t>> bytes;
 		m_gpu_modified_ranges.ForEachInRange(hot.start, hot.end - hot.start,
@@ -4278,6 +4317,7 @@ void BufferCache::IssueEagerReadbacks() {
 		if (!any) continue;
 		auto done = std::make_shared<std::atomic_bool>(false);
 		m_scheduler.DeferPriorityOperation([done] { done->store(true, std::memory_order_release); });
+		m_eager_starts.insert(hot.start);
 		m_eager_readbacks.push_back({.start = hot.start, .end = hot.end, .generation = hot.generation,
 		                             .tick = m_scheduler.CurrentTick(), .done = std::move(done),
 		                             .bytes = std::move(bytes)});
@@ -4433,7 +4473,7 @@ void BufferCache::NoteCommandEmitted() {
 			NoteWriteTick(vaddr, vaddr + size, m_scheduler.CurrentTick());
 		}
 	}
-	m_bar_pending_writes.clear();
+	ClearBarPendingWrites();
 }
 
 namespace {
@@ -4521,18 +4561,22 @@ BarCopyPool& GetBarCopyPool() {
 }
 
 void CopyFromWriteCombined(uint8_t* dst, const uint8_t* src, uint64_t size) {
-	const auto start = std::chrono::steady_clock::now();
+	const bool probing = g_bar_reads.load(std::memory_order_relaxed) == -1;
+	const bool timed   = probing || PerfEnabled();
+	const auto start   = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	if (size >= 262144u) {
 		GetBarCopyPool().Copy(dst, src, size);
 	} else {
 		CopyFromWriteCombinedImpl(dst, src, size);
 	}
+	if (!timed) return;
 	const auto ns = static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+	if (probing) BarReadsProbe(size, ns);
+	if (!PerfEnabled()) return;
 	g_bar_copy_calls.fetch_add(1, std::memory_order_relaxed);
 	g_bar_copy_bytes.fetch_add(size, std::memory_order_relaxed);
 	g_bar_copy_ns.fetch_add(ns, std::memory_order_relaxed);
-	BarReadsProbe(size, ns);
 	const size_t bucket = size < 4096u ? 0u : size < 65536u ? 1u : size < 1048576u ? 2u : 3u;
 	g_bar_size_calls[bucket].fetch_add(1, std::memory_order_relaxed);
 	g_bar_size_bytes[bucket].fetch_add(size, std::memory_order_relaxed);
@@ -4611,8 +4655,9 @@ void BufferCache::ReportBarCopyPerf() {
 int BufferCache::ScanBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
                                  std::vector<std::pair<uint64_t, uint64_t>>& intervals, uint64_t& newest,
                                  uint64_t& total) {
-	const auto base   = buffer.CpuAddress();
-	int        reason = -1;
+	const auto base     = buffer.CpuAddress();
+	int        reason   = -1;
+	uint64_t   last_key = ~uint64_t {0};
 	intervals.clear();
 	newest = 0;
 	total  = 0;
@@ -4624,12 +4669,15 @@ int BufferCache::ScanBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 				return;
 			}
 			for (uint64_t page = start & ~uint64_t {TRACKER_PAGE_SIZE - 1}; page < end; page += TRACKER_PAGE_SIZE) {
-				const auto it = GranuleWriteTick(WriteTickKey(page));
+				const uint64_t key = WriteTickKey(page);
+				if (key == last_key) continue;
+				const auto it = GranuleWriteTick(key);
 				if (!it) {
 					reason = 1;
 					return;
 				}
-				newest = std::max(newest, *it);
+				newest   = std::max(newest, *it);
+				last_key = key;
 			}
 			intervals.emplace_back(start, end);
 			total += end - start;
@@ -4718,11 +4766,13 @@ void BufferCache::BarBatchRead(const uint8_t* mapped, uint64_t base,
 			CopyFromWriteCombined(staging.data() + span.staging, mapped + (span.start - base), span.end - span.start);
 		}
 	}
-	s.downloads.fetch_add(1, std::memory_order_relaxed);
-	s.intervals.fetch_add(intervals.size(), std::memory_order_relaxed);
-	s.spans.fetch_add(spans.size(), std::memory_order_relaxed);
-	s.bytes.fetch_add(bytes, std::memory_order_relaxed);
-	s.extra.fetch_add(total - bytes, std::memory_order_relaxed);
+	if (PerfEnabled()) {
+		s.downloads.fetch_add(1, std::memory_order_relaxed);
+		s.intervals.fetch_add(intervals.size(), std::memory_order_relaxed);
+		s.spans.fetch_add(spans.size(), std::memory_order_relaxed);
+		s.bytes.fetch_add(bytes, std::memory_order_relaxed);
+		s.extra.fetch_add(total - bytes, std::memory_order_relaxed);
+	}
 	for (size_t i = 0; i < intervals.size(); i++) {
 		const auto [start, end] = intervals[i];
 		const auto&    span     = spans[owner[i]];
@@ -4818,7 +4868,8 @@ int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	const auto base   = buffer.CpuAddress();
 	uint64_t   newest = 0;
 	uint64_t   total  = 0;
-	std::vector<std::pair<uint64_t, uint64_t>> intervals;
+	static thread_local std::vector<std::pair<uint64_t, uint64_t>> intervals;
+	intervals.clear();
 	KYTY_PROFILER_BLOCK("Download::BarScan");
 	if (const int reason = ScanBarDownload(buffer, vaddr, size, intervals, newest, total); reason >= 0) {
 		return outcome(static_cast<size_t>(reason));
@@ -4833,10 +4884,9 @@ int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	DownloadWaitTrace::g_last_bar_old = newest < m_scheduler.CurrentTick();
 	if (total > MaxBytes) return outcome(4);
 	if (newest >= m_scheduler.CurrentTick()) return outcome(2);
-	for (const auto& [start, end]: intervals) {
-		if (std::ranges::any_of(m_bar_pending_writes,
-		                        [&](const auto& w) { return w.first < end && start < w.first + w.second; })) {
-			return outcome(3);
+	if (!m_bar_pending_writes.empty()) {
+		for (const auto& [start, end]: intervals) {
+			if (HasBarPendingOverlap(start, end)) return outcome(3);
 		}
 	}
 	// Every command buffer ends with a device-to-host memory barrier (CommandScheduler::Submit), so
@@ -5456,9 +5506,7 @@ bool BufferCache::AppendRelease(uint64_t vaddr, uint64_t size) {
 	for (const auto& [a, b]: release) {
 		for (uint64_t page = a & ~(TRACKER_PAGE_SIZE - 1); page < b; page += TRACKER_PAGE_SIZE) {
 			if (m_gpu_modified_ranges.Intersects(page, TRACKER_PAGE_SIZE)) continue;
-			const bool bar = std::ranges::any_of(m_bar_pending_writes, [&](const std::pair<uint64_t, uint64_t>& w) {
-				return w.first < page + TRACKER_PAGE_SIZE && page < w.second;
-			});
+			const bool bar = HasBarPendingOverlap(page, page + TRACKER_PAGE_SIZE);
 			if (!bar) UnmarkWindow(page, page + TRACKER_PAGE_SIZE);
 		}
 	}

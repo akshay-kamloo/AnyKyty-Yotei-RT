@@ -278,7 +278,8 @@ private:
 	// Based on TheCruZ/KytyPS5-GTA 12ec19890 (commandProcessor.h), GPL-2.0.
 	template <typename T>
 	struct SnapshotRing {
-		static constexpr size_t Size = 512;
+		static constexpr size_t Size = 1024;
+		static_assert((Size & (Size - 1)) == 0, "SnapshotRing::Size must be a power of 2");
 		struct alignas(64) Slot {
 			T value;
 		};

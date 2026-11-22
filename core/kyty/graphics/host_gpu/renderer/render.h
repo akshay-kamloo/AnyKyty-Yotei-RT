@@ -624,7 +624,11 @@ private:
 	std::vector<uint32_t>                 m_bindless_words;
 	std::unordered_map<uint64_t, uint64_t> m_bindless_refreshed; // image -> last refreshed frame
 	uint64_t                              m_bindless_stats_frame = 0;
-	std::vector<BindlessTable::Heap*>     m_bindless_draw_heaps; // heaps of the stage being prepared
+	std::vector<BindlessTable::Heap*>           m_bindless_draw_heaps; // heaps of the stage being prepared
+	std::vector<uint32_t>                       m_bindless_inherit_keys;
+	std::vector<uint8_t>                        m_table_exact;
+	std::vector<BufferCache::AppendBinding>     m_append_bindings;
+	std::vector<std::pair<uint64_t, uint64_t>>  m_append_unqualified;
 	// The bytes of the table being checked, the fields of the use being prepared, the
 	// translation stamp (TableSlotInfo::stamp) and the frames of the per-frame work.
 	std::vector<uint32_t>                 m_table_words;

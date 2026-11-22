@@ -10,6 +10,8 @@ namespace Libs::Graphics::StallWatch {
 
 void StartIfEnabled();
 
+inline std::atomic<bool> g_enabled {false};
+
 // KYTY_DIAG_STALL_WATCH_IDLE_MS=<ms> (hitch study 10.11): when the execution thread has waited for an operation this
 // long, the watchdog captures every thread (STALL_STACK, stalled_ms = the idle time): what the game does meanwhile.
 // The execution thread stores the steady-clock ns when its wait begins, 0 when it ends.
@@ -21,7 +23,7 @@ inline std::atomic<int64_t> g_exec_driver_since {0};
 // RAII marker for the execution thread's driver calls.
 struct DriverCallMark {
 	bool on;
-	explicit DriverCallMark(bool exec_thread): on(exec_thread) {
+	explicit DriverCallMark(bool exec_thread): on(exec_thread && g_enabled.load(std::memory_order_relaxed)) {
 		if (on) g_exec_driver_since.store(static_cast<int64_t>(std::chrono::steady_clock::now().time_since_epoch().count()), std::memory_order_release);
 	}
 	~DriverCallMark() {

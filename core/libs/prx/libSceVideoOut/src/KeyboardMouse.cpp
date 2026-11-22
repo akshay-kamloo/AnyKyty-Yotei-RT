@@ -209,7 +209,7 @@ bool Pad::KeyboardMouse::Advance(Clock::time_point now) {
     if (gyroRate[0] != 0.0 || gyroRate[1] != 0.0) changed = true;
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
         const auto& binding = configuration.bindings[index];
-        if (pressed[index] && binding.control == InputControl::Shake) changed = true;
+        if (pressed[index] && (binding.control == InputControl::Shake || binding.control == InputControl::SwingDown || binding.control == InputControl::SwingUp)) changed = true;
         if ((binding.wheelDirection == 0 && binding.wheelTilt == 0) || !pressed[index] || now < wheelReleaseTimes[index]) continue;
         pressed[index] = false;
         wheelReleaseTimes[index] = {};
@@ -379,6 +379,18 @@ PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const
                 state.hasMotion = true;
                 state.accel = {sign * ShakeAcceleration, 9.80665f, 0.0f};
                 state.gyro = {0.0f, 0.0f, sign * ShakeAngularVelocity};
+                break;
+            }
+            case InputControl::SwingDown: {
+                state.hasMotion = true;
+                state.accel = {0.0f, -2.5f * 9.80665f, 1.8f * 9.80665f};
+                state.gyro = {-8.0f, 0.0f, 0.0f};
+                break;
+            }
+            case InputControl::SwingUp: {
+                state.hasMotion = true;
+                state.accel = {0.0f, 2.2f * 9.80665f, -1.2f * 9.80665f};
+                state.gyro = {6.5f, 0.0f, 0.0f};
                 break;
             }
             case InputControl::ToggleMouse: break;

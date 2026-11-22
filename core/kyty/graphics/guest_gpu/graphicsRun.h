@@ -169,6 +169,7 @@ private:
 	Common::CondVar                                m_work_available;
 	Common::CondVar                                m_idle;
 	std::array<std::deque<Submission>, QueueCount> m_queues;
+	uint64_t                                       m_nonempty_queues = 0; // bitmask of non-empty m_queues
 	std::deque<Common::UniqueFunction<void>>       m_commands;
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
@@ -200,9 +201,9 @@ private:
 	static constexpr size_t         ResolvedQueueSize  = 256; // RenderExecutor::ResolvedDrawRing holds more
 	Common::SpscQueue<GpuOperation> m_operations;
 	Common::SpscQueue<GpuOperation> m_resolved;
-	std::atomic_bool                m_execution_sleeping {false};
+	alignas(64) std::atomic_bool    m_execution_sleeping {false};
 	std::atomic_uint32_t            m_execution_bell {0};
-	std::atomic_bool                m_execution_stop {false};
+	alignas(64) std::atomic_bool    m_execution_stop {false};
 	bool             m_commands_running = false; // m_queue_mutex
 	// Game and host threads bump it when they queue work, under m_queue_mutex; the command processor spins on it.
 	std::atomic_uint64_t m_work_epoch {0};

@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 
+#include <bit>
 #include <chrono>
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/translatorGuard.h"
@@ -867,10 +868,8 @@ void GuestGpu::RunCommands() {
 	m_commands_running = false;
 	// A command may have written what a blocked queue waits for (a deferred label's publish, labels at completion, is
 	// one): the queues retry now. A wait still unmet blocks the queue again.
-	for (auto& queue: m_queues) {
-		if (!queue.empty()) {
-			queue.front().blocked = false;
-		}
+	for (uint64_t mask = m_nonempty_queues; mask != 0u; mask &= mask - 1u) {
+		m_queues[static_cast<uint32_t>(std::countr_zero(mask))].front().blocked = false;
 	}
 	m_work_epoch.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
@@ -956,10 +955,13 @@ void GuestGpu::ExecutionThread() {
 			bool have_operations = false;
 			{
 				const Common::SlowFrame::Scope slow_idle(Common::SlowFrame::ExecIdle); // KYTY_TRACE_SLOW_FRAMES
-				StallWatch::g_exec_idle_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
-				                                    std::memory_order_release); // KYTY_DIAG_STALL_WATCH_IDLE_MS
+				const bool                     sw_on = StallWatch::g_enabled.load(std::memory_order_relaxed);
+				if (sw_on) {
+					StallWatch::g_exec_idle_since.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+					                                    std::memory_order_release); // KYTY_DIAG_STALL_WATCH_IDLE_MS
+				}
 				have_operations = WaitForOperations();
-				StallWatch::g_exec_idle_since.store(0, std::memory_order_release);
+				if (sw_on) StallWatch::g_exec_idle_since.store(0, std::memory_order_release);
 			}
 			if (!have_operations) {
 				break;
@@ -1396,6 +1398,7 @@ void GuestGpu::ResolveThread() {
 	uint64_t       members    = 0;
 	auto&          hs         = m_helper_stats;
 	auto           report_at  = std::chrono::steady_clock::now();
+	uint32_t       report_ops = 0;
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
@@ -1507,7 +1510,7 @@ void GuestGpu::ResolveThread() {
 			m_resolved.Push(std::move(*operation));
 		}
 		RingExecution();
-		if (g_gpu_stage_stats) {
+		if (g_gpu_stage_stats && (++report_ops & 1023u) == 0u) {
 			// PERF resolve_helper every ~5 s (N2.2): the helper's tasks, the execution thread's claims and waits.
 			const auto now = std::chrono::steady_clock::now();
 			if (now - report_at >= std::chrono::seconds(5)) {
@@ -2080,7 +2083,7 @@ T* CommandProcessor::Snapshot(SnapshotRing<T>& ring, const T& live, bool& dirty,
 		std::memcpy(static_cast<void*>(&slot.value), &live, sizeof(T));
 		if (g_gpu_stage_stats) g_stage_stats.copied_bytes.fetch_add(sizeof(T), std::memory_order_relaxed);
 		ring.current = ring.next;
-		ring.next    = (ring.next + 1) % SnapshotRing<T>::Size;
+		ring.next    = (ring.next + 1u) & (SnapshotRing<T>::Size - 1u);
 		dirty        = false;
 	}
 	ring.last_use[ring.current] = sequence;
@@ -2575,6 +2578,7 @@ void GuestGpu::Enqueue(Submission submission) {
 	}
 	RingGameWriteFrame(m_ring_after_sp ? m_ring_sp_count - 1u : m_ring_sp_count);
 	m_queues[submission.queue_id].push_back(std::move(submission));
+	m_nonempty_queues |= (uint64_t {1} << submission.queue_id);
 	m_submission_count++;
 	m_work_epoch.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
@@ -2704,17 +2708,24 @@ void GuestGpu::ThreadRun(void* data) {
 				static_assert(QueueCount <= 64); // g_queue_history
 				const uint32_t frame_now = DebugPresentCount().load(std::memory_order_relaxed);
 				int            producer  = -1; // the first runnable producer in round-robin order
-				for (uint32_t offset = 0; offset < QueueCount; offset++) {
-					const auto id = (gpu->m_next_queue + offset) % QueueCount;
-					if (!gpu->m_queues[id].empty() && !gpu->m_queues[id].front().blocked) {
-						if (IsProducerQueue(id, frame_now)) {
-							if (producer < 0) producer = static_cast<int>(id);
-							continue;
+				const uint32_t start_q   = gpu->m_next_queue;
+				const uint64_t hi_mask   = gpu->m_nonempty_queues >> start_q;
+				const uint64_t lo_mask   = gpu->m_nonempty_queues & ((uint64_t {1} << start_q) - 1u);
+				const auto     scan_mask = [&](uint64_t mask, uint32_t base) {
+					for (; mask != 0u; mask &= mask - 1u) {
+						const uint32_t id = base + static_cast<uint32_t>(std::countr_zero(mask));
+						if (!gpu->m_queues[id].front().blocked) {
+							if (IsProducerQueue(id, frame_now)) {
+								if (producer < 0) producer = static_cast<int>(id);
+								continue;
+							}
+							selected_queue = static_cast<int>(id);
+							return true;
 						}
-						selected_queue = static_cast<int>(id);
-						break;
 					}
-				}
+					return false;
+				};
+				if (!scan_mask(hi_mask, start_q)) scan_mask(lo_mask, 0u);
 				if (selected_queue < 0) selected_queue = producer;
 				// the queue waits liveness guard: no queue can run and a stream waits in a block of waits whose
 				// predicate was never read.
@@ -2728,29 +2739,27 @@ void GuestGpu::ThreadRun(void* data) {
 					const auto blocked_start = std::chrono::steady_clock::now();
 					// A wake that came before this wait must not be lost (GuestGpu::Wake; only KYTY_UPSTREAM_FLIP_SUSPEND
 					// wakes the thread this way, so by default the flag is never set).
-					const auto now = std::chrono::steady_clock::now();
 					if (!blocked_since) {
-						blocked_since = now;
+						blocked_since = blocked_start;
 					}
 					if (std::exchange(gpu->m_wake_pending, false)) {
 						// Retry at once.
-					} else if (now - *blocked_since < Common::SpinBudget()) {
+					} else if (blocked_start - *blocked_since < Common::SpinBudget()) {
 						spin_blocked = true;
 					} else {
 						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
 					}
-					PerfBlockedWait(std::chrono::steady_clock::now() - blocked_start);
+					if (PerfEnabled()) PerfBlockedWait(std::chrono::steady_clock::now() - blocked_start);
 					if (GpuTimer::Enabled() && GpuTimer::TimelineCpuActive()) GpuTimer::NoteCpuWait('b', blocked_start); // KYTY_TRACE_GPU_TIMELINE
-					for (auto& queue: gpu->m_queues) {
-						if (!queue.empty()) {
-							queue.front().blocked = false;
-						}
+					for (uint64_t mask = gpu->m_nonempty_queues; mask != 0u; mask &= mask - 1u) {
+						gpu->m_queues[static_cast<uint32_t>(std::countr_zero(mask))].front().blocked = false;
 					}
 					continue;
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
 				submission  = std::move(queue.front());
 				queue.pop_front();
+				if (queue.empty()) gpu->m_nonempty_queues &= ~(uint64_t {1} << static_cast<uint32_t>(selected_queue));
 				if (ChunkLead::On()) ChunkLead::g_cp_state.store(ChunkLead::CpWorking, std::memory_order_relaxed); // KYTY_TRACE_CHUNK_LEAD
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
@@ -2774,6 +2783,7 @@ void GuestGpu::ThreadRun(void* data) {
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			submission.blocked = !skipped;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			gpu->m_nonempty_queues |= (uint64_t {1} << submission.queue_id);
 			gpu->m_submission_count++;
 			gpu->m_processing = false;
 			continue;
@@ -2802,12 +2812,11 @@ void GuestGpu::ThreadRun(void* data) {
 		if (!complete) {
 			submission.blocked = true;
 			gpu->m_queues[submission.queue_id].push_front(std::move(submission));
+			gpu->m_nonempty_queues |= (uint64_t {1} << submission.queue_id);
 			gpu->m_submission_count++;
 		} else {
-			for (auto& queue: gpu->m_queues) {
-				if (!queue.empty()) {
-					queue.front().blocked = false;
-				}
+			for (uint64_t mask = gpu->m_nonempty_queues; mask != 0u; mask &= mask - 1u) {
+				gpu->m_queues[static_cast<uint32_t>(std::countr_zero(mask))].front().blocked = false;
 			}
 		}
 		// Processing until the operations executed: the idle wait above.
@@ -3164,15 +3173,13 @@ void CommandProcessor::NoteStuckCondBlock(Pm4Execution& execution, uint32_t queu
 }
 
 int GuestGpu::CondGuardQueue() {
-	const auto now    = std::chrono::steady_clock::now();
-	const auto now_ns = SteadyNowNs();
-	int        found  = -1;
-	for (uint32_t index = 0; index < QueueCount; index++) {
-		auto& queue = m_queues[index];
-		if (queue.empty()) {
-			continue;
-		}
-		auto& front = queue.front();
+	if (m_nonempty_queues == 0u) return -1;
+	const auto    now    = std::chrono::steady_clock::now();
+	const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+	int           found  = -1;
+	for (uint64_t mask = m_nonempty_queues; mask != 0u; mask &= mask - 1u) {
+		const uint32_t index = static_cast<uint32_t>(std::countr_zero(mask));
+		auto&          front = m_queues[index].front();
 		CommandProcessor::NoteStuckCondBlock(front.command_execution, GuestQueueId(index), now_ns);
 		CommandProcessor::NoteStuckCondBlock(front.constant_execution, GuestQueueId(index), now_ns);
 		if (found < 0 && (CommandProcessor::IsCondGuardCandidate(front.command_execution) ||

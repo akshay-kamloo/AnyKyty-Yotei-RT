@@ -375,13 +375,15 @@ void RenderContext::PrepareBda() {
 			t_long_prep_parts[28] += stats.uploads;
 			t_long_prep_parts[29] += stats.bytes;
 		}
-		const auto now = std::chrono::steady_clock::now();
-		if (now - m_bda_log_time >= std::chrono::seconds(10) && Common::EnvRead::PerfLines()) {
-			m_bda_log_time = now;
-			std::fprintf(stderr, "BDA_REGION_STATS passes=%llu regions=%llu buffers_visited=%llu\n",
-			             static_cast<unsigned long long>(m_bda_counters.passes),
-			             static_cast<unsigned long long>(m_bda_counters.regions),
-			             static_cast<unsigned long long>(m_bda_counters.buffers_visited));
+		if (Common::EnvRead::PerfLines()) {
+			const auto now = std::chrono::steady_clock::now();
+			if (now - m_bda_log_time >= std::chrono::seconds(10)) {
+				m_bda_log_time = now;
+				std::fprintf(stderr, "BDA_REGION_STATS passes=%llu regions=%llu buffers_visited=%llu\n",
+				             static_cast<unsigned long long>(m_bda_counters.passes),
+				             static_cast<unsigned long long>(m_bda_counters.regions),
+				             static_cast<unsigned long long>(m_bda_counters.buffers_visited));
+			}
 		}
 		m_bda_synced_epoch = epoch;
 		m_bda_epoch_counters.passes++;
@@ -394,8 +396,9 @@ void RenderContext::PrepareBda() {
 
 // The PERF line of the BDA sync epoch about every 10 s.
 void RenderContext::ReportBdaSyncEpoch() {
+	if (!Common::EnvRead::PerfLines()) return;
 	auto& counters = m_bda_epoch_counters;
-	counters.calls++;
+	if ((++counters.calls & 1023u) != 0u) return;
 	const auto now = std::chrono::steady_clock::now();
 	if (now - m_bda_epoch_log_time < std::chrono::seconds(10) || !Common::EnvRead::PerfLines()) {
 		return;

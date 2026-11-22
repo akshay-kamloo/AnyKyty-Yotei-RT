@@ -2524,10 +2524,11 @@ void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
 			if (source != nullptr) {
 				// The keys the previous heap was asked for are likely asked for again: resolve them
 				// now from this heap's own words (known descriptors reuse their slots).
-				std::vector<uint32_t> keys;
-				for (const auto& item: source->resolved_entries) keys.push_back(item.entry);
-				for (const auto& item: source->rejected_entries) keys.push_back(item.entry);
-				for (const auto entry: keys)
+				m_bindless_inherit_keys.clear();
+				m_bindless_inherit_keys.reserve(source->resolved_entries.size() + source->rejected_entries.size());
+				for (const auto& item: source->resolved_entries) m_bindless_inherit_keys.push_back(item.entry);
+				for (const auto& item: source->rejected_entries) m_bindless_inherit_keys.push_back(item.entry);
+				for (const auto entry: m_bindless_inherit_keys)
 					if (entry < heap->settled.size() && heap->settled[entry] == 0)
 						(void)ResolveBindlessKey(*heap, entry, true);
 			}
@@ -3993,7 +3994,7 @@ static TableSetStats& TableStats() {
 static void TableSetKey(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
                         bool soft, std::vector<uint32_t>& words) {
 	words.clear();
-	words.reserve(program.info.images.size() * 9u + program.info.samplers.size() * 4u + 2u);
+	words.reserve(program.info.images.size() * 9u + program.info.samplers.size() * 5u + 1u);
 	// The compare functions (ImageCompareFuncs) come from the S# words, which are in the key.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		words.insert(words.end(), snapshot.images[i].dwords.begin(), snapshot.images[i].dwords.end());
@@ -4014,11 +4015,11 @@ static bool TableSetMatches(const ShaderRecompiler::IR::CompiledShaderInfo& prog
 	const uint32_t* w = words.data();
 	for (uint32_t i = 0; i < program.info.images.size(); i++, w += 9) {
 		const auto& value = snapshot.images[i];
-		if (!std::equal(value.dwords.begin(), value.dwords.end(), w) || w[8] != value.dword_count) return false;
+		if (w[8] != value.dword_count || std::memcmp(value.dwords.data(), w, 8u * sizeof(uint32_t)) != 0) return false;
 	}
 	for (const auto& sampler: program.info.samplers) {
 		const auto& value = snapshot.samplers[sampler.snapshot_index];
-		if (!std::equal(value.dwords.begin(), value.dwords.begin() + 4, w) || w[4] != value.dword_count) return false;
+		if (w[4] != value.dword_count || std::memcmp(value.dwords.data(), w, 4u * sizeof(uint32_t)) != 0) return false;
 		w += 5;
 	}
 	return *w == (soft ? 1u : 0u);
@@ -4588,7 +4589,7 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 	prepared.shader_data.clear();
 	bind_split.Mark(1);
 	// The table sets: per slot, whether the binding may become a set member (g_slot_exact).
-	static thread_local std::vector<uint8_t> table_exact;
+	auto& table_exact = m_table_exact;
 	table_exact.assign(program.info.images.size(), 0u);
 	const auto table_loop_epoch = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
 	PeekImages::Stage* peek_entry = nullptr; // KYTY_CHECK_PEEK=2 (S2b): this stage's peek
@@ -4773,7 +4774,8 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 	// A stage without bindless heaps (or with the table off) skips the binder lock block below: its PrepareBindlessHeaps only
 	// clears the stage's bindless lists.
 	if (snapshot.bindless_heaps.empty() || !m_context.GetBindlessTable().Enabled()) {
-		PrepareBindlessHeaps(runtime, prepared);
+		prepared.bindless_patches.clear();
+		prepared.bindless_images.clear();
 	} else {
 		KYTY_PROFILER_BLOCK("PrepareBindings::Bindless");
 		auto&            bindless_table = m_context.GetBindlessTable();
@@ -4782,11 +4784,16 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 		PrepareBindlessHeaps(runtime, prepared);
 	}
 	bind_split.Mark(6);
-	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
-	for (const auto reg: program.info.user_data_registers) {
-		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
+	const size_t total_dwords = program.bindings.ShaderDataDwords();
+	prepared.shader_data.resize(total_dwords);
+	const auto& regs = program.info.user_data_registers;
+	const uint32_t ud_base = program.user_data_base;
+	for (size_t k = 0; k < regs.size(); ++k) {
+		prepared.shader_data[k] = snapshot.user_data[regs[k] - ud_base];
 	}
-	prepared.shader_data.resize(program.bindings.ShaderDataDwords());
+	if (regs.size() < total_dwords) {
+		std::fill(prepared.shader_data.begin() + static_cast<std::ptrdiff_t>(regs.size()), prepared.shader_data.end(), 0u);
+	}
 	if (program.bindings.descriptor_counts[static_cast<size_t>(BindingKind::Gds)] != 0) {
 		prepared.gds.buffer = m_context.GetBufferCache().GetGdsBuffer()->Handle();
 	}
@@ -5047,17 +5054,19 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// D4b step 1 (append windows): the stage's own counters are no foreign writes while its bindings are obtained;
 	// its windows open (counter copied) once they are, before the draw or dispatch is recorded (any return below).
 	struct AppendScope {
-		BufferCache&            cache;
-		const PreparedBindings& stage;
-		bool                    on = false;
+		BufferCache&                                 cache;
+		const PreparedBindings&                      stage;
+		std::vector<BufferCache::AppendBinding>&     bindings;
+		std::vector<std::pair<uint64_t, uint64_t>>&  unqualified;
+		bool                                         on = false;
 		~AppendScope() {
 			if (!on) return;
-			std::vector<BufferCache::AppendBinding>      bindings;
-			std::vector<std::pair<uint64_t, uint64_t>> unqualified;
+			bindings.clear();
+			unqualified.clear();
 			CollectAppendBindings(stage, nullptr, &bindings, &unqualified);
 			cache.AppendDispatch(bindings, unqualified);
 		}
-	} append_scope {m_context.GetBufferCache(), prepared};
+	} append_scope {m_context.GetBufferCache(), prepared, m_append_bindings, m_append_unqualified};
 	if (std::ranges::any_of(program.info.buffers, [](const auto& b) {
 		    return b.append_counter != ShaderRecompiler::IR::BufferResource::NoAppendCounter;
 	    })) {

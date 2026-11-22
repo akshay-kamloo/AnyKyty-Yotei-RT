@@ -28,9 +28,10 @@ Tested on **Windows 11**, **Intel Core Ultra 7 270K Plus**, **32 GB RAM**, **NVI
 | Village (Big-O v1 + PGO v2) | 1080p | **23.26 FPS** avg (26–32 FPS steady) | 43.0 ms/f avg |
 | Open World (`native-rt-v6`) | 900p (`1600×900`) | **19.4–25.3 FPS** | Stable across 9,518 frames |
 | Heavy Post-Fight Cutscene (`native-rt-v6`) | 900p (`1600×900`) | **8.1–11.1 FPS** | `fault_gpu = 0 ms` (up from 3.3–3.6 FPS at 1080p) |
-| Heavy Post-Fight Cutscene / Open World (`native-rt-v9`, current HEAD) | 900p (`1600×900`) | **15.2–18.8 FPS** open world (53–66 ms/f) | `v8` shutdown fix + `v9` async graphics variants + `.kyhints` import |
+| Heavy Post-Fight Cutscene / Open World (`native-rt-v9`) | 900p (`1600×900`) | **15.2–18.8 FPS** open world (53–66 ms/f) | `v8` shutdown fix + `v9` async graphics variants + `.kyhints` import |
+| **Open World / Heavy Gameplay (`native-rt-v12-pgo-v3`, current HEAD)** | 900p (`1600×900`) | **Heavy `74.69 ms/f`** (-7.7% vs `v9` `80.94 ms/f`) | `v10` `BufferCache` O(1) hot-read/BAR pruning + `v11` 64-bit queue bitmask & 1024-slot snapshot ring + `v12` descriptor/BDA churn cuts + fresh 19-snapshot `yotei-v3.profdata` PGO |
 
-> **v9 Highlights:** Includes the `v8`/`v9` clean-exit fixes (eliminating `graphicsRun.cpp:670` and `renderContext.cpp:94`), **async graphics shader variant compilation** (`KYTY_ASYNC_GRAPHICS_VARIANTS=1` by default), and **`.kyhints` upfront shader precompilation** (`KYTY_IMPORT_HINTS` / `KYTY_PRECOMPILE_ONLY=1`).
+> **v12-pgo-v3 Highlights:** Cuts heavy-frame `download` (-16.1%), `idle` (-26.5%), `rebind_img` (-15.1%), `claim` (-36.0%), and steady-frame `draw_op` (-32.8%), `prep_today` (-29.6%), `download` (-21.5%), and `bindless` (-25.3%), plus adds dedicated keyboard **Swing/Hammer** motion controls (**`B`** = lift/pitch up, **`V`** = swing/strike down) in `libSceVideoOut` / `libScePad`.
 
 ## Requirements
 
@@ -130,6 +131,7 @@ $env:KYTY_TRACE_GPU_TIME    = "1"
 ### Controls, Input & Hotkeys
 - **Performance Overlay:** Press **`F2`** to toggle the performance panel; **`Shift+F2`** shows detailed breakdown (frame time, CPU/GPU waits, draw calls, shader compiles, and **Vulkan VRAM budget**).
 - **Touch Pad ("Swipe up" prompts):** A DualSense controller's touchpad works natively. With keyboard + mouse (when `ANYPS5_MOUSE_TOUCHPAD=1`), press **`F6`**, move the mouse to swipe, and press **`F6`** again to exit touchpad mode.
+- **Motion Controls (Keyboard):** Hold **`X`** for side-to-side shake (`Shake`), **`B`** to lift/pitch up (`SwingUp`), and **`V`** to swing/strike down (`SwingDown` — e.g., forging/hammering prompts).
 - **Keyboard & Controller Mapping:** SDL-mapped controllers work out of the box; keyboard/mouse binds can be customized via `anyps5-input.ini` (see [`docs/user/INPUT_MAPPING.md`](docs/user/INPUT_MAPPING.md)).
 
 ## Important Environment Variables & Toggles

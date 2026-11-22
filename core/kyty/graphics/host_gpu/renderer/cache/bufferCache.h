@@ -950,6 +950,7 @@ private:
 	[[nodiscard]] uint64_t      RecentlyRetiredBytes();
 	std::vector<HotRead>                 m_hot_reads;
 	std::unordered_map<uint64_t, size_t> m_hot_read_index;
+	size_t                               m_hot_evict_cursor = 0;
 	uint64_t                             m_hot_min_start = ~uint64_t {0};
 	uint64_t                             m_hot_max_end   = 0;
 	void                                 RecomputeHotBounds() noexcept {
@@ -961,9 +962,10 @@ private:
 		m_hot_min_start = lo;
 		m_hot_max_end   = hi;
 	}
-	std::vector<EagerReadback> m_eager_readbacks;
-	uint64_t                   m_eager_min_start = ~uint64_t {0};
-	uint64_t                   m_eager_max_end   = 0;
+	std::vector<EagerReadback>   m_eager_readbacks;
+	std::unordered_set<uint64_t> m_eager_starts;
+	uint64_t                     m_eager_min_start = ~uint64_t {0};
+	uint64_t                     m_eager_max_end   = 0;
 	void                       RecomputeEagerBounds() noexcept {
 		uint64_t lo = ~uint64_t {0}, hi = 0;
 		for (const auto& e: m_eager_readbacks) {
@@ -1023,6 +1025,27 @@ private:
 	static constexpr uint64_t BarMaxBytes = uint64_t {1024} << 10u;
 	// Writable ranges obtained since the last recorded draw/dispatch (write tick not final yet).
 	std::vector<std::pair<uint64_t, uint64_t>> m_bar_pending_writes;
+	uint64_t                                   m_bar_pending_min = ~uint64_t {0};
+	uint64_t                                   m_bar_pending_max = 0;
+	void AddBarPendingWrite(uint64_t vaddr, uint64_t size) noexcept {
+		m_bar_pending_writes.emplace_back(vaddr, size);
+		if (vaddr < m_bar_pending_min) m_bar_pending_min = vaddr;
+		if (vaddr + size > m_bar_pending_max) m_bar_pending_max = vaddr + size;
+	}
+	void ClearBarPendingWrites() noexcept {
+		m_bar_pending_writes.clear();
+		m_bar_pending_min = ~uint64_t {0};
+		m_bar_pending_max = 0;
+	}
+	[[nodiscard]] bool HasBarPendingOverlap(uint64_t start, uint64_t end) const noexcept {
+		if (m_bar_pending_writes.empty() || end <= m_bar_pending_min || start >= m_bar_pending_max) {
+			return false;
+		}
+		for (const auto& w: m_bar_pending_writes) {
+			if (w.first < end && start < w.first + w.second) return true;
+		}
+		return false;
+	}
 	static constexpr uint64_t WriteTickKey(uint64_t address) noexcept { return address >> 16u; }
 	// The granule write ticks in two levels - 2^16 blocks
 	// of 4096 granules (256 MiB of guest addresses each, 32 KiB), a block allocated at its first write, consecutive

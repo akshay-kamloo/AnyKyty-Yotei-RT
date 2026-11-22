@@ -4117,6 +4117,7 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info, Sh
 	}
 	input_info             = resolved->compute;
 	program                = resolved->compute_program;
+	m_slot_taken           = true;
 	t_compute_program_path = 3u; // KYTY_TRACE_DISPATCH_CENSUS
 	return true;
 }
@@ -4141,17 +4142,22 @@ bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task
 		slot.fault = task.fault;
 	}
 	slot.empty = !ok;
-	if (ok && !task.dispatch && task.build_plan) {
-		// N5.3: the helper builds the draw's plan while the slot is still its own (before it is marked ready).
-		PeekAhead(&slot, *task.context, *task.user_config, *task.shaders, task.indexed, task.draw_count, 1u, task.index_type,
-		          task.slice_offset, task.draw_indirect, std::min(task.lead, 127u), task.index_address,
-		          task.gpu_indirect ? &task.indirect_args : nullptr);
-		// N7.1: the outcome counters for the report (the helper's scratch slot 3 + index names its row)
-		if (slot.ahead.planned) t_helper_plans_made++;
-		if (task.gpu_indirect) t_helper_packets++;
-		const uint32_t row = ShaderRecompiler::IR::t_ahead_scratch_slot - 3u;
-		if ((t_ahead_helper.planned & 255u) == 0 && row < 2u) {
-			g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
+	if (ok && task.build_plan) {
+		if (task.dispatch) {
+			// v14: offload read-only compute PlanBuffer lookups onto Resolve Helpers while slot is still private.
+			PeekComputeAhead(&slot, std::min(task.lead, 127u));
+		} else {
+			// N5.3: the helper builds the draw's plan while the slot is still its own (before it is marked ready).
+			PeekAhead(&slot, *task.context, *task.user_config, *task.shaders, task.indexed, task.draw_count, 1u, task.index_type,
+			          task.slice_offset, task.draw_indirect, std::min(task.lead, 127u), task.index_address,
+			          task.gpu_indirect ? &task.indirect_args : nullptr);
+			// N7.1: the outcome counters for the report (the helper's scratch slot 3 + index names its row)
+			if (slot.ahead.planned) t_helper_plans_made++;
+			if (task.gpu_indirect) t_helper_packets++;
+			const uint32_t row = ShaderRecompiler::IR::t_ahead_scratch_slot - 3u;
+			if ((t_ahead_helper.planned & 255u) == 0 && row < 2u) {
+				g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
+			}
 		}
 	}
 	slot.phase.store(PhaseReady, std::memory_order_release);
@@ -4382,6 +4388,24 @@ bool RenderExecutor::TakeAheadImages(const void* program, PeekStageImagesResult&
 		return true;
 	}
 	return false;
+}
+
+void RenderExecutor::PeekComputeAhead(ResolvedDraw* slot, uint32_t distance) {
+	if (slot == nullptr || slot->stages == nullptr) return;
+	auto& pc = m_context.GetPipelineCache();
+	++t_translator;
+	if (!pc.PeekAdoptAhead(*slot->stages, distance)) {
+		--t_translator;
+		return;
+	}
+	slot->ahead.planned = true;
+	for (uint32_t i = 0; i < PipelineCache::StageCount(*slot->stages); i++) {
+		const auto* program   = PipelineCache::AheadProgram(*slot->stages, i);
+		const auto* resources = PipelineCache::StageResources(*slot->stages, i);
+		if (program == nullptr || resources == nullptr) continue;
+		PeekStageBuffers(*program, *resources, PipelineCache::StageRecord(*slot->stages, i), distance, slot->ahead.buffers);
+	}
+	--t_translator;
 }
 
 void RenderExecutor::PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders,

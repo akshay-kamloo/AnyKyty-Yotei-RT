@@ -360,6 +360,7 @@ public:
 	void PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders, bool indexed,
 	               uint32_t count, uint32_t instances, uint32_t index_type, uint32_t slice_offset, uint64_t indirect, uint32_t distance,
 	               uint64_t index_address = 0, const DrawIndirectGpuArgs* gpu_indirect = nullptr);
+	void PeekComputeAhead(ResolvedDraw* slot, uint32_t distance);
 	// N4.2b: hands the running draw's buffer plan entries to the buffer cache's check (null: none).
 	void PlanBuffersBegin();
 	// KYTY_DIAG_GPU_BURN_NS / KYTY_DIAG_GPU_BURN_AT (measurement only): GPU-thread spin at one of these places.

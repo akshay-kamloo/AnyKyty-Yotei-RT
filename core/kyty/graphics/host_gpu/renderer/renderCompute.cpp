@@ -536,6 +536,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2): a chunk-member dispatch is prepared once more before its preparation;
 	// the two preparations' prints must be equal (renderDraw.cpp ChunkCheckFirst; the commit uses the second).
 	const bool chunk_check = ChunkCensus::CheckOn() && ChunkCensus::t_member;
+	const bool use_plan    = !ChunkCensus::CheckOn() && !BufferCache::PlanBufferCheck() && PlanPresent() && PlanProgramsHold();
+	struct PlanBuffersScope {
+		bool on;
+		~PlanBuffersScope() {
+			if (on) BufferCache::SetPlanBuffers(nullptr);
+		}
+	} const plan_buffers_scope {use_plan};
+	if (plan_buffers_scope.on) PlanBuffersBegin();
 	for (uint32_t preparation = chunk_check ? 0u : 1u; preparation < 2u; preparation++) {
 		// The first preparation (the oracle's) into bindings of its own.
 		auto&             prepared       = preparation == 0u ? ChunkScratchBindings(4) : bindings;
@@ -1013,7 +1021,15 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	buffer.EndRendering();
 	census_timer.Mark(3);
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
-	auto& bindings = m_compute_bindings;
+	auto&      bindings = m_compute_bindings;
+	const bool use_plan = !ChunkCensus::CheckOn() && !BufferCache::PlanBufferCheck() && PlanPresent() && PlanProgramsHold();
+	struct PlanBuffersScope {
+		bool on;
+		~PlanBuffersScope() {
+			if (on) BufferCache::SetPlanBuffers(nullptr);
+		}
+	} const plan_buffers_scope {use_plan};
+	if (plan_buffers_scope.on) PlanBuffersBegin();
 	PrepareBindings(input_info.stage, bindings);
 	census_timer.Mark(4);
 	PreparedBindings* descriptor_stage = &bindings;

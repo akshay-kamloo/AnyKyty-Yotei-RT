@@ -16,6 +16,11 @@ struct RenderTargetFormatEncoding {
 	uint8_t             components    = 0;
 	ChannelOrderSupport order_support = ChannelOrderSupport::kNone;
 
+	[[nodiscard]] constexpr bool IsValid() const {
+		return buffer_format != BufferFormat::kInvalid && components >= 1u && components <= 4u &&
+		       order_support != ChannelOrderSupport::kNone;
+	}
+
 	[[nodiscard]] constexpr bool SupportsOrder(ChannelOrder order) const {
 		switch (order_support) {
 			case ChannelOrderSupport::kStandardOnly: return order == ChannelOrder::kStandard;
@@ -39,10 +44,10 @@ uint32_t                   NumBytesPerElement(BufferFormat format);
 uint32_t                   BlockCompressedBytesPerBlock(BufferFormat format);
 uint32_t                   RenderTargetBytesPerElement(BufferFormat format);
 bool                       IsFmaskTextureFormat(BufferFormat format);
-bool                       IsSrgbFormat(BufferFormat format);
 TextureNumericClass        SampledTextureNumericClass(BufferFormat format);
 BufferFormat               RemapTextureFormat(BufferFormat format);
+bool                       Diagnostic111110UnormAsFloat();
 
-}
+} // namespace Libs::Graphics::Prospero
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GUEST_GPU_GPU_FORMAT_H_ */

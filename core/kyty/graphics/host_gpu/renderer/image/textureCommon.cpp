@@ -1,20 +1,20 @@
+#include "graphics/host_gpu/translatorGuard.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 
 #include "common/assert.h"
-#include "common/logging/log.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/gpu_format.h"
-#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 
 namespace Libs::Graphics {
 namespace {
 
+// Rows are channel order; columns are the number of physical components minus one. Unused
+// selectors complete each entry to a permutation so logical write masks can be inverted.
 constexpr Prospero::ColorComponentMapping kRenderTargetColorMappings[4][4] = {
     {Prospero::ColorMappingRgba, Prospero::ColorMappingRgba, Prospero::ColorMappingRgba,
      Prospero::ColorMappingRgba},
@@ -62,21 +62,18 @@ HostFormatInfo ResolveHostFormat(Prospero::BufferFormat guest_format,
 	}
 }
 
-}
+} // namespace
 
-RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   graphics,
-                                                    Prospero::ChannelLayout layout,
+RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order) {
-	if (layout == Prospero::ChannelLayout::k4_4_4_4 && !graphics.r4g4b4a4_render_targets) {
-		static std::atomic_bool warned = false;
-		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog("Warning: rendering 4_4_4_4 targets as 5_5_5_1.\n");
-		}
-		layout = Prospero::ChannelLayout::k5_5_5_1;
+	auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
+	if (encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm &&
+	    Prospero::Diagnostic111110UnormAsFloat()) {
+		// Scene targets programmed as COLOR_11_11_10 UNORM store packed unsigned floats.
+		encoding.buffer_format = Prospero::BufferFormat::k11_11_10Float;
 	}
-	const auto encoding = Prospero::ResolveRenderTargetFormat(layout, type);
-	if (encoding.SupportsOrder(order)) {
+	if (encoding.IsValid() && encoding.SupportsOrder(order)) {
 		const auto backing_format = encoding.buffer_format == Prospero::BufferFormat::k11_11_10UNorm
 		                                ? Prospero::RemapTextureFormat(encoding.buffer_format)
 		                                : encoding.buffer_format;
@@ -88,6 +85,10 @@ RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   grap
 			return {host_format.format, bytes, host_format.host_to_storage.Then(order_mapping),
 			        encoding.buffer_format};
 		}
+	}
+	if (t_describe_soft) { // project 15 N5.1: a plan's description fails instead of stopping
+		t_describe_failed = true;
+		return {};
 	}
 	EXIT("unsupported render-target format combination: layout=%u type=%u order=%u\n",
 	     static_cast<uint32_t>(layout), static_cast<uint32_t>(type), static_cast<uint32_t>(order));
@@ -117,6 +118,9 @@ vk::ComponentMapping TextureGetComponentMapping(uint32_t                        
 }
 
 SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
+	if (format == Prospero::BufferFormat::k11_11_10UNorm && Prospero::Diagnostic111110UnormAsFloat()) {
+		format = Prospero::BufferFormat::k11_11_10Float;
+	}
 	const auto backing_format = Prospero::RemapTextureFormat(format);
 	const auto host_format = ResolveHostFormat(backing_format, Prospero::ChannelOrder::kStandard);
 	const auto conversion_format =
@@ -127,4 +131,4 @@ SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
 	EXIT("unknown format: fmt = %u\n", static_cast<uint32_t>(format));
 }
 
-}
+} // namespace Libs::Graphics

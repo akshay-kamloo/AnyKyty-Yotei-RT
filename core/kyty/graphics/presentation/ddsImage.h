@@ -27,6 +27,6 @@ private:
 	VmaAllocation   m_staging_allocation = nullptr;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_DDSIMAGE_H_

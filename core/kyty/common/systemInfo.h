@@ -11,6 +11,6 @@ struct SystemInfo {
 
 [[nodiscard]] SystemInfo GetSystemInfo();
 
-}
+} // namespace Common
 
-#endif
+#endif /* KYTY_COMMON_SYSTEM_INFO_H_ */

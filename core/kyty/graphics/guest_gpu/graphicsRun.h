@@ -7,11 +7,10 @@
 #include "common/threads.h"
 #include "common/uniqueFunction.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
-#include "graphics/guest_gpu/scout.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -19,7 +18,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
-#include <vector>
+#include <utility>
 
 namespace Libs::Graphics {
 
@@ -33,59 +32,78 @@ public:
 
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
+	// On the GPU thread it runs in place.
 	void               SendCommand(Common::UniqueFunction<void>&& command);
+	// Always through the queue: it runs at a packet boundary, also when sent from the GPU thread (from a fault handler there,
+	// where running in place would run under whatever the thread holds, before the faulting instruction runs again).
+	void               PostCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
-	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies = true);
-	void SendReadbackCommandSync(Common::UniqueFunction<void>&& command);
-	[[nodiscard]] bool PostReadbackCommand(Common::UniqueFunction<void>&& command);
-	uint64_t WaitForOrderedOperations(uint64_t begin, uint64_t end);
-	void NoteOrderedSequence(uint64_t sequence) noexcept { m_cp_ordered = std::max(m_cp_ordered, sequence); }
-	[[nodiscard]] static bool OrderedReadbacks() noexcept;
+	// Retries blocked submissions now instead of after the 100 ms stall timeout.
+	void               Wake();
 
-	void Submit(std::span<const uint32_t> commands);
+	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
+	void Submit(std::span<const uint32_t> draw_commands,
+	            std::span<const uint32_t> constant_commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
+	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
 	void SuspendPoint();
-#if defined(ANYPS5_KYTY)
-	void NoteFrameSubmitted();
-#endif
+	// Wait for guest command processing, including all compute queues (not native GPU completion).
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
 
+	// The thread that owns the renderer: the execution thread.
 	[[nodiscard]] static bool IsGpuThread() noexcept;
-	[[nodiscard]] static bool IsCommandProcessorThread() noexcept;
-	static void RunUrgentCommandsWhileWaiting();
-
-	[[nodiscard]] bool Pipelined() const noexcept { return m_pipelined; }
-	[[nodiscard]] uint64_t NextSequence() const noexcept { return m_emitted + 1; }
-	uint64_t               EmitOperation(GpuOperation&& operation);
-	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value);
-	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
-	void                   WaitForExecution(uint64_t sequence) { m_executed.WaitFor(sequence); }
-	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
-#if defined(ANYPS5_KYTY)
-	void NoteBlockedWait(uint64_t address, uint64_t size, uint64_t reference, uint64_t mask,
-	                     uint32_t function);
-	void NoteBlockedRewind(uint64_t control);
-#else
-	void NoteBlockedWait(uint64_t address, uint64_t size);
-#endif
-	[[nodiscard]] bool OtherQueueWaitsOn(uint64_t address, uint64_t size) const;
+	// Command processor thread.
+	void EmitOperation(GpuOperation&& operation);
+	// Waits until the operations emitted so far executed.
+	void WaitForExecution(GpuDrain reason);
+	// The registers bound while nothing but an operation reads them.
 	[[nodiscard]] const GpuRegisterState& NeutralState() const noexcept { return m_neutral_state; }
-#if defined(ANYPS5_KYTY)
+	// The thread that owns the renderer, while it waits for another thread (a compile), which may in
+	// turn wait for a command: runs the commands queued so far.
+	// Based on TheCruZ/KytyPS5-GTA e7036cb45 (graphicsRun.cpp), GPL-2.0.
+	static void RunCommandsWhileWaiting();
+	// That thread has commands to run.
+	[[nodiscard]] static bool CommandsWaiting() noexcept;
+	// A thread waits at all for such commands (false: its plain wait is fine).
+	[[nodiscard]] static bool WaitsServeCommands() noexcept;
+	// Numbers the next operation of the stream, across all command processors.
+	[[nodiscard]] uint64_t TakeSequence() noexcept { return ++m_emitted; }
+	[[nodiscard]] uint64_t NextSequence() const noexcept { return m_emitted + 1; }
+	// The operation `sequence` and everything before it executed when this returns: their snapshots are free.
+	// True when it waited.
+	bool WaitForSnapshot(uint64_t sequence);
 
-	struct BlockedWait {
-		uint64_t address   = 0;
-		uint64_t reference = 0;
-		uint64_t mask      = 0;
-		uint32_t function  = 0;
-		uint32_t bytes     = 0;
-		uint32_t queue     = 0;
-	};
-	[[nodiscard]] size_t BlockedWaits(BlockedWait* waits, size_t capacity) const;
-	[[nodiscard]] bool   HoldSubmissions(uint32_t timeout_ms);
-	void                 ReleaseSubmissions();
-#endif
+	// The journal of writes that are not in guest memory yet, for the reads the stream decides on. Oldest first; the
+	// thread that makes the operations owns it. Based on TheCruZ/KytyPS5-GTA 12ec19890 (graphicsRun.h, graphicsRun.cpp),
+	// GPL-2.0; the labels that land when the host GPU gets there (labels at completion) and the writes into direct ranges
+	// are ours.
+	// A write of an emitted operation; `value` null when it is known only when the operation executes.
+	void NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value);
+	// A deferred label: in guest memory when its publish ran (MarkPublished), not when its operation executed.
+	void NoteDeferredWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value);
+	// Any thread, in sequence order (the host GPU's completions are): the label of `sequence` is in guest memory.
+	void MarkPublished(uint64_t sequence) noexcept {
+		if (sequence > m_published.load(std::memory_order_relaxed)) m_published.store(sequence, std::memory_order_release);
+	}
+	// A dword the operation records into the stream (a write into a direct range): in guest memory when the tick it was
+	// recorded in finished.
+	void NoteStreamWrite(uint64_t sequence, uint64_t address, uint32_t value);
+	// Which pending writes a read sees. Stream: those of operations not executed yet, the writes that come before the
+	// read in the stream and have not happened; not the labels, which land when the host GPU gets there. Overlay
+	// (WAIT_REG_MEM): also the labels and direct-range writes recorded but not in guest memory yet (one in-order host
+	// queue: a wait recorded after the label is ordered after its work).
+	enum class DecisionRead { Stream, Overlay };
+	// Reads `address` (at most 8 bytes) with the pending writes over it. `covered`: they cover all of it.
+	void ReadDecisionMemory(const volatile void* address, void* value, size_t size, DecisionRead scope,
+	                        bool* covered = nullptr);
+	// The writes of the operations not executed yet into the range are in guest memory when this returns.
+	void WaitForPendingWrites(uint64_t address, uint64_t size, bool unknown_only);
+	// KYTY_PERF_SRT_GPU_WORDS_VERIFY (diagnostic, GPU thread): a value not yet in guest memory covers the dword at
+	// `address`: 1 a deferred end-of-pipe label (KYTY_FIX_LABEL_AT_COMPLETION), 2 a command-processor write the host GPU
+	// has not run (KYTY_PERF_DIRECT_RANGES); 0 none.
+	[[nodiscard]] static uint32_t PendingWriteKind(uint64_t address);
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -94,32 +112,55 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Commands;
+		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
-		Pm4Execution              execution;
-		bool                      blocked         = false;
-		bool                      yielded         = false;
-		uint64_t                  flip_request_id = 0;
-		uint64_t                  scout_sequence  = 0;
-#if defined(ANYPS5_KYTY)
-		bool                      frame_end       = false;
-		uint64_t                  wait_flushed    = 0;
-#endif
+		std::span<const uint32_t> constant_commands;
+		Pm4Execution              command_execution;
+		Pm4Execution              constant_execution;
+		bool                      started           = false;
+		bool                      command_complete  = false;
+		bool                      constant_complete = false;
+		bool                      blocked           = false;
+		uint64_t                  flip_request_id   = 0;
+		uint64_t                  ring_frame        = 0; // the game frame whose data-ring half this work writes (DropDeadRingBytes)
 	};
 
 	void              Enqueue(Submission submission);
 	void              ProcessCommands();
+	// Makes this thread the one that owns the renderer.
+	void              BecomeRendererOwner();
 	void              ExecutionThread();
 	void              ResolveThread();
+	// Project 15 N2.2: the resolve helper (KYTY_PERF_RESOLVE_HELPERS=1 or KYTY_CHECK_RESOLVE=2) and the execution
+	// thread's claim of an operation's resolution before it executes (waits for a running one, steals a pending one).
+	void              ResolveHelperThread(uint32_t index);
+	// busy(context, true) before a wait for the helper, (context, false) after it: the caller's work scopes.
+	void              ClaimResolved(GpuOperation& operation, void (*busy)(void* context, bool waiting), void* busy_context);
+	// Execution thread: runs the queued commands, then lets the blocked queues try again.
+	void              RunCommands();
+	// Execution thread with no operation: waits for work; false when the GPU stops.
+	bool              WaitForOperations();
+	void              RingExecution() noexcept;
 	void              StopExecution();
+	// Command processor thread: runs a command on the execution thread, after the operations emitted so far, and waits.
 	void              ExecuteSync(Common::UniqueFunction<void>&& command);
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
+	// the queue waits liveness guard, m_queue_mutex held, no queue runnable: the queue whose suspended stream sits
+	// in a block of waits the guard has not checked, once no slice ran a packet for the guard delay; -1 otherwise.
+	int CondGuardQueue();
+	// The guard's exact read of that block's predicate (queue lock released: it may wait for the GPU). True when the
+	// predicate was zero and the stream now continues after the block.
+	bool ResolveCondGuard(Submission& submission);
+	// Guest queue id of a queue index (0 = graphics, else the compute queue 0x20..0x57).
+	static uint32_t GuestQueueId(uint32_t queue_index) {
+		return queue_index == 0 ? 0u : ComputeQueueBase + queue_index - 1u;
+	}
 
 	RenderContext&                                 m_renderer;
 	Common::Mutex                                  m_queue_mutex;
@@ -134,91 +175,93 @@ private:
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
+	bool                                           m_wake_pending      = false;
 	bool                                           m_shutdown_complete = false;
-#if defined(ANYPS5_KYTY)
-	static constexpr ptrdiff_t SuspendPointDepthMax = 64;
-	static ptrdiff_t           SuspendPointDepth();
-	std::shared_ptr<std::counting_semaphore<SuspendPointDepthMax>> m_suspend_point_ready =
-	    std::make_shared<std::counting_semaphore<SuspendPointDepthMax>>(SuspendPointDepth());
-	std::shared_ptr<std::binary_semaphore> m_frame_ready = std::make_shared<std::binary_semaphore>(1);
-	std::atomic_bool                       m_frame_submitted {false};
-#else
+	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
-#endif
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
 	uint64_t        m_submit_id = 0;
 	std::atomic_int m_done_num  = 0;
-	uint64_t        m_scout_sequence = 0;
-	bool            m_scout_reset    = false;
-
-	struct WaitRange {
-		uint64_t begin = 0;
-		uint64_t end   = 0;
-	};
-	std::array<WaitRange, QueueCount> m_wait_ranges {};
-	uint32_t                          m_waiting_queues = 0;
-	uint32_t                          m_current_queue  = 0;
-#if defined(ANYPS5_KYTY)
-
-	struct BlockedSlot {
-		std::atomic_uint64_t sequence {0};
-		std::atomic_uint64_t address {0};
-		std::atomic_uint64_t reference {0};
-		std::atomic_uint64_t mask {0};
-		std::atomic_uint64_t shape {0};
-	};
-	std::array<BlockedSlot, QueueCount> m_blocked_slots;
-	std::atomic_bool                    m_hold {false};
-	bool                                m_in_submission = false;
-	void RecordBlockedWait(uint64_t address, uint64_t reference, uint64_t mask, uint32_t function,
-	                       uint32_t bytes);
-#endif
-
+	// The game frame of each submission (Enqueue, m_queue_mutex): SuspendPoints enqueued, and a SuspendPoint whose
+	// graphics submission is not enqueued yet. The frame last announced to the execution thread (Process, CP thread).
+	uint64_t        m_ring_sp_count  = 0;
+	bool            m_ring_after_sp  = false;
+	uint64_t        m_ring_announced = ~uint64_t {0};
+	uint64_t        m_emitted   = 0;
+	Common::ProgressCounter m_executed;
+	// The pipeline: operations ring from the command processor thread to the resolve thread and from there to the execution
+	// thread, which also serves m_commands and so may sleep on the bell, not in the ring.
+	static constexpr size_t         OperationQueueSize = 4096;
+	static constexpr size_t         ResolvedQueueSize  = 256; // RenderExecutor::ResolvedDrawRing holds more
+	Common::SpscQueue<GpuOperation> m_operations;
+	Common::SpscQueue<GpuOperation> m_resolved;
+	std::atomic_bool                m_execution_sleeping {false};
+	std::atomic_uint32_t            m_execution_bell {0};
+	std::atomic_bool                m_execution_stop {false};
+	bool             m_commands_running = false; // m_queue_mutex
+	// Game and host threads bump it when they queue work, under m_queue_mutex; the command processor spins on it.
+	std::atomic_uint64_t m_work_epoch {0};
+	HW::Context          m_neutral_context;
+	HW::UserConfig       m_neutral_user_config;
+	HW::Shader           m_neutral_shaders;
+	GpuRegisterState     m_neutral_state;
+	std::atomic_uint64_t    m_published {0}; // the newest label in guest memory
 	struct GuestWrite {
 		uint64_t sequence = 0;
 		uint64_t address  = 0;
 		uint64_t size     = 0;
-		bool     known    = false;
-		uint8_t  value[8] = {};
+		uint64_t tick     = 0; // recorded into the stream: an upper bound of its tick, once it executed
+		bool     known      = false;
+		bool     at_publish = false; // a deferred label
+		bool     stream     = false; // recorded into the stream
+		uint8_t  value[8]   = {};
 	};
-
-	const bool                      m_pipelined;
-	const bool                      m_resolving;
-	Common::SpscQueue<GpuOperation> m_operations;
-	Common::SpscQueue<GpuOperation> m_resolved;
-	static constexpr size_t         TableTicketRing = 1024;
-	std::unique_ptr<Scout::Ticket[]> m_table_tickets = std::make_unique<Scout::Ticket[]>(TableTicketRing);
-	uint64_t                        m_table_ticket_next = 0;
-	Common::ProgressCounter         m_executed;
-	uint64_t                        m_emitted = 0;
+	// A ring, oldest first. It holds more writes than the host GPU has in flight.
 	static constexpr size_t PendingWriteCapacity = 16384;
 	std::unique_ptr<GuestWrite[]> m_pending_writes;
 	size_t                        m_pending_first = 0;
 	size_t                        m_pending_count = 0;
+	size_t                        m_pending_ticked = 0; // writes from the oldest on that had their chance at a tick
 	void                          ForgetExecutedWrites();
-	uint64_t                      m_cp_ordered = 0;
-	void PostUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies);
-	void                                      RunUrgentCommands();
-	std::mutex                                m_urgent_mutex;
-	std::vector<Common::UniqueFunction<void>> m_urgent_commands;
-	std::atomic_uint32_t                      m_urgent_pending {0};
-	uint32_t                                  m_urgent_drains = 0;
-	std::atomic_uint64_t m_work_epoch {0};
-	HW::Context                     m_neutral_context;
-	HW::UserConfig                  m_neutral_user_config;
-	HW::Shader                      m_neutral_shaders;
-	GpuRegisterState                m_neutral_state;
-	std::jthread                    m_executor;
-	std::jthread                    m_resolver;
-
-	std::jthread m_thread;
+	[[nodiscard]] bool            WriteLanded(GuestWrite& write, uint64_t executed, uint64_t published, uint64_t known_tick);
+	GuestWrite&                   NewWrite();
+	void                          WaitForOldestWrite();
+	// Puts the pending writes over `value`, read from `address`.
+	void ApplyPendingWrites(const volatile void* address, void* value, size_t size, DecisionRead scope, bool* covered);
+	// GPU thread, the queue waits guard: when a slice last ran a packet, and whether the current slice did.
+	std::chrono::steady_clock::time_point m_last_progress {};
+	bool                                  m_slice_progressed = false;
+	// Project 15 N2.2: the resolve thread's tasks for the helper (each task holds a slot of the 320-slot ring, so 512 never
+	// fill), the tasks pushed (resolve thread) and finished (helper), and the counters of PERF resolve_helper.
+	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks {512};
+	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks2 {512}; // N5.2: the second helper's
+	uint32_t                                       m_deal_turn = 0; // N5.2: the tasks dealt in the current turn
+	uint64_t                                       m_tasks_pushed = 0;
+	std::atomic<uint64_t>                          m_tasks_finished {0};
+	std::atomic<uint64_t>                          m_tasks_claimed {0}; // N5.3: operations with a resolution the execution thread began
+	struct HelperStats {
+		std::atomic<uint64_t> tasks {0}, done {0}, empty {0}, stolen {0}, skipped {0}, ready {0}, running {0}, pending {0};
+		std::atomic<uint64_t> plans {0}, plans_short {0}; // N5.3: plans built; member draws without (lead below the margin)
+		std::atomic<uint64_t> waits {0}, wait_ns {0}, wait_cmd_ns {0}, wait_max_ns {0}, wait_commands {0};
+		// The waits by length (<5, <20, <100, <500, <2000, >=2000 us: count and ns).
+		std::array<std::atomic<uint64_t>, 6> hist_n {}, hist_ns {};
+		// KYTY_CHECK_RESOLVE=2: both empty, refused, reads differ, compared, bad; the fault test: injected, injected and
+		// compared, detected.
+		std::atomic<uint64_t> both_empty {0}, refused {0}, reads_differ {0}, compared {0}, bad {0};
+		std::atomic<uint64_t> injected {0}, injected_compared {0}, detected {0};
+	} m_helper_stats;
+	std::jthread    m_executor;
+	std::jthread    m_resolver;
+	std::jthread    m_resolve_helper;
+	std::jthread    m_resolve_helper2; // N5.2
+	std::jthread    m_thread;
 
 	friend class CommandProcessor;
 };
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

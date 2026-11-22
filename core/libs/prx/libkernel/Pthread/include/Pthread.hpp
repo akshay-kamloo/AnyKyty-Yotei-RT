@@ -221,6 +221,7 @@ extern "C" void DeliverPendingException_nid_no_patch(PthreadPrivate* thread);
 void DeliverDeferredGuestException();
 PthreadPrivate* CurrentGuestThreadForDelivery();
 #endif
+extern "C" PthreadPrivate* CurrentGuestPthreadOrNull_nid_no_patch();
 extern "C" void ResumeAllGuestThreads_nid_no_patch();
 bool LiveGuestThreadExists(std::int64_t tid);
 extern "C" bool LiveGuestThreadName_nid_no_patch(std::int64_t tid, char* name, std::size_t capacity);

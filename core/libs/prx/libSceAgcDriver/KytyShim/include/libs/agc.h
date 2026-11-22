@@ -83,12 +83,10 @@ uint32_t KYTY_SYSV_ABI AgcDriverGetResourceRegistrationMaxNameLength();
 uint32_t KYTY_SYSV_ABI AgcDriverInitResourceRegistration();
 uint32_t KYTY_SYSV_ABI
 AgcDriverQueryResourceRegistrationUserMemoryRequirements(uint64_t* size_in_bytes);
-int KYTY_SYSV_ABI AgcDriverRegisterOwner(uint32_t* owner_handle, const char* name);
-int KYTY_SYSV_ABI AgcDriverRegisterResource(uint32_t* resource_handle, uint32_t owner_handle,
-                                            const void* memory, uint64_t size, const char* name,
-                                            uint32_t type, uint64_t user_data);
+int KYTY_SYSV_ABI AgcDriverRegisterOwner();
+int KYTY_SYSV_ABI AgcDriverRegisterResource();
 int KYTY_SYSV_ABI AgcDriverUnregisterOwnerAndResources(uint32_t owner_handle);
-int KYTY_SYSV_ABI AgcDriverUnregisterResource(uint32_t resource_handle);
+int KYTY_SYSV_ABI AgcDriverUnregisterResource();
 int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void* stream);
 
 uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords);
@@ -127,7 +125,7 @@ uint32_t* KYTY_SYSV_ABI AgcAcbResetQueue(CommandBuffer* buf, uint32_t op);
 uint32_t* KYTY_SYSV_ABI AgcDcbResetQueue(CommandBuffer* buf, uint32_t op, uint32_t state);
 uint32_t* KYTY_SYSV_ABI AgcDcbWaitUntilSafeForRendering(CommandBuffer* buf,
                                                         uint32_t       video_out_handle,
-                                                        int32_t        display_buffer_index);
+                                                        uint32_t       display_buffer_index);
 uint32_t* KYTY_SYSV_ABI AgcDcbSetWorkloadsActive(CommandBuffer* buf, uint32_t stream_id,
                                                  const uint32_t* workload_ids,
                                                  uint32_t        workload_count);
@@ -158,10 +156,10 @@ uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndex(CommandBuffer* buf, uint32_t index_count
                                         const volatile void* index_addr, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexGetSize();
 
-uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t instance_count,
-                                                      const volatile void* object_ids,
+uint32_t* KYTY_SYSV_ABI AgcDcbDrawIndexMultiInstanced(CommandBuffer* buf, uint32_t index_count,
                                                       const volatile void* index_addr,
-                                                      uint32_t index_count, uint64_t modifier);
+                                                      const volatile void* object_ids,
+                                                      uint32_t instance_count, uint64_t modifier);
 uint32_t KYTY_SYSV_ABI  AgcDcbDrawIndexMultiInstancedGetSize();
 int KYTY_SYSV_ABI AgcJumpPatchSetTarget_0300(uint32_t* cmd, uint64_t arg1,
                                        const volatile uint32_t* target, uint32_t size_in_dwords,
@@ -218,8 +216,6 @@ uint32_t* KYTY_SYSV_ABI AgcAcbWaitRegMem(CommandBuffer* buf, uint8_t size, uint8
                                          uint8_t cache_policy, const volatile void* address,
                                          uint64_t reference, uint64_t mask, uint32_t poll_cycles);
 uint64_t KYTY_SYSV_ABI  AgcAcbWaitOnAddressGetSize(uint8_t size);
-uint32_t* KYTY_SYSV_ABI AgcAcbMemSemaphore(CommandBuffer* buf, const volatile void* address,
-                                           uint8_t mailbox, uint8_t signal_type, uint8_t op);
 uint32_t* KYTY_SYSV_ABI AgcAcbDmaData(CommandBuffer* buf, uint8_t dst, uint8_t dst_cache_policy,
                                       uint64_t dst_address_or_offset, uint8_t src,
                                       uint8_t  src_cache_policy,
@@ -308,7 +304,7 @@ uint32_t* KYTY_SYSV_ABI AgcDcbSetFlip(CommandBuffer* buf, uint32_t video_out_han
                                       int32_t display_buffer_index, uint32_t flip_mode,
                                       int64_t flip_arg);
 
-}
+} // namespace Gen5
 
 namespace Gen5Driver {
 
@@ -346,8 +342,8 @@ int KYTY_SYSV_ABI  AgcDriverSetHsOffchipParam(uint64_t value0, uint64_t value1, 
 bool KYTY_SYSV_ABI AgcDriverIsCaptureInProgress();
 int KYTY_SYSV_ABI  AgcDriverRegisterDefaultOwner();
 
-}
+} // namespace Gen5Driver
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_LIBS_AGC_H_ */

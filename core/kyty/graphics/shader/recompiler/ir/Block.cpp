@@ -6,6 +6,8 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 Block::~Block() {
+	// Instructions own reverse-use links. Unlink every argument while all definitions are still
+	// alive, then let the list destroy the detached instructions.
 	for (auto& inst: instructions) {
 		inst.Invalidate();
 	}
@@ -79,4 +81,4 @@ bool Block::empty() const {
 	return instructions.empty();
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

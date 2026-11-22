@@ -2,7 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DYNAMICSTATE_H_
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -56,6 +56,7 @@ struct DynamicState {
 		bool front_face : 1;
 
 		bool blend_constants       : 1;
+		bool color_write_enables   : 1;
 		bool line_width            : 1;
 		bool feedback_loop_aspects : 1;
 	} dirty_state {};
@@ -91,59 +92,17 @@ struct DynamicState {
 	vk::CullModeFlags cull_mode {};
 	vk::FrontFace     front_face {};
 
-	std::array<float, 4> blend_constants {};
-	float                line_width {};
-	vk::ImageAspectFlags feedback_loop_aspects {};
-	uint64_t             generation {};
+	std::array<float, 4>                               blend_constants {};
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write_enables {};
+	uint32_t                                           num_color_write_enables {};
+	float                                              line_width {};
+	vk::ImageAspectFlags                               feedback_loop_aspects {};
 
-	void Commit(const GraphicContext& graphics, CommandRecorder cmdbuf);
+	/// Commits the dynamic state to the provided command buffer.
+	void Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf);
 
-	void Assign(const DynamicState& values) {
-		SetViewports(std::span(values.viewports).first(values.num_viewports));
-		SetScissors(std::span(values.scissors).first(values.num_scissors));
-		SetDepthTestEnabled(values.depth_test_enabled);
-		SetDepthWriteEnabled(values.depth_write_enabled);
-		SetDepthCompareOp(values.depth_compare_op);
-		SetDepthBoundsTestEnabled(values.depth_bounds_test_enabled);
-		SetDepthBounds(values.depth_bounds_min, values.depth_bounds_max);
-		SetDepthBiasEnabled(values.depth_bias_enabled);
-		SetDepthBias(values.depth_bias_constant, values.depth_bias_clamp, values.depth_bias_slope);
-		SetStencilTestEnabled(values.stencil_test_enabled);
-		SetStencilOps(values.stencil_front_ops, values.stencil_back_ops);
-		SetStencilReferences(values.stencil_front_reference, values.stencil_back_reference);
-		SetStencilWriteMasks(values.stencil_front_write_mask, values.stencil_back_write_mask);
-		SetStencilCompareMasks(values.stencil_front_compare_mask, values.stencil_back_compare_mask);
-		SetBlendConstants(values.blend_constants);
-		SetCullMode(values.cull_mode);
-		SetFrontFace(values.front_face);
-		SetLineWidth(values.line_width);
-		SetAttachmentFeedbackLoopAspects(values.feedback_loop_aspects);
-	}
-
-	bool BiasTowardViewer(float units, float slope) {
-		if (!depth_test_enabled || depth_write_enabled || depth_bias_enabled) {
-			return false;
-		}
-		float sign = 0.0f;
-		switch (depth_compare_op) {
-			case vk::CompareOp::eLess:
-			case vk::CompareOp::eLessOrEqual: sign = -1.0f; break;
-			case vk::CompareOp::eGreater:
-			case vk::CompareOp::eGreaterOrEqual: sign = 1.0f; break;
-			default: return false;
-		}
-		SetDepthBiasEnabled(true);
-		SetDepthBias(sign * units, 0.0f, sign * slope);
-		return true;
-	}
-
-	void Invalidate() {
-		std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
-		++generation;
-	}
-
-	[[nodiscard]] uint64_t Generation() const noexcept { return generation; }
-	void                   MoveGeneration() noexcept { ++generation; }
+	/// Invalidates all dynamic state to be flushed into the next command buffer.
+	void Invalidate() { std::memset(&dirty_state, 0xFF, sizeof(dirty_state)); }
 
 	void SetViewports(std::span<const vk::Viewport> viewports_) {
 		EXIT_IF(viewports_.size() > viewports.size());
@@ -289,6 +248,16 @@ struct DynamicState {
 		}
 	}
 
+	void SetColorWriteEnables(std::span<const vk::Bool32> enables) {
+		EXIT_IF(enables.size() > color_write_enables.size());
+		if (!std::ranges::equal(std::span(color_write_enables).first(num_color_write_enables),
+		                        enables)) {
+			std::ranges::copy(enables, color_write_enables.begin());
+			num_color_write_enables         = static_cast<uint32_t>(enables.size());
+			dirty_state.color_write_enables = true;
+		}
+	}
+
 	void SetLineWidth(const float width) {
 		if (line_width != width) {
 			line_width             = width;
@@ -304,6 +273,6 @@ struct DynamicState {
 	}
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DYNAMICSTATE_H_

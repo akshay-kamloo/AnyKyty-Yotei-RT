@@ -9,11 +9,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
-#include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstring>
-#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -21,46 +18,25 @@ namespace Libs::Graphics {
 
 struct ShaderStageRuntime;
 
-struct TextureDescDerivation;
-struct DrawTemplateStage;
-
-struct ImageLookupState {
-	ImageId  id;
-	ImageId  depth_id;
-	uint64_t track_addr      = 0;
-	uint64_t track_addr_end  = 0;
-	bool     cpu_dirty       = false;
-	bool     buffer_modified = false;
-	bool     gpu_modified    = false;
-	bool     render_target   = false;
-
-	bool operator==(const ImageLookupState&) const = default;
-
-	[[nodiscard]] static ImageLookupState Of(ImageId id, const Image& image) {
-		return {.id              = id,
-		        .depth_id        = image.depth_id,
-		        .track_addr      = image.track_addr,
-		        .track_addr_end  = image.track_addr_end,
-		        .cpu_dirty       = image.IsCpuDirty(),
-		        .buffer_modified = image.IsBufferModified(),
-		        .gpu_modified    = image.IsGpuModified(),
-		        .render_target   = image.usage.render_target};
-	}
-};
-
-struct TableViewMemo {
-	ImageLookupState state;
-	bool             valid = false;
-};
-
 struct TextureBinding {
 	ImageId                    image_id;
 	vk::ImageView              image_view = nullptr;
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
 	std::vector<vk::ImageView> mip_views;
-	TextureDescDerivation* lookup = nullptr;
-	bool                   reused = false;
+};
+
+// Project 15 S2b/N4.1: a stage's images and samplers answered without a write (RenderExecutor::PeekStageImages).
+struct PeekStageImagesResult {
+	bool                                    pending = false, samplers_answered = false;
+	std::vector<uint8_t>                    stale; // today's path took a slow path for the slot
+	uint64_t                                epoch = 0; // the image registry epoch at the peek
+	uint64_t                                set_version = 0; // the table set that answered (0: none)
+	std::vector<uint8_t>                    klass;
+	std::vector<ImageId>                    ids;
+	std::vector<vk::ImageView>              views;
+	std::vector<std::vector<vk::ImageView>> mips;
+	std::vector<vk::Sampler>                samplers;
 };
 
 struct PreparedBindings {
@@ -70,111 +46,58 @@ struct PreparedBindings {
 		BufferId id;
 	};
 
+	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
 	const ShaderStageRuntime* runtime = nullptr;
+	// Keep the resolved guest range through cache preparation; only the host buffer ID may
+	// become stale and need resolving again when bindings are rebound.
 	std::vector<BufferSource>             buffer_sources;
+	// Project 15 way B P1.2: per buffer binding, the plan entry FindBuffers took its source from (RebindBuffers answers it)
+	std::vector<struct PlanBuffer*>       plan_entries;
 	std::vector<vk::DescriptorBufferInfo> buffers;
-	std::vector<vk::DescriptorBufferInfo> uniform_buffers;
 	std::vector<TextureBinding>           images;
-	std::vector<TextureBinding*>                        table_images;
-	std::vector<TableViewMemo*>                         table_views;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> table_sources;
-	std::vector<uint32_t>                               table_roots;
-	std::vector<uint32_t>                               table_versions;
-	std::vector<uint32_t>                               table_slots;
-	void*                                               table_state   = nullptr;
-	bool                                                tables_reused = false;
-	std::vector<uint32_t>                               table_visits;
-	std::vector<uint32_t>                               table_moved_slots;
 	std::vector<vk::Sampler>              samplers;
+	// The table sets (descriptors.cpp): the stage set used by this call (hit) or to complete with its views (store);
+	// the image registry epoch after the hit proof.
+	void*                                 table_hit    = nullptr;
+	void*                                 table_store  = nullptr;
+	uint64_t                              table_epoch  = 0;
+	std::vector<uint64_t>                 image_source; // the table sets: per image slot, the set version it was filled from (0: none)
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
-	bool                                  flattened_srt_known = false;
+	// Uniform const buffers (ShaderIR.h): the same uploaded SRT words as a uniform buffer view (ReadConst).
+	vk::DescriptorBufferInfo              flattened_srt_uniform;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
-	const void*                                        last_program          = nullptr;
-	uint64_t                                           last_descs_generation = 0;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;
-	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
-	std::vector<TextureDescDerivation*>                image_descs;
-	const DrawTemplateStage* template_stage  = nullptr;
-	uint64_t                 template_images = 0;
+	// KYTY_BINDLESS: flattened-SRT words to patch (offset, region, entries) and the resolved
+	// bindless textures the draw may sample.
+	struct BindlessPatch {
+		uint32_t offset  = 0;
+		uint32_t region  = 0;
+		uint32_t entries = 0;
+	};
+	std::vector<BindlessPatch>            bindless_patches;
+	std::vector<ImageId>                  bindless_images;
+	// Record-keyed V#s: guest ranges the stage's record-keyed V#s can touch through BDA (from the snapshot).
+	// The scalar-read check tests [address, address + size); its first `resident` bytes are committed memory, made
+	// resident (and GPU-modified when written) before the draw or dispatch.
+	struct IndirectRange {
+		uint64_t address  = 0;
+		uint64_t size     = 0;
+		uint64_t resident = 0;
+		bool     written  = false;
+		BufferId id;
+	};
+	std::vector<IndirectRange>            indirect_ranges;
+	// KYTY_CHECK_CHUNKS=2: the GPU-read SRT words as the shader reaches them, without the word stream's offsets (a direct
+	// word: its guest address and value; a cached one: its device address) - the fingerprint's stable form.
+	uint64_t                              gpu_words_key = 0;
 };
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
-
-struct ImageTableFill {
-	uint32_t base       = 0;
-	uint32_t capacity   = 0;
-	uint32_t first_slot = 0;
-};
-
-[[nodiscard]] bool TableDescriptorWrites(vk::DriverId driver);
-
-void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
-                          std::vector<vk::WriteDescriptorSet>& gap_writes);
-void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables, bool writes,
-                           vk::DescriptorSet persistent, std::span<const vk::DescriptorImageInfo> slot_infos,
-                           std::span<const uint8_t> slot_live, std::vector<vk::WriteDescriptorSet>& table_writes,
-                           std::vector<vk::CopyDescriptorSet>& table_copies);
-void AppendImageTableSeed(uint32_t binding, vk::DescriptorType type, const ImageTableFill& table, bool writes,
-                          vk::DescriptorSet set, vk::DescriptorSet persistent,
-                          std::span<const vk::DescriptorImageInfo> slot_infos,
-                          std::vector<vk::WriteDescriptorSet>&     seed_writes,
-                          std::vector<vk::CopyDescriptorSet>&      seed_copies);
-void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorSet>& writes,
-                         std::span<const vk::WriteDescriptorSet> table_writes,
-                         std::span<vk::CopyDescriptorSet>         copies,
-                         std::span<const vk::WriteDescriptorSet> slot_set_writes);
-
-struct ImageTableBinding {
-	const void*                              state = nullptr;
-	vk::DescriptorSet                        persistent;
-	std::span<const vk::DescriptorImageInfo> slot_infos;
-	vk::WriteDescriptorSet                   whole;
-	std::array<ImageTableFill, 16>           tables {};
-	uint32_t                                 count = 0;
-};
-
-template <typename TProve>
-void AppendTableBindingFills(std::span<const ImageTableBinding> bindings, bool writes, TProve&& prove,
-                             std::vector<vk::WriteDescriptorSet>& table_writes,
-                             std::vector<vk::CopyDescriptorSet>&  table_copies) {
-	const void*              proven = nullptr;
-	std::span<const uint8_t> slot_live;
-	for (const auto& binding: bindings) {
-		if (writes && binding.state != proven) {
-			proven    = binding.state;
-			slot_live = prove(binding.state);
-		}
-		AppendImageTableFills(binding.whole, std::span {binding.tables.data(), binding.count}, writes,
-		                      binding.persistent, binding.slot_infos, slot_live, table_writes, table_copies);
-	}
-}
-
-template <typename TViewsOf>
-void MarkLiveTableElements(std::span<const vk::DescriptorImageInfo> infos, TViewsOf&& views_of,
-                           std::vector<uint8_t>& element_live) {
-	element_live.resize(infos.size());
-	for (size_t index = 0; index < infos.size(); index++) {
-		const auto view = infos[index].imageView;
-		if (view == nullptr) {
-			element_live[index] = 1;
-			continue;
-		}
-		const std::vector<CachedImageView>* views = views_of(index);
-		element_live[index] =
-		    views != nullptr && std::ranges::find(*views, view, &CachedImageView::view) != views->end() ? 1 : 0;
-	}
-}
-
-[[nodiscard]] bool MarkLiveTableSlots(std::span<const uint32_t>                slots,
-                                      std::span<const vk::DescriptorImageInfo> slot_infos,
-                                      std::span<const vk::DescriptorImageInfo> infos,
-                                      std::span<const uint8_t> element_live, std::vector<uint8_t>& slot_live);
 
 template <typename T>
 [[nodiscard]] T DecodeNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& value) {
@@ -188,9 +111,17 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
+// KYTY_WORKAROUND_DEPTH_ENCODING_LENIENT (stage 2 pack 2, #15): for a depth T# IsSupportedDepthTextureEncoding refused, what
+// differs from the encoding it accepts (descriptors.cpp has the rule, from RDNA2 ISA table 45).
+enum class DepthEncodingFields : uint32_t {
+	Ignored, // only fields the texture unit does not use for this T#: sampling reads what the accepted encoding reads
+	Corner,  // as Ignored, but CORNER_SAMPLES = 1 (texel placement; not emulated)
+	Other,   // anything else (other types, R128, BASE_ARRAY, compression with other metadata, reserved bits of words 1-3)
+};
+[[nodiscard]] DepthEncodingFields DepthEncodingFieldsVerdict(const ShaderTextureResource& descriptor, bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DESCRIPTORS_H_

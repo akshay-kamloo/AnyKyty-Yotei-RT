@@ -18,10 +18,11 @@ bool BlendFactorIsConstantColor(uint8_t factor) {
 	       factor == static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusConstantColor);
 }
 
-}
+} // namespace
 
 BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                blend,
                                          const Prospero::ColorComponentMapping& mapping) {
+	// Color constants are not swizzled with the exports; scalar constant alpha is unaffected.
 	if (!mapping.IsIdentity() && (BlendFactorIsConstantColor(blend.color_srcblend) ||
 	                              BlendFactorIsConstantColor(blend.color_destblend))) {
 		return BlendMappingSupport::Unsupported;
@@ -41,6 +42,7 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 			default: break;
 		}
 	}
+	// Moving alpha requires the same equation for all channels.
 	if (blend.separate_alpha_blend && (blend.alpha_srcblend != blend.color_srcblend ||
 	                                   blend.alpha_destblend != blend.color_destblend ||
 	                                   blend.alpha_comb_fcn != blend.color_comb_fcn)) {
@@ -65,4 +67,4 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 	return support;
 }
 
-}
+} // namespace Libs::Graphics

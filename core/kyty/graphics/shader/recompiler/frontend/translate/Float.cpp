@@ -2,96 +2,100 @@
 
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool NativeF16Enabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_NATIVE_F16");
-		return value == nullptr || value[0] != '0';
-	}();
-	return enabled;
-}
+// f16 adds, multiplies, FMAs and min/max/min3/max3/med3 (V_PK_* and the scalar V_*_F16 forms) are HalfPk* operations on
+// the packed bits, emitted as f16vec2 arithmetic instead of each lane through exact f16 -> f32 and f32 -> f16 conversions
+// (FSR3 accumulate d4288915: ~71% of its SPIR-V operations were those conversions, 7.1 -> 4.7 ms on the GPU), and the
+// mixed-precision FMA's f16 operands and result take plain conversions. Same results as the f32 path (all lane pairs,
+// spirvEmitterAluHelpers.cpp), except that an FMA rounds once, as the guest's fused FMA does.
+// The signaling-NaN override of the native V_PK_MIN/MAX_F16 path works on whole packed words instead of per lane (package
+// FSR3 1.84 -> 1.62 ms, Volfog 1.02 -> 0.86 ms, open world +1.4%). For an operand's two raw lanes X (exactly the bits the
+// per-lane form reads), s = ((X & 0x7dff7dff) + 0x03ff03ff) & 0x80008000 has bit 15 of a lane set iff the lane's exponent
+// is all ones and its low 9 payload bits are not zero (the per-lane test; no carry crosses into the other lane, 0x7dff +
+// 0x3ff < 0x10000); m = (s >> 15) * 0xffff is that lane's mask; the result's masked lanes take X | 0x02000200 (the quieted
+// lanes). src1 first, then src0, gives src0 priority as the selects do. CPU check over every 32-bit word and 84 M random
+// triples (verify_snan_swar.py): 0 differences. FSR3 accumulate: 978 -> 423 SPIR-V operations.
 
-namespace {
-
-IR::ValueOpcode NativeScalarF16Opcode(IR::ValueOpcode opcode) {
+// The HalfPk* operation of an f32 opcode the f16 translations use, or None.
+static IR::ValueOpcode HalfOpcode(IR::ValueOpcode opcode) {
 	switch (opcode) {
-		case IR::ValueOpcode::FPAdd32: return IR::ValueOpcode::FPAdd16;
-		case IR::ValueOpcode::FPSub32: return IR::ValueOpcode::FPSub16;
-		case IR::ValueOpcode::FPMul32: return IR::ValueOpcode::FPMul16;
-		case IR::ValueOpcode::FPFma32: return IR::ValueOpcode::FPFma16;
-		case IR::ValueOpcode::FPMin32: return IR::ValueOpcode::FPMin16;
-		case IR::ValueOpcode::FPMax32: return IR::ValueOpcode::FPMax16;
-		default: return IR::ValueOpcode::Identity;
+		case IR::ValueOpcode::FPAdd32: return IR::ValueOpcode::HalfPkAdd;
+		case IR::ValueOpcode::FPMul32: return IR::ValueOpcode::HalfPkMul;
+		case IR::ValueOpcode::FPFma32: return IR::ValueOpcode::HalfPkFma;
+		case IR::ValueOpcode::FPMin32: return IR::ValueOpcode::HalfPkMin;
+		case IR::ValueOpcode::FPMax32: return IR::ValueOpcode::HalfPkMax;
+		case IR::ValueOpcode::FPMinTri32: return IR::ValueOpcode::HalfPkMinTri;
+		case IR::ValueOpcode::FPMaxTri32: return IR::ValueOpcode::HalfPkMaxTri;
+		case IR::ValueOpcode::FPMedTri32: return IR::ValueOpcode::HalfPkMedTri;
+		default: return IR::ValueOpcode::Void;
 	}
-}
-
-IR::ValueOpcode NativePackedF16Opcode(IR::ValueOpcode opcode) {
-	switch (opcode) {
-		case IR::ValueOpcode::FPAdd32: return IR::ValueOpcode::PackedFPAdd16x2;
-		case IR::ValueOpcode::FPMul32: return IR::ValueOpcode::PackedFPMul16x2;
-		case IR::ValueOpcode::FPFma32: return IR::ValueOpcode::PackedFPFma16x2;
-		case IR::ValueOpcode::FPMin32: return IR::ValueOpcode::PackedFPMin16x2;
-		case IR::ValueOpcode::FPMax32: return IR::ValueOpcode::PackedFPMax16x2;
-		default: return IR::ValueOpcode::Identity;
-	}
-}
-
-}
-
-IR::U32 Translator::ReadPackedF16(const Decoder::Operand& operand) {
-	if (operand.sdwa_sel == 6u && operand.kind != Decoder::OperandKind::FloatInlineConstant) {
-		const auto raw    = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
-		const auto insert = [&](IR::U32 base, IR::U32 half, uint32_t offset) {
-			return IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
-			                       {base, half, IR::Value(offset), IR::Value(16u)}));
-		};
-		const auto high = [&] { return ir.ShiftRightLogical(raw, IR::U32(IR::Value(16u))); };
-		auto       bits = raw;
-		if (operand.op_sel && !operand.op_sel_hi) {
-			bits = ir.BitwiseOr(high(), ir.ShiftLeftLogical(raw, IR::U32(IR::Value(16u))));
-		} else if (!operand.op_sel && !operand.op_sel_hi) {
-			bits = insert(raw, raw, 16u);
-		} else if (operand.op_sel && operand.op_sel_hi) {
-			bits = insert(raw, high(), 0u);
-		}
-		if (operand.absolute) {
-			bits = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7fff7fffu)));
-		}
-		const auto sign = (operand.negate ? 0x8000u : 0u) | (operand.negate_hi ? 0x80000000u : 0u);
-		if (sign != 0u) {
-			bits = ir.BitwiseXor(bits, IR::U32(IR::Value(sign)));
-		}
-		return bits;
-	}
-	const auto low  = Read16LaneBits(operand, false);
-	const auto high = Read16LaneBits(operand, true);
-	return ir.BitwiseOr(low, ir.ShiftLeftLogical(high, IR::U32(IR::Value(16u))));
 }
 
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
-	const auto native = NativePackedF16Opcode(opcode);
-	if (NativeF16Enabled() && native != IR::ValueOpcode::Identity && inst.dst.omod == 0u &&
-	    !inst.dst.clamp) {
-		const auto lhs = ReadPackedF16(inst.src0);
-		const auto rhs = ReadPackedF16(inst.src1);
-		IR::U32    result;
+	if (const auto half_opcode = HalfOpcode(opcode); half_opcode != IR::ValueOpcode::Void && inst.dst.omod == 0u) {
+		const auto packed = [&](const Decoder::Operand& operand) {
+			// A register operand read whole (low lane from bits 0-15, high from 16-31, no SDWA, no inline float) is the
+			// register with abs as AND 0x7fff7fff and neg/neg_hi as XOR of the sign bits: the same bits as extracting both
+			// lanes, applying the modifiers to each and packing them again (FSR3 2.89 -> 2.50 ms on the GPU).
+			if (operand.kind != Decoder::OperandKind::FloatInlineConstant && operand.sdwa_sel == 6u && !operand.op_sel &&
+			    operand.op_sel_hi) {
+				auto raw_operand      = operand;
+				raw_operand.sdwa_sext = false;
+				auto bits             = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+				if (operand.absolute) bits = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7fff7fffu)));
+				const uint32_t sign = (operand.negate ? 0x8000u : 0u) | (operand.negate_hi ? 0x80000000u : 0u);
+				if (sign != 0u) bits = ir.BitwiseXor(bits, IR::U32(IR::Value(sign)));
+				return bits;
+			}
+			return PackU16Lanes(Read16LaneBits(operand, false), Read16LaneBits(operand, true));
+		};
+		const auto lhs = packed(inst.src0);
+		const auto rhs = packed(inst.src1);
+		IR::U32    native;
 		if (accumulator) {
-			result = IR::U32(ir.Emit(native, {lhs, rhs, ReadPackedF16(inst.dst)}));
+			native = IR::U32(ir.Emit(half_opcode, {lhs, rhs, packed(inst.dst)}));
 		} else if (inst.src_count == 3u) {
-			result = IR::U32(ir.Emit(native, {lhs, rhs, ReadPackedF16(inst.src2)}));
+			native = IR::U32(ir.Emit(half_opcode, {lhs, rhs, packed(inst.src2)}));
 		} else {
-			result = IR::U32(ir.Emit(native, {lhs, rhs}));
+			native = IR::U32(ir.Emit(half_opcode, {lhs, rhs}));
 		}
-		auto raw = DestinationOperand(inst);
+		if (inst.dst.clamp) {
+			native = IR::U32(ir.Emit(IR::ValueOpcode::HalfPkSaturate, {native}));
+		}
+		auto raw  = DestinationOperand(inst);
+		raw.omod  = 0u;
+		raw.clamp = false;
 		if (quiet_snan) {
-			result = QuietPackedSnan(inst, result);
+			// As below, on the packed raw lanes of each operand: a signaling NaN operand gives itself quieted.
+			const auto raw_lanes = [&](const Decoder::Operand& operand) {
+				if (operand.sdwa_sel == 6u && !operand.op_sel && operand.op_sel_hi &&
+				    operand.kind != Decoder::OperandKind::FloatInlineConstant) {
+					auto raw_operand      = operand;
+					raw_operand.sdwa_sext = false;
+					return ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
+				}
+				return PackU16Lanes(Read16LaneBits(operand, false), Read16LaneBits(operand, true));
+			};
+			const auto take_quiet = [&](IR::U32 result, const Decoder::Operand& operand) {
+				if (operand.kind == Decoder::OperandKind::FloatInlineConstant) return result; // never a NaN
+				const auto x = raw_lanes(operand);
+				const auto s = ir.BitwiseAnd(ir.IAdd(ir.BitwiseAnd(x, IR::U32(IR::Value(0x7dff7dffu))),
+				                                     IR::U32(IR::Value(0x03ff03ffu))),
+				                             IR::U32(IR::Value(0x80008000u)));
+				const auto m = ir.IMul(ir.ShiftRightLogical(s, IR::U32(IR::Value(15u))), IR::U32(IR::Value(0xffffu)));
+				const auto q = ir.BitwiseOr(x, IR::U32(IR::Value(0x02000200u)));
+				return ir.BitwiseXor(result, ir.BitwiseAnd(ir.BitwiseXor(result, q), m));
+			};
+			native = take_quiet(take_quiet(native, inst.src1), inst.src0);
 		}
-		WriteOperand(raw, result);
+		WriteOperand(raw, native);
 		return;
 	}
 	const auto translate_lane = [&](bool high) {
@@ -112,28 +116,24 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	raw.clamp   = false;
 	auto result = PackHalf2x16(translate_lane(false), translate_lane(true));
 	if (quiet_snan) {
-		result = QuietPackedSnan(inst, result);
+		const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
+			const auto bits     = ReadU16LaneAsU32(operand, high, false);
+			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7e00u)));
+			const auto payload  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x01ffu)));
+			const auto snan     = ir.LogicalAnd(ir.IEqual(exponent, IR::U32(IR::Value(0x7c00u))),
+			                                    ir.INotEqual(payload, IR::U32(IR::Value(0u))));
+			return std::pair {snan, ir.BitwiseOr(bits, IR::U32(IR::Value(0x0200u)))};
+		};
+		const auto override_lane = [&](bool high) {
+			const auto [lhs_snan, lhs_quiet] = quiet_snan_lane(inst.src0, high);
+			const auto [rhs_snan, rhs_quiet] = quiet_snan_lane(inst.src1, high);
+			const auto normal = high ? ir.ShiftRightLogical(result, IR::U32(IR::Value(16u)))
+			                         : ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu)));
+			return ir.Select(lhs_snan, lhs_quiet, ir.Select(rhs_snan, rhs_quiet, normal));
+		};
+		result = PackU16Lanes(override_lane(false), override_lane(true));
 	}
 	WriteOperand(raw, result);
-}
-
-IR::U32 Translator::QuietPackedSnan(const Decoder::Instruction& inst, IR::U32 result) {
-	const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
-		const auto bits     = ReadU16LaneAsU32(operand, high, false);
-		const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7e00u)));
-		const auto payload  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x01ffu)));
-		const auto snan     = ir.LogicalAnd(ir.IEqual(exponent, IR::U32(IR::Value(0x7c00u))),
-		                                    ir.INotEqual(payload, IR::U32(IR::Value(0u))));
-		return std::pair {snan, ir.BitwiseOr(bits, IR::U32(IR::Value(0x0200u)))};
-	};
-	const auto override_lane = [&](bool high) {
-		const auto [lhs_snan, lhs_quiet] = quiet_snan_lane(inst.src0, high);
-		const auto [rhs_snan, rhs_quiet] = quiet_snan_lane(inst.src1, high);
-		const auto normal = high ? ir.ShiftRightLogical(result, IR::U32(IR::Value(16u)))
-		                         : ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu)));
-		return ir.Select(lhs_snan, lhs_quiet, ir.Select(rhs_snan, rhs_quiet, normal));
-	};
-	return PackU16Lanes(override_lane(false), override_lane(true));
 }
 
 void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
@@ -168,6 +168,8 @@ void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 		result = IR::F32(ir.Emit(
 		    IR::ValueOpcode::SelectF32, {cardinal, IR::Value::F32(0.0f), result}));
 	} else {
+		// The architectural quarter-cycle result is exactly zero. Evaluating cos(pi/2) with a
+		// rounded F32 PI can otherwise produce a half-precision subnormal instead.
 		const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
 		const auto quarter = IR::U1(
 		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
@@ -185,70 +187,22 @@ void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 	Write16Bits(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
 }
 
-IR::F16 Translator::ReadF16Lane(const Decoder::Operand& operand, bool high_lane) {
-	if (operand.kind != Decoder::OperandKind::FloatInlineConstant && operand.sdwa_sel >= 4u) {
-		auto raw_operand      = operand;
-		raw_operand.sdwa_sel  = 6;
-		raw_operand.sdwa_sext = false;
-		const auto bits = ApplyBitSourceModifiers(raw_operand, ReadRawU32(operand));
-		bool       high = high_lane ? operand.op_sel_hi : operand.op_sel;
-		if (operand.sdwa_sel != 6u) {
-			high = operand.sdwa_sel == 5u;
-		}
-		auto value =
-		    IR::F16(ir.Emit(IR::ValueOpcode::ExtractF16Lane, {bits, IR::Value(high ? 1u : 0u)}));
-		if (operand.absolute) {
-			value = IR::F16(ir.Emit(IR::ValueOpcode::FPAbs16, {value}));
-		}
-		if (high_lane ? operand.negate_hi : operand.negate) {
-			value = IR::F16(ir.Emit(IR::ValueOpcode::FPNeg16, {value}));
-		}
-		return value;
-	}
-	const auto bits = Read16LaneBits(operand, high_lane);
-	return IR::F16(ir.Emit(IR::ValueOpcode::BitCastF16U16,
-	                       {IR::U16(ir.Emit(IR::ValueOpcode::ConvertU16U32, {bits}))}));
-}
-
-bool Translator::WriteF16Lane(const Decoder::Operand& operand, IR::F16 value) {
-	auto destination = operand;
-	if (!destination.explicit_sdwa_dst) {
-		if (destination.sdwa_sel == 6u) {
-			destination.sdwa_sel = 4u;
-		}
-		destination.sdwa_dst_unused = 2u;
-	}
-	if ((destination.sdwa_sel != 4u && destination.sdwa_sel != 5u) ||
-	    destination.sdwa_dst_unused != 2u ||
-	    (destination.kind != Decoder::OperandKind::Vgpr &&
-	     destination.kind != Decoder::OperandKind::Sgpr)) {
-		return false;
-	}
-	destination.omod   = 0u;
-	destination.op_sel = false;
-	destination.clamp  = false;
-	const auto old     = ReadRawU32(PlainOperand(destination));
-	const auto merged  = IR::U32(ir.Emit(IR::ValueOpcode::InsertF16Lane,
-	                                     {old, value, IR::Value(destination.sdwa_sel == 5u ? 1u : 0u)}));
-	destination.sdwa_sel = 6u;
-	WriteRawU32(destination, merged);
-	return true;
-}
-
 void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
-	const auto native      = NativeScalarF16Opcode(opcode);
-	const auto destination = DestinationOperand(inst);
-	if (NativeF16Enabled() && native != IR::ValueOpcode::Identity && destination.omod == 0u &&
-	    !destination.clamp) {
-		const auto lhs    = ReadF16Lane(reverse ? inst.src1 : inst.src0, false);
-		const auto rhs    = ReadF16Lane(reverse ? inst.src0 : inst.src1, false);
-		const auto result = IR::F16(ir.Emit(native, {lhs, rhs}));
-		if (!WriteF16Lane(destination, result)) {
-			Write16Bits(destination, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
-			                                         {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16,
-			                                                          {result}))})));
+	// The low lane of a HalfPk* operation; a - b as a + (-b) (IEEE subtraction).
+	const bool subtract = opcode == IR::ValueOpcode::FPSub32;
+	if (const auto half_opcode = HalfOpcode(subtract ? IR::ValueOpcode::FPAdd32 : opcode);
+	    half_opcode != IR::ValueOpcode::Void && inst.dst.omod == 0u) {
+		const auto lhs = Read16LaneBits(reverse ? inst.src1 : inst.src0, false);
+		auto       rhs = Read16LaneBits(reverse ? inst.src0 : inst.src1, false);
+		if (subtract) {
+			rhs = ir.BitwiseXor(rhs, IR::U32(IR::Value(0x8000u)));
 		}
+		auto result = IR::U32(ir.Emit(half_opcode, {lhs, rhs}));
+		if (inst.dst.clamp) {
+			result = IR::U32(ir.Emit(IR::ValueOpcode::HalfPkSaturate, {result}));
+		}
+		Write16Bits(DestinationOperand(inst), result);
 		return;
 	}
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
@@ -258,27 +212,38 @@ void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
 
 void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
-	const auto native      = NativeScalarF16Opcode(opcode);
-	const auto destination = DestinationOperand(inst);
-	if (NativeF16Enabled() && !mix && native == IR::ValueOpcode::FPFma16 &&
-	    destination.omod == 0u && !destination.clamp) {
-		std::array<IR::Value, 3> halves;
-		for (uint32_t index = 0; index < halves.size(); index++) {
-			halves[index] =
-			    ReadF16Lane(accumulator && index == 2u ? inst.dst : SourceAt(inst, index), false);
+	// The low lane of a HalfPk* operation (not the mixed-precision forms).
+	if (const auto half_opcode = HalfOpcode(opcode);
+	    !mix && half_opcode != IR::ValueOpcode::Void && inst.dst.omod == 0u) {
+		std::array<IR::Value, 3> bits;
+		for (uint32_t index = 0; index < bits.size(); index++) {
+			bits[index] = Read16LaneBits(accumulator && index == 2u ? inst.dst : SourceAt(inst, index), false);
 		}
-		const auto result = IR::F16(ir.Emit(native, {halves[0], halves[1], halves[2]}));
-		if (!WriteF16Lane(destination, result)) {
-			Write16Bits(destination, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16,
-			                                         {IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16,
-			                                                          {result}))})));
+		auto result = IR::U32(ir.Emit(half_opcode, {bits[0], bits[1], bits[2]}));
+		if (inst.dst.clamp) {
+			result = IR::U32(ir.Emit(IR::ValueOpcode::HalfPkSaturate, {result}));
 		}
+		Write16Bits(DestinationOperand(inst), result);
 		return;
 	}
+	// Mixed precision: the f16 operands and the f16 result of the f32 FMA converted without
+	// the NaN payload encodings (HalfToF32Arith / F32ToHalfArith), as WriteF16 does otherwise.
+	const bool arith_conversions = mix && opcode == IR::ValueOpcode::FPFma32;
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
+		if (arith_conversions && operand.op_sel_hi) {
+			args[index] = ir.Emit(IR::ValueOpcode::HalfToF32Arith, {Read16LaneBits(operand, false)});
+			continue;
+		}
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
+	}
+	if (arith_conversions) {
+		const auto destination = DestinationOperand(inst);
+		const auto value =
+		    ApplyF32ResultModifiers(destination, IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
+		Write16Bits(destination, IR::U32(ir.Emit(IR::ValueOpcode::F32ToHalfArith, {value})));
+		return;
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
 }
@@ -289,6 +254,8 @@ void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode op
 }
 
 void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
+	// x - floor(x) rounds to 1.0 for a tiny negative x; v_fract returns the largest value below
+	// one instead. The ordered compare lets NaN through.
 	const auto destination = DestinationOperand(inst);
 	if (type == IR::Type::F64) {
 		const auto result    = ir.Emit(IR::ValueOpcode::FPFract64, {ReadOperand(inst.src0, type)});
@@ -301,6 +268,7 @@ void Translator::V_FRACT(const Decoder::Instruction& inst, IR::Type type) {
 	const bool half   = type == IR::Type::F16;
 	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, type));
 	const auto result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	// Clamp in the destination precision: 0x3f7fe000 is the half 0x3bff.
 	const auto below_one =
 	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
 	const auto above   = IR::U1(ir.Emit(IR::ValueOpcode::FPOrdGreaterThan32, {result, below_one}));
@@ -425,4 +393,4 @@ void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 	WriteOperand(DestinationOperand(inst), result);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

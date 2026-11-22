@@ -31,6 +31,7 @@ struct ExceptionInfo {
 	uint64_t            r14                    = 0;
 	uint64_t            r15                    = 0;
 	uint32_t            native_code            = 0;
+	// Platform-specific mutable context, valid only for the duration of the handler call.
 	void* native_context = nullptr;
 };
 
@@ -38,11 +39,16 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Diagnostics (the KYTY_TRACE_PERF_SAMPLE stack unwinder): while on, the calling thread's access violations skip the
+// emulator's handler and reach the thread's own __except.
+void PassAccessViolations(bool pass);
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 bool InitializeThreadSignalStack();
-int GuestSignalDispatchSignal();
 #endif
 
-}
+} // namespace Common::HostException
 
-#endif
+#endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */

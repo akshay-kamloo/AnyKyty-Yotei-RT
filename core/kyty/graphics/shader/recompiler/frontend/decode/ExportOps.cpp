@@ -36,4 +36,4 @@ void DecodeExp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

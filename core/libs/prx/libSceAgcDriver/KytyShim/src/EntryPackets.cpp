@@ -55,10 +55,15 @@ uint32_t CpOpAnyPs5Flip(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* b
         EXIT("AnyPS5 flip packet at 0x%05" PRIx32 ": header 0x%08" PRIx32 " with %" PRIu32 " dwords left, expected 0x%08" PRIx32 " and %" PRIu32 "\n",
              num_dw - dw, cmd_id, dw, AgcDriver::FlipPacketHeader, AgcDriver::FlipPacketWords);
     }
-    cp.WriteBackImages();
-    cp.Flip(static_cast<int>(flip->handle), flip->index, static_cast<int>(flip->mode), flip->argument);
+    CommandProcessor::FlipInfo f;
+    f.handle    = static_cast<int>(flip->handle);
+    f.index     = flip->index;
+    f.flip_mode = static_cast<int>(flip->mode);
+    f.flip_arg  = flip->argument;
+    cp.SetFlip(f);
+    cp.Flip();
     if (KytyShim::Entry::OwnsFlipPacket(packet)) {
-        cp.EmitHostCommand([packet] { KytyShim::Entry::ReleaseFlipPacket(packet); });
+        cp.EmitCallback([packet] { KytyShim::Entry::ReleaseFlipPacket(packet); });
     }
     return AgcDriver::FlipPacketWords - 1u;
 }
@@ -72,7 +77,7 @@ uint32_t CpOpAnyPs5RenderingWait(CommandProcessor& cp, uint32_t cmd_id, const ui
              num_dw - dw, cmd_id, dw, AgcDriver::RenderingWaitPacketHeader, AgcDriver::RenderingWaitPacketWords);
     }
     if (target->mode != 0) EXIT("AnyPS5 rendering wait packet at 0x%05" PRIx32 ": mode %" PRIu32 " is not implemented\n", num_dw - dw, target->mode);
-    cp.EmitHostCommand([wait = *target] { KytyShim::Entry::WaitForRendering(wait); });
+    cp.EmitCallback([wait = *target] { KytyShim::Entry::WaitForRendering(wait); });
     return AgcDriver::RenderingWaitPacketWords - 1u;
 }
 
@@ -125,7 +130,7 @@ constexpr uint32_t AGC_INTERNAL_DATA_PACKET_SIZE_DW   = 3u;
 
 bool AgcIsInternalDataPacket(uint32_t cmd_id, const uint32_t* payload) {
     if (payload == nullptr || ((cmd_id >> 8u) & 0xffu) != Pm4::IT_SET_UCONFIG_REG ||
-        KYTY_PM4_R(cmd_id) != 1u || payload[0] != Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+        KYTY_PM4_R(cmd_id) != 1u || payload[0] != 0x342u) {
         return false;
     }
 

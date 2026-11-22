@@ -11,6 +11,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,7 +19,7 @@ namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
 struct TypeAnnotation {
 	spv::Op               opcode = spv::OpNop;
-	std::vector<uint32_t> operands;
+	std::vector<uint32_t> operands; // Already encoded operand words.
 };
 
 struct DeferredPhi {
@@ -38,23 +39,21 @@ public:
 	uint32_t Import(const char* name);
 	template <typename... Args>
 	uint32_t Type(spv::Op opcode, const Args&... operands) {
-		return DecoratedType(opcode, {}, operands...);
+		return DeclareType(opcode, MakeTypeKey(opcode, operands...));
 	}
 
 	template <typename... Args>
 	uint32_t DecoratedType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations,
 	                       const Args&... operands) {
-		const auto operand_count = static_cast<uint32_t>((0u + ... + OperandWordCount(operands)));
-		m_key.clear();
-		AppendOperands(m_key, opcode, operand_count, operands...);
-		return DeclareType(opcode, annotations);
+		return DeclareDecoratedType(opcode, MakeTypeKey(opcode, operands...), annotations);
 	}
 
 	template <typename... Args>
 	uint32_t Constant(spv::Op opcode, uint32_t type, const Args&... operands) {
-		m_key.clear();
-		AppendOperands(m_key, opcode, type, operands...);
-		return DeclareConstant(opcode);
+		std::vector<uint32_t> key;
+		key.reserve(2u + (0u + ... + OperandWordCount(operands)));
+		AppendOperands(key, opcode, type, operands...);
+		return DeclareConstant(opcode, std::move(key));
 	}
 
 	uint32_t DefineGlobalVariable(uint32_t pointer_type, spv::StorageClass storage_class);
@@ -83,6 +82,8 @@ public:
 	}
 
 	void        AddFunction(std::span<const uint32_t> words);
+	[[nodiscard]] size_t FunctionWordCount() const { return m_functions.size(); }
+	[[nodiscard]] const std::vector<uint32_t>& FunctionWords() const { return m_functions; }
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
 
@@ -123,6 +124,15 @@ private:
 	}
 
 	template <typename... Args>
+	static std::vector<uint32_t> MakeTypeKey(spv::Op opcode, const Args&... operands) {
+		const auto operand_count = static_cast<uint32_t>((0u + ... + OperandWordCount(operands)));
+		std::vector<uint32_t> key;
+		key.reserve(2u + operand_count);
+		AppendOperands(key, opcode, operand_count, operands...);
+		return key;
+	}
+
+	template <typename... Args>
 	static void AppendInstruction(std::vector<uint32_t>& section, spv::Op opcode,
 	                              const Args&... operands) {
 		const auto offset = section.size();
@@ -131,8 +141,21 @@ private:
 		section[offset] |= word_count << spv::WordCountShift;
 	}
 
-	uint32_t    DeclareType(spv::Op opcode, std::initializer_list<TypeAnnotation> annotations);
-	uint32_t    DeclareConstant(spv::Op opcode);
+	uint32_t    DeclareType(spv::Op opcode, std::vector<uint32_t> key);
+	uint32_t    DeclareDecoratedType(spv::Op opcode, std::vector<uint32_t> key,
+	                                 std::initializer_list<TypeAnnotation> annotations);
+	uint32_t    DeclareConstant(spv::Op opcode, std::vector<uint32_t> key);
+
+public:
+	// The single 32-bit operand of a scalar OpConstant id, if `id` is one.
+	[[nodiscard]] bool TryScalarConstant(uint32_t id, uint32_t& value) const {
+		const auto it = m_constant_words.find(id);
+		if (it == m_constant_words.end()) return false;
+		value = it->second;
+		return true;
+	}
+
+private:
 	static void AppendString(std::vector<uint32_t>& words, const char* text);
 
 	uint32_t                                  m_next_id = 1;
@@ -151,11 +174,11 @@ private:
 	std::set<std::string>                     m_required_extensions;
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
-	std::vector<uint32_t>                     m_key;
+	std::unordered_map<uint32_t, uint32_t>    m_constant_words;
 	size_t                                    m_unpatched_phi_incomings = 0;
 	bool                                      m_emit_names              = false;
 };
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SPIRVBUILDER_H_ */

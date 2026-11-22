@@ -6,8 +6,6 @@
 
 namespace Libs::Graphics {
 
-struct GraphicContext;
-
 struct RenderTargetFormatInfo {
 	vk::Format                      format            = vk::Format::eUndefined;
 	uint32_t                        bytes_per_element = 0;
@@ -24,11 +22,10 @@ struct SurfaceFormatInfo {
 vk::ComponentMapping   TextureGetComponentMapping(uint32_t                        swizzle,
                                                   Prospero::ColorComponentMapping host_to_storage);
 SurfaceFormatInfo      TextureGetSurfaceFormatInfo(Prospero::BufferFormat format);
-RenderTargetFormatInfo TextureGetRenderTargetFormat(const GraphicContext&   graphics,
-                                                    Prospero::ChannelLayout layout,
+RenderTargetFormatInfo TextureGetRenderTargetFormat(Prospero::ChannelLayout layout,
                                                     Prospero::ChannelType   type,
                                                     Prospero::ChannelOrder  order);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_HOST_GPU_RENDERER_IMAGE_TEXTURECOMMON_H_ */

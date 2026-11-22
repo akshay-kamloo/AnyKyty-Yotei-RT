@@ -1,6 +1,10 @@
 #include "graphics/shader/shader.h"
 
 #include "common/assert.h"
+#include "common/shaderEnv.h"
+
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics {
 
@@ -9,7 +13,7 @@ namespace {
 constexpr uint32_t PsInputOffsetMask = 0x0000001fu;
 constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
-}
+} // namespace
 
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
 	for (uint32_t target = 0; target < 8u; target++) {
@@ -45,6 +49,7 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 		auto&      location = group_locations[group];
 		if (location == UINT32_MAX) {
 			location = mapped;
+			// Rectangle expansion broadcasts flat aliases through separate outputs.
 			if (group_locations[group ^ 1u] != UINT32_MAX) {
 				location = 0;
 				while (location < used_locations.size() && used_locations[location]) {
@@ -71,4 +76,4 @@ bool ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t inp
 	return input < 32u && (info.custom_interpolation_mask & (1u << input)) != 0;
 }
 
-}
+} // namespace Libs::Graphics

@@ -1,7 +1,6 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
-#include "common/hackNotice.h"
 
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -14,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdarg>
@@ -112,11 +112,13 @@ public:
 		const auto end = vaddr + size;
 		auto entry = first;
 		for (auto page = vaddr >> PageBits; page < end >> PageBits; ++page) {
-			auto& bucket = m_buckets[page / BucketPages];
+			const auto b = page / BucketPages;
+			const auto idx = page % BucketPages;
+			auto& bucket = m_buckets[b];
 			auto* entries = bucket.load(std::memory_order_acquire);
 			if (entries == nullptr) {
 				if (first == 0) {
-					page = (page / BucketPages + 1u) * BucketPages - 1u;
+					page = (b + 1u) * BucketPages - 1u;
 					continue;
 				}
 				auto* created = new std::atomic<uint32_t>[BucketPages] {};
@@ -126,9 +128,81 @@ public:
 					delete[] created;
 				}
 			}
-			entries[page % BucketPages].store(entry, std::memory_order_relaxed);
+			entries[idx].store(entry, std::memory_order_relaxed);
+			const bool is_backed = entry != 0 && entry != PrivateEntry;
+			auto& bm_bucket = m_backed[b];
+			auto* bm = bm_bucket.load(std::memory_order_acquire);
+			if (is_backed) {
+				if (bm == nullptr) {
+					auto* created = new std::atomic<uint64_t>[BackedWords] {};
+					if (bm_bucket.compare_exchange_strong(bm, created, std::memory_order_acq_rel)) {
+						bm = created;
+					} else {
+						delete[] created;
+					}
+				}
+				bm[idx >> 6u].fetch_or(uint64_t {1} << (idx & 63u), std::memory_order_relaxed);
+			} else if (bm != nullptr) {
+				bm[idx >> 6u].fetch_and(~(uint64_t {1} << (idx & 63u)), std::memory_order_relaxed);
+			}
 			if (step) ++entry;
 		}
+	}
+
+	[[nodiscard]] bool IsRangeBacked(uint64_t vaddr, uint64_t size) const {
+		uint64_t page = vaddr >> PageBits;
+		const uint64_t last_page = (vaddr + size - 1u) >> PageBits;
+		if (page == last_page) return LoadBacking(page) != 0;
+		while (page <= last_page) {
+			const uint64_t b = page / BucketPages;
+			if (b >= BucketCount) return false;
+			const auto* bm = m_backed[b].load(std::memory_order_acquire);
+			if (bm == nullptr) return false;
+			const uint64_t bucket_end = std::min(last_page, (b + 1u) * BucketPages - 1u);
+			const uint64_t idx = page - b * BucketPages;
+			const uint64_t idx_end = bucket_end - b * BucketPages;
+			const uint64_t w_first = idx >> 6u;
+			const uint64_t w_last = idx_end >> 6u;
+			for (uint64_t w = w_first; w <= w_last; ++w) {
+				const unsigned bit0 = (w == w_first) ? static_cast<unsigned>(idx & 63u) : 0u;
+				const unsigned bit1 = (w == w_last) ? static_cast<unsigned>(idx_end & 63u) : 63u;
+				const uint64_t mask = (~uint64_t {0} >> (63u - (bit1 - bit0))) << bit0;
+				if ((bm[w].load(std::memory_order_relaxed) & mask) != mask) return false;
+			}
+			page = bucket_end + 1u;
+		}
+		return true;
+	}
+
+	[[nodiscard]] uint64_t SkipBacked(uint64_t cursor, uint64_t end) const {
+		if (cursor >= end) return end;
+		uint64_t page = cursor >> PageBits;
+		const uint64_t last_page = (end - 1u) >> PageBits;
+		while (page <= last_page) {
+			const uint64_t b = page / BucketPages;
+			if (b >= BucketCount) break;
+			const auto* bm = m_backed[b].load(std::memory_order_acquire);
+			if (bm == nullptr) break;
+			const uint64_t bucket_end = std::min(last_page, (b + 1u) * BucketPages - 1u);
+			const uint64_t idx = page - b * BucketPages;
+			const uint64_t idx_end = bucket_end - b * BucketPages;
+			const uint64_t w_first = idx >> 6u;
+			const uint64_t w_last = idx_end >> 6u;
+			for (uint64_t w = w_first; w <= w_last; ++w) {
+				const unsigned bit0 = (w == w_first) ? static_cast<unsigned>(idx & 63u) : 0u;
+				const unsigned bit1 = (w == w_last) ? static_cast<unsigned>(idx_end & 63u) : 63u;
+				const uint64_t word = bm[w].load(std::memory_order_relaxed) >> bit0;
+				const unsigned span = bit1 - bit0 + 1u;
+				const unsigned ones = static_cast<unsigned>(std::countr_one(word));
+				if (ones < span) {
+					const uint64_t first_unbacked = b * BucketPages + (w << 6u) + bit0 + ones;
+					return std::max(cursor, first_unbacked << PageBits);
+				}
+			}
+			page = bucket_end + 1u;
+		}
+		if (page > last_page) return end;
+		return std::max(cursor, page << PageBits);
 	}
 
 	[[nodiscard]] bool AnyMapped(uint64_t vaddr, uint64_t size) const {
@@ -256,7 +330,9 @@ private:
 		return static_cast<unsigned>(((host >> 12u) & 3u) * 2u);
 	}
 
+	static constexpr uint64_t BackedWords = BucketPages / 64u;
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_buckets {};
+	std::array<std::atomic<std::atomic<uint64_t>*>, BucketCount> m_backed {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_probe {};
 };
@@ -606,13 +682,13 @@ uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
 	auto cursor = vaddr;
 	while (cursor < end) {
 		if (pages.Load(cursor >> PageBits) != 0) {
-			cursor = std::min(end, (cursor | PageMask) + 1u);
+			const auto next = pages.SkipBacked(cursor, end);
+			cursor = next > cursor ? next : std::min(end, (cursor | PageMask) + 1u);
 			continue;
 		}
-		auto stop = std::min(end, (cursor | PageMask) + 1u);
-		while (stop < end && pages.Load(stop >> PageBits) == 0) stop = std::min(end, stop + PageSize);
-		cursor += UnreportedMappedPrefix(cursor, stop);
-		if (cursor < stop) break;
+		const auto mapped = UnreportedMappedPrefix(cursor, end);
+		if (mapped == 0) break;
+		cursor += mapped;
 	}
 	return cursor - vaddr;
 }
@@ -758,11 +834,7 @@ bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes) {
 
 bool IsBacked(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return false;
-	const auto& pages = Pages();
-	for (auto page = vaddr >> PageBits; page <= (vaddr + size - 1u) >> PageBits; ++page) {
-		if (pages.LoadBacking(page) == 0) return false;
-	}
-	return true;
+	return Pages().IsRangeBacked(vaddr, size);
 }
 
 bool InGuestSpace(uint64_t vaddr, uint64_t size) {
@@ -838,7 +910,15 @@ uint64_t DirectMappedBytes() {
 }
 
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
-	if (data == nullptr || !Shim::IsBacked(vaddr, size)) return false;
+	if (data == nullptr || !ValidRange(vaddr, size)) return false;
+	const uint64_t first_page = vaddr >> PageBits;
+	if (first_page == ((vaddr + size - 1u) >> PageBits)) {
+		const uint32_t entry = Pages().LoadBacking(first_page);
+		if (entry == 0) return false;
+		CopyFromView(static_cast<uint8_t*>(data), (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask), size);
+		return true;
+	}
+	if (!Pages().IsRangeBacked(vaddr, size)) return false;
 	auto* destination = static_cast<uint8_t*>(data);
 	ForEachRun(
 	    vaddr, size,
@@ -916,8 +996,9 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
-	if (IsFullyMapped(vaddr, size)) return size;
+	if (Shim::IsBacked(vaddr, size)) return size;
 	const auto clamped = MappedPrefix(vaddr, size);
+	if (clamped == size) return size;
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
@@ -927,12 +1008,8 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 
 uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return 0;
-	if (IsFullyMapped(vaddr, size)) return size;
-	const auto clamped = MappedPrefix(vaddr, size);
-	if (clamped == 0) {
-		Common::HackNotice::Report("V# outside guest memory bound as a null buffer", "ClampRangeSizeOrZero", 0, 0);
-	}
-	return clamped;
+	if (Shim::IsBacked(vaddr, size)) return size;
+	return MappedPrefix(vaddr, size);
 }
 
 template <bool CopyPrivate>
@@ -992,8 +1069,12 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 	const auto host_first = vaddr & ~uint64_t {0xfff};
 	const auto host_end = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
 	for (auto start = host_first; start < host_end;) {
+		const bool mapped = mapped_pages.Load(start >> PageBits) != 0;
 		auto stop = std::min(host_end, (start | PageMask) + 1u);
-		if (mapped_pages.Load(start >> PageBits) != 0) {
+		while (stop < host_end && (mapped_pages.Load(stop >> PageBits) != 0) == mapped) {
+			stop = std::min(host_end, stop + PageSize);
+		}
+		if (mapped) {
 			DWORD previous = 0;
 			if (VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)), stop - start, host_protection, &previous) == 0) {
 				for (auto cursor = start; cursor < stop;) {
@@ -1080,5 +1161,90 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+
+
+int CompareBacking(uint64_t vaddr, const void* expected, uint64_t size) {
+	if (size == 0) return 0;
+	if (expected == nullptr || !ValidRange(vaddr, size) || !Shim::ViewEnabled()) return 2;
+	const uint64_t first_page = vaddr >> PageBits;
+	if (first_page == ((vaddr + size - 1u) >> PageBits)) {
+		const uint32_t entry = Pages().LoadBacking(first_page);
+		if (entry == 0) return 2;
+		const uint8_t* ptr = State().base + (uint64_t {entry - 1u} << PageBits) + (vaddr & PageMask);
+		return std::memcmp(ptr, expected, size) == 0 ? 0 : 1;
+	}
+	if (const void* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
+		return std::memcmp(backing, expected, size) == 0 ? 0 : 1;
+	}
+	thread_local std::vector<uint8_t> tmp;
+	tmp.resize(size);
+	if (!TryReadBacking(vaddr, tmp.data(), size)) return 2;
+	return std::memcmp(tmp.data(), expected, size) == 0 ? 0 : 1;
+}
+
+uint64_t GuestBackingBase() {
+	if (!Shim::ViewEnabled() || State().base == nullptr) return 0;
+	return reinterpret_cast<uint64_t>(State().base);
+}
+
+uint64_t GuestBackingSize() {
+	if (!Shim::ViewEnabled() || State().base == nullptr) return 0;
+	return static_cast<uint64_t>(State().view_bytes);
+}
+
+bool GuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* offset) {
+	if (offset == nullptr || size == 0 || !Shim::ViewEnabled() || State().base == nullptr) return false;
+	const auto* ptr = static_cast<const uint8_t*>(FindBackingPointer(vaddr, size));
+	if (ptr == nullptr) return false;
+	const auto base = State().base;
+	if (ptr < base) return false;
+	const auto off = static_cast<uint64_t>(ptr - base);
+	if (off > State().view_bytes || size > State().view_bytes - off) return false;
+	*offset = off;
+	return true;
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t, uint64_t) {
+	return {};
+}
+
+ClampContextScope::ClampContextScope(const ClampContext&) {}
+ClampContextScope::~ClampContextScope() {}
+
+uint64_t RangesGeneration() {
+	return BackingEpoch();
+}
+
+uint64_t TryClampReservedRangeSize(uint64_t vaddr, uint64_t size) {
+	return ClampRangeSizeOrZero(vaddr, size);
+}
+
+uint64_t ClampRangeSizeAhead(uint64_t vaddr, uint64_t size, uint64_t* generation) {
+	if (generation != nullptr) *generation = RangesGeneration();
+	return ClampRangeSizeOrZero(vaddr, size);
+}
+
+void ReadGuestPlain(void* dst, uint64_t vaddr, uint64_t size) {
+	if (dst == nullptr || size == 0) return;
+	if (TryReadBacking(vaddr, dst, size)) return;
+	if (!CopySparseMemory(vaddr, dst, size)) {
+		std::memcpy(dst, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vaddr)), static_cast<size_t>(size));
+	}
+}
+
+// GuestImageReadArmed is implemented in MemoryGpu.cpp via PageManager::ImageReadArmedInRange.
+
+bool GuardedGuestCopy(void* dst, const void* src, size_t size) {
+	if (dst == nullptr || src == nullptr || size == 0) return size == 0;
+	const auto vaddr = static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(src));
+	if (TryReadBacking(vaddr, dst, size)) return true;
+	if (CopySparseMemory(vaddr, dst, size)) return true;
+#ifdef _WIN32
+	SIZE_T read = 0;
+	return ReadProcessMemory(GetCurrentProcess(), src, dst, size, &read) != 0 && read == size;
+#else
+	return false;
+#endif
+}
 
 }

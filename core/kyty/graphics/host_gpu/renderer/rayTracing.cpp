@@ -20,8 +20,7 @@ RayTracing::~RayTracing() {
 
 
 vk::DeviceAddress RayTracing::Prepare(uint64_t tlas, uint64_t frame) {
-	m_context.NoteOperation(0, true);
-	m_context.PrepareBda(false);
+	m_context.PrepareBda();
 	if (!m_enabled) {
 		return 0;
 	}

@@ -22,24 +22,14 @@ struct Lifecycle {
 	static constexpr auto        shutdown   = Config::Shutdown;
 };
 
+enum class ShaderOptimizationType { None, Size, Performance };
+
 enum class LogDirection { Silent, Console, File };
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
-enum class PssrUpscaler { Linear, DLSS, FSR };
-
-enum class PipelinePrecompile { Ask, Wait, Play };
-
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
-
-enum GpuPipelineStage : uint32_t {
-	GPU_PIPELINE_RECORDING = 1u << 0u,
-	GPU_PIPELINE_COMMAND_PROCESSOR = 1u << 1u,
-	GPU_PIPELINE_RESOLVE = 1u << 2u,
-	GPU_PIPELINE_ALL =
-	    GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR | GPU_PIPELINE_RESOLVE,
-};
 
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
@@ -67,8 +57,8 @@ struct ConfigOptions {
 	std::optional<ControllerColor> controller_color;
 	uint32_t               controller_speaker_volume      = 50;
 	uint32_t               controller_vibration_intensity = 100;
+	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	uint32_t               keyboard_player                = 0;
-	bool                   pad_haptic_rumble           = false;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -78,12 +68,8 @@ struct ConfigOptions {
 	bool                   splash_enabled              = true;
 	bool                   vr_enabled                  = false;
 	bool                   pro_enabled                 = false;
-	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
-	std::filesystem::path  dlss_folder;
-	uint32_t               dlss_preset                 = 0;
-	std::filesystem::path  fsr_folder;
 	bool                   amd_cpu_enabled             = false;
-	bool                   guest_tsc_enabled           = true;
+	bool                   guest_tsc_enabled           = false;
 	bool                   network_connected           = false;
 	bool                   psn_emulation_enabled       = false;
 	uint32_t               vblank_frequency            = 60;
@@ -91,10 +77,7 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	bool                   shader_cache_enabled        = false;
-	bool                   pipeline_manifest_enabled   = true;
-	bool                   pipeline_manifest_record    = false;
-	bool                   pipeline_manifest_strict    = KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT != 0;
-	PipelinePrecompile     pipeline_precompile         = PipelinePrecompile::Ask;
+	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -102,39 +85,43 @@ struct ConfigOptions {
 	bool                   graphics_debug_dump_enabled = false;
 	LogDirection           printf_direction            = LogDirection::Silent;
 	std::filesystem::path  printf_output_file          = "_kyty.txt";
-	std::filesystem::path  session_log_file;
 	bool                   profiler_enabled            = false;
 	bool                   spirv_debug_printf_enabled  = false;
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = true;
+	bool                   readback_linear_images      = false;
 	bool                   readback_tiled_images       = false;
-	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
-	uint32_t               flush_draws                 = 0;
-	bool                   tessellation_enabled        = true;
-	bool                   occlusion_queries_enabled   = true;
-	bool                   relaxed_shader_float        = false;
-	bool                   wave_split                  = false;
-	bool                   image_table_heap            = true;
-	bool                   native_rt                   = false;
-	bool                   async_pipelines_enabled     = true;
-	bool                   async_pipelines_skip_more   = false;
-	bool                   rt_stats_enabled            = false;
-	uint32_t               rt_oracle                   = 0;
-	uint32_t               rt_check_period             = 0;
-	uint32_t               rt_check_ppm                = 1000;
-	uint32_t               rt_check_strikes            = 3;
+	bool                   tessellation_enabled        = true; // default on (volumetric mist, water; --no-tessellation off)
+	bool                   occlusion_queries_enabled   = false;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
-	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
+	// --precompile-only: compile the recorded shader journals into the driver cache and exit, without starting the
+	// game (Emulator::Run, PipelineCache::RunPrecompileOnly). --precompile-threads: its workers (0 = the
+	// KYTY_SHADER_PRECOMPILE_THREADS setting).
+	bool                   precompile_only             = false;
+	uint32_t               precompile_threads          = 0;
+	// --export-hints <file>: with --precompile-only, the journals are written as a hints file (no game code) and the run
+	// ends. --import-hints <file>: before the precompile, the hints' code is looked for in the game folder and the records
+	// found are added to the journals (shaderPrecompile.h PrecompileHintsExport / PrecompileHintsImport).
+	std::filesystem::path  precompile_export_hints;
+	std::filesystem::path  precompile_import_hints;
+	// The game folder of --game (the importer reads its files).
+	std::filesystem::path  game_dir;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	bool red_zone_protection_enabled = true;
+	bool red_zone_protection_enabled = false;
 #endif
+	bool                   native_rt                   = false;
+	bool                   rt_stats_enabled            = false;
+	uint32_t               rt_oracle                   = 0;
+	uint32_t               rt_check_period             = 0;
+	uint32_t               rt_check_ppm                = 1000;
+	uint32_t               rt_check_strikes            = 3;
 	Keymap keymap;
+	// Ordinary boots need a non-null argv[0]; --guest-exec supplies the caller's arguments.
 	std::vector<std::string> guest_arguments {""};
 };
 
@@ -149,10 +136,12 @@ const std::optional<ControllerColor>& GetControllerColor();
 uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
 uint32_t GetKeyboardPlayer();
+// Player 0 is the configured user; later players derive their IDs from it.
 int32_t  GetPlayerUserId(int player);
+// Returns -1 when the user ID does not belong to any player.
 int      GetPlayerFromUserId(int32_t user_id);
+// Players after the first are guests: they have no profile, trophies or NP account.
 bool     IsGuestUserId(int32_t user_id);
-bool     PadHapticRumbleEnabled();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
@@ -161,10 +150,6 @@ bool     HideCursorEnabled();
 bool     StretchEnabled();
 bool     VrEnabled();
 bool     Ps5ProEnabled();
-PssrUpscaler GetPssrUpscaler();
-const std::filesystem::path& GetDlssFolder();
-uint32_t GetDlssPreset();
-const std::filesystem::path& GetFsrFolder();
 bool     AmdCpuEnabled();
 bool     GuestTscEnabled();
 bool     IsNetworkConnected();
@@ -175,10 +160,7 @@ bool     VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 bool                   ShaderCacheEnabled();
-bool                   PipelineManifestEnabled();
-bool                   PipelineManifestRecord();
-bool                   PipelineManifestStrict();
-PipelinePrecompile     GetPipelinePrecompile();
+ShaderOptimizationType GetShaderOptimizationType();
 LogDirection           GetShaderLogDirection();
 std::filesystem::path  GetShaderLogFolder();
 
@@ -189,7 +171,6 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
-std::filesystem::path GetSessionLogFile();
 
 bool ProfilerEnabled();
 
@@ -200,17 +181,9 @@ bool GpuAssistedValidationEnabled();
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool ReadbackTiledImagesEnabled();
-bool ReadbackStorageImagesEnabled();
 bool SyncRawImageBuffersEnabled();
-uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
-bool RelaxedShaderFloatEnabled();
-bool WaveSplitEnabled();
-bool ImageTableHeapEnabled();
-bool NativeRtEnabled();
-bool AsyncPipelinesEnabled();
-bool AsyncPipelinesSkipMore();
 bool NativeRayTracingEnabled();
 bool RayTracingStatsEnabled();
 uint32_t RayTracingOracle();
@@ -221,19 +194,22 @@ bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
-uint32_t GpuPipelineStages();
-uint32_t ParseGpuPipelineStages(const char* value);
-
+// Threads of the emulated GPU's stages. KYTY_GPU_THREAD_CPUS lists the logical processors the execution, recording,
+// resolve and command processor threads are pinned to ("off" leaves them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps
+// the normal priority of the execution and command processor threads.
+// Project 15 N2.2: ResolveHelper (the resolve helper) takes the resolve stage's processor; ResolveDispatcher (the resolve
+// thread while a helper resolves) the SMT sibling of the command processor's (unpinned when there is none).
 enum class GpuStageThread : uint32_t {
-	CommandProcessor = 0,
-	Execution        = 1,
-	Recording        = 2,
-	Resolve          = 3,
-	HostCopy         = 4,
-	ResolveHelper    = 5
+	Execution = 0, Recording = 1, Resolve = 2, CommandProcessor = 3, ResolveHelper = 4, ResolveDispatcher = 5,
+	ResolveHelper2 = 6 // project 15 N5.2: the second resolve helper (not pinned)
 };
-bool ResolveHelperEnabled();
+// Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);
+bool     PrecompileOnly();
+uint32_t GetPrecompileThreads();
+const std::filesystem::path& GetPrecompileExportHints();
+const std::filesystem::path& GetPrecompileImportHints();
+const std::filesystem::path& GetGameDir();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif
@@ -241,6 +217,6 @@ bool RedZoneProtectionEnabled();
 const Keymap& GetKeymap();
 const std::vector<std::string>& GetGuestArguments();
 
-}
+} // namespace Config
 
-#endif
+#endif /* KYTY_COMMON_EMULATOR_CONFIG_H_ */

@@ -1,51 +1,69 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/envRead.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/startupTrace.h"
+#include <optional>
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
-#include "gpu_blit_shaders/gpu_fsr_easu_spv.h"
-#include "gpu_blit_shaders/gpu_fsr_rcas_spv.h"
-#include "gpu_blit_shaders/gpu_cmaa2_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/host_gpu/renderer/debugSample.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
-#include "graphics/presentation/precompileNotice.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
 
+#include "kernel/memory.h"
+#include "graphics/host_gpu/queueLockSite.h"
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+#endif
+#include <cstring>
+#include <cstdio>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <chrono>
-#include <cstdlib>
-#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
+// IWYU pragma: no_include <intrin.h>
+
 namespace Libs::Graphics {
+
+static void TraceFrameTime(uint32_t frame); // KYTY_TRACE_FRAMETIME, defined below
 
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
-	uint32_t      source_flags = 0;
+	bool          hdr          = false;
 	bool          blank        = false;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(CommandRecorder command, vk::ImageLayout layout, vk::AccessFlags2 access);
+	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
 	void CopyFrom(CommandBuffer& command, Image& source);
 	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
 };
@@ -66,7 +84,13 @@ public:
 	KYTY_CLASS_NO_COPY(FramePool);
 
 	void Initialize(uint32_t count, vk::Format format) {
+		if (count == 0 || format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool requires at least one frame\n");
+		}
 		Common::LockGuard lock(m_mutex);
+		if (!m_frames.empty()) {
+			EXIT("prepared-frame pool was initialized twice\n");
+		}
 		m_format = format;
 		m_frames.reserve(count);
 		m_free.reserve(count);
@@ -78,17 +102,28 @@ public:
 	}
 
 	void SetFormat(vk::Format format) {
+		if (format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool requires a presentation format\n");
+		}
 		Common::LockGuard lock(m_mutex);
 		m_format = format;
 	}
 
 	vk::Format GetFormat() {
 		Common::LockGuard lock(m_mutex);
+		if (m_format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool has no presentation format\n");
+		}
 		return m_format;
 	}
 
 	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format) {
 		m_mutex.Lock();
+		if (m_frames.empty()) {
+			EXIT("prepared-frame pool was used before swapchain initialization\n");
+		}
+		// A synchronized flip may need more frames than the swapchain has images.
+		// Queue capacity bounds growth; waiting here can prevent its master from recording.
 		if (m_free.empty()) {
 			auto frame = std::make_unique<Presenter::Frame>();
 			m_free.push_back(frame.get());
@@ -103,6 +138,9 @@ public:
 			*compatible = m_free.back();
 		}
 		m_free.pop_back();
+		if (frame->busy) {
+			EXIT("prepared-frame pool returned an invalid frame\n");
+		}
 		frame->busy = true;
 		m_mutex.Unlock();
 
@@ -110,7 +148,17 @@ public:
 		return frame;
 	}
 
+	void ValidateForPresent(Presenter::Frame* frame) {
+		Common::LockGuard lock(m_mutex);
+		if (frame == nullptr || !frame->busy) {
+			EXIT("prepared frame has invalid presentation ownership\n");
+		}
+	}
+
 	void Release(Presenter::Frame* frame) {
+		if (frame == nullptr) {
+			EXIT("cannot release a null prepared frame\n");
+		}
 		Common::LockGuard lock(m_mutex);
 		if (!frame->busy) {
 			EXIT("prepared frame was released twice\n");
@@ -175,7 +223,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 }
 
-void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
+void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
 	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
 	                                access == vk::AccessFlagBits2::eTransferWrite
@@ -207,6 +255,7 @@ void Presenter::Frame::Transit(CommandRecorder command, vk::ImageLayout layout,
 	dependency.pImageMemoryBarriers    = &barrier;
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
+	image.subresource_states.clear();
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
@@ -265,13 +314,6 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void EnsureFsrPipelines();
-	void DrawFsr(vk::CommandBuffer command, Presenter::Frame* source,
-	             const vk::Rect2D& game_rect);
-	void DrawRcasNative(vk::CommandBuffer command, Presenter::Frame* source,
-	                    const vk::Rect2D& game_rect);
-	void DrawCmaa2(vk::CommandBuffer command, Presenter::Frame* source,
-	               const vk::Rect2D& game_rect);
 	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
 	               const vk::Rect2D& rect);
 
@@ -282,6 +324,7 @@ private:
 	bool             m_hdr_requested = false;
 	bool             m_hdr_active    = false;
 	vk::Extent2D     m_extent {};
+	// Drawable pixel size observed when this swapchain was created.
 	vk::Extent2D                   m_window_extent {};
 	std::vector<vk::Image>         m_images;
 	std::vector<vk::ImageView>     m_image_views;
@@ -289,26 +332,11 @@ private:
 	std::vector<uint64_t>          m_image_acquired_ticks;
 	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
-	struct UpscaleSlot {
-		VulkanImage   image {};
-		vk::ImageView view = nullptr;
-	};
-
 	vk::DescriptorSetLayout        m_overlay_descriptors = nullptr;
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
-	AgcDriver::UpscaleMode                    m_upscale_mode {};
-	std::vector<std::unique_ptr<UpscaleSlot>> m_upscale_slots;
-	vk::DescriptorSetLayout        m_fsr_descriptors     = nullptr;
-	vk::PipelineLayout             m_easu_layout         = nullptr;
-	vk::Pipeline                   m_easu_pipeline       = nullptr;
-	vk::PipelineLayout             m_rcas_layout         = nullptr;
-	vk::Pipeline                   m_rcas_pipeline       = nullptr;
-	vk::PipelineLayout             m_cmaa2_layout        = nullptr;
-	vk::Pipeline                   m_cmaa2_pipeline      = nullptr;
-	vk::Sampler                    m_fsr_sampler         = nullptr;
-	uint32_t                       m_image_index         = 0;
+	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
 
@@ -316,6 +344,7 @@ struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+		EXIT_IF(owner.render_context == nullptr);
 #if defined(ANYPS5_KYTY)
 		if (owner.surface == nullptr) {
 			return;
@@ -347,7 +376,17 @@ struct Presenter::Impl {
 		desc.type                  = TextureCache::BindingType::VideoOut;
 
 		auto&      cache      = renderer.GetTextureCache();
+		static std::atomic_uint traced {0};
+		const bool trace = Common::EnvRead::Flips() && [&] {
+			const auto n = traced.fetch_add(1);
+			return n < 6u || n % 120u == 0u;
+		}();
+		if (trace) cache.DebugDescribeRegion("before", info.data.address, info.data.size);
 		const auto image_id   = cache.FindImage(desc);
+		if (trace) {
+			std::fprintf(stderr, "SURFACE chosen id=%u\n", static_cast<uint32_t>(image_id.index));
+			cache.DebugDescribeRegion("after", info.data.address, info.data.size);
+		}
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
@@ -404,6 +443,8 @@ void Swapchain::Create() {
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
 
+	// Capture the size before querying surface capabilities. If the window changes
+	// during creation, the next presentation will detect the newer size.
 	{
 		Common::LockGuard lock(m_window.mutex);
 		m_window_extent = {graphics.screen_width, graphics.screen_height};
@@ -443,9 +484,6 @@ void Swapchain::Create() {
 		EXIT("swapchain format cannot be a blit destination: format=%d\n",
 		     static_cast<int>(m_format));
 	}
-	if (m_extent.width == 0 || m_extent.height == 0) {
-		return;
-	}
 
 	vk::SwapchainCreateInfoKHR create_info {};
 	create_info.sType            = vk::StructureType::eSwapchainCreateInfoKHR;
@@ -480,20 +518,6 @@ void Swapchain::Create() {
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
 	LOGF("Vulkan presentation: %s\n", m_hdr_active ? "HDR10 (PQ)" : "SDR");
-	m_upscale_mode = AgcDriver::SelectUpscaleMode(std::getenv("ANYPS5_UPSCALE"),
-	                                              std::getenv("ANYPS5_FSR_SHARPNESS"));
-	if (m_upscale_mode.fsr) {
-		LOGF("[present] ANYPS5_UPSCALE=fsr: FSR 1 EASU and RCAS when the window is larger than the "
-		     "display buffer, the normal scaler otherwise; RCAS sharpness %.2f\n",
-		     static_cast<double>(m_upscale_mode.sharpness));
-	} else if (m_upscale_mode.cmaa2) {
-		LOGF("[present] ANYPS5_UPSCALE=cmaa2: Intel CMAA2 conservative morphological anti-aliasing "
-		     "at native 1:1 resolution\n");
-	} else if (m_upscale_mode.rcas) {
-		LOGF("[present] ANYPS5_UPSCALE=rcas: 1:1 native RCAS contrast-adaptive sharpening; "
-		     "RCAS sharpness %.2f\n",
-		     static_cast<double>(m_upscale_mode.sharpness));
-	}
 
 	m_images = EnumerateVulkan<vk::Image>(
 	    "vkGetSwapchainImagesKHR", [&](uint32_t* count, vk::Image* images) {
@@ -524,7 +548,6 @@ void Swapchain::Create() {
 	m_image_acquired.resize(m_images.size());
 	m_image_acquired_ticks.assign(m_images.size(), 0);
 	m_render_complete.resize(m_images.size());
-	m_upscale_slots.resize(m_images.size());
 	for (size_t i = 0; i < m_images.size(); i++) {
 		RequireVulkanSuccess(
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_image_acquired[i]),
@@ -533,6 +556,8 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
+	m_image_index = static_cast<uint32_t>(-1);
+	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -547,7 +572,8 @@ void Swapchain::Destroy() {
 	auto& graphics = m_window.graphic_ctx;
 
 	{
-		Common::LockGuard queue_lock(graphics.queue_mutex);
+		CommandRecorder::SyncQueue(); // before the queue lock
+		QueueLockGuard queue_lock(graphics.queue_mutex, "swapchain.cpp:652");
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
 	if (m_system_overlay != nullptr) {
@@ -557,38 +583,10 @@ void Swapchain::Destroy() {
 	graphics.device.destroyPipelineLayout(m_overlay_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(m_overlay_descriptors, nullptr);
 	graphics.device.destroySampler(m_overlay_sampler, nullptr);
-	graphics.device.destroyPipeline(m_easu_pipeline, nullptr);
-	graphics.device.destroyPipelineLayout(m_easu_layout, nullptr);
-	graphics.device.destroyPipeline(m_rcas_pipeline, nullptr);
-	graphics.device.destroyPipelineLayout(m_rcas_layout, nullptr);
-	graphics.device.destroyPipeline(m_cmaa2_pipeline, nullptr);
-	graphics.device.destroyPipelineLayout(m_cmaa2_layout, nullptr);
-	graphics.device.destroyDescriptorSetLayout(m_fsr_descriptors, nullptr);
-	graphics.device.destroySampler(m_fsr_sampler, nullptr);
-	for (auto& slot: m_upscale_slots) {
-		if (slot != nullptr) {
-			if (slot->view != nullptr) {
-				graphics.device.destroyImageView(slot->view, nullptr);
-				slot->view = nullptr;
-			}
-			if (slot->image.image != nullptr) {
-				graphics.DeleteImage(slot->image);
-			}
-		}
-	}
-	m_upscale_slots.clear();
 	m_overlay_pipeline    = nullptr;
 	m_overlay_layout      = nullptr;
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
-	m_easu_pipeline       = nullptr;
-	m_easu_layout         = nullptr;
-	m_rcas_pipeline       = nullptr;
-	m_rcas_layout         = nullptr;
-	m_cmaa2_pipeline      = nullptr;
-	m_cmaa2_layout        = nullptr;
-	m_fsr_descriptors     = nullptr;
-	m_fsr_sampler         = nullptr;
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -613,6 +611,7 @@ void Swapchain::Destroy() {
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
 	m_window_extent = {};
+	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
 	m_images.clear();
 	m_image_views.clear();
@@ -625,6 +624,8 @@ void Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
+		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
+		// window's view/layer and must run on the main thread on macOS.
 		EXIT_IF(!SDL_RunOnMainThread(
 		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); }, &m_window,
 		    true));
@@ -637,12 +638,16 @@ void Swapchain::Recreate(bool surface_lost) {
 
 bool Swapchain::NeedsResize() const {
 	Common::LockGuard lock(m_window.mutex);
-	return m_handle == nullptr || m_window_extent.width != m_window.graphic_ctx.screen_width ||
+	return m_window_extent.width != m_window.graphic_ctx.screen_width ||
 	       m_window_extent.height != m_window.graphic_ctx.screen_height;
 }
 
 Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
+	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
+	// Wait for the submission that consumed this slot before signaling it again.
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
+	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
@@ -662,6 +667,7 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 			return Status::SurfaceLost;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
+	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
 }
 
@@ -685,500 +691,6 @@ static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& targ
 	return {{static_cast<int32_t>((target.width - w) / 2),
 	         static_cast<int32_t>((target.height - h) / 2)},
 	        {w, h}};
-}
-
-void Swapchain::EnsureFsrPipelines() {
-	auto device = m_window.graphic_ctx.device;
-	if (m_easu_pipeline != nullptr) {
-		return;
-	}
-	vk::SamplerCreateInfo sampler {};
-	sampler.magFilter    = vk::Filter::eNearest;
-	sampler.minFilter    = vk::Filter::eNearest;
-	sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
-	sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
-	sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
-	sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
-	RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_fsr_sampler),
-	                     "create FSR sampler");
-
-	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler,
-	                                              1, vk::ShaderStageFlagBits::eFragment};
-	vk::DescriptorSetLayoutCreateInfo    descriptors {};
-	descriptors.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-	descriptors.bindingCount = 1;
-	descriptors.pBindings    = &binding;
-	RequireVulkanSuccess(
-	    device.createDescriptorSetLayout(&descriptors, nullptr, &m_fsr_descriptors),
-	    "create FSR descriptor layout");
-
-	struct EasuParameters {
-		float source_w;
-		float source_h;
-		float output_w;
-		float output_h;
-	};
-	struct RcasParameters {
-		int32_t x;
-		int32_t y;
-		int32_t width;
-		int32_t height;
-		float   sharpness;
-	};
-
-	const vk::PushConstantRange easu_push {vk::ShaderStageFlagBits::eFragment, 0,
-	                                       sizeof(EasuParameters)};
-	vk::PipelineLayoutCreateInfo easu_layout {};
-	easu_layout.setLayoutCount         = 1;
-	easu_layout.pSetLayouts            = &m_fsr_descriptors;
-	easu_layout.pushConstantRangeCount = 1;
-	easu_layout.pPushConstantRanges    = &easu_push;
-	RequireVulkanSuccess(device.createPipelineLayout(&easu_layout, nullptr, &m_easu_layout),
-	                     "create FSR EASU pipeline layout");
-
-	const vk::PushConstantRange rcas_push {vk::ShaderStageFlagBits::eFragment, 0,
-	                                       sizeof(RcasParameters)};
-	vk::PipelineLayoutCreateInfo rcas_layout {};
-	rcas_layout.setLayoutCount         = 1;
-	rcas_layout.pSetLayouts            = &m_fsr_descriptors;
-	rcas_layout.pushConstantRangeCount = 1;
-	rcas_layout.pPushConstantRanges    = &rcas_push;
-	RequireVulkanSuccess(device.createPipelineLayout(&rcas_layout, nullptr, &m_rcas_layout),
-	                     "create FSR RCAS pipeline layout");
-
-	struct Cmaa2Parameters {
-		int32_t x;
-		int32_t y;
-		int32_t width;
-		int32_t height;
-	};
-
-	const vk::PushConstantRange cmaa2_push {vk::ShaderStageFlagBits::eFragment, 0,
-	                                        sizeof(Cmaa2Parameters)};
-	vk::PipelineLayoutCreateInfo cmaa2_layout {};
-	cmaa2_layout.setLayoutCount         = 1;
-	cmaa2_layout.pSetLayouts            = &m_fsr_descriptors;
-	cmaa2_layout.pushConstantRangeCount = 1;
-	cmaa2_layout.pPushConstantRanges    = &cmaa2_push;
-	RequireVulkanSuccess(device.createPipelineLayout(&cmaa2_layout, nullptr, &m_cmaa2_layout),
-	                     "create CMAA2 pipeline layout");
-
-	const auto vertex         = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
-	const auto easu_fragment  = CompileSPV(GPU_FSR_EASU_SPV, device);
-	const auto rcas_fragment  = CompileSPV(GPU_FSR_RCAS_SPV, device);
-	const auto cmaa2_fragment = CompileSPV(GPU_CMAA2_SPV, device);
-
-	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
-	vk::PipelineInputAssemblyStateCreateInfo assembly {};
-	assembly.topology = vk::PrimitiveTopology::eTriangleList;
-	vk::PipelineViewportStateCreateInfo viewport {};
-	viewport.viewportCount = 1;
-	viewport.scissorCount  = 1;
-	vk::PipelineRasterizationStateCreateInfo rasterization {};
-	rasterization.lineWidth = 1.0f;
-	vk::PipelineMultisampleStateCreateInfo multisample {};
-	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
-	vk::PipelineColorBlendAttachmentState attachment {};
-	attachment.blendEnable    = VK_FALSE;
-	attachment.colorWriteMask = vk::ColorComponentFlagBits::eR |
-	                            vk::ColorComponentFlagBits::eG |
-	                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-	vk::PipelineColorBlendStateCreateInfo blend {};
-	blend.attachmentCount = 1;
-	blend.pAttachments    = &attachment;
-	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-	vk::PipelineDynamicStateCreateInfo dynamic {};
-	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
-	dynamic.pDynamicStates    = dynamic_states.data();
-	vk::PipelineRenderingCreateInfo rendering {};
-	rendering.colorAttachmentCount    = 1;
-	rendering.pColorAttachmentFormats = &m_format;
-
-	vk::GraphicsPipelineCreateInfo create {};
-	create.pNext               = &rendering;
-	create.pVertexInputState   = &vertex_input;
-	create.pInputAssemblyState = &assembly;
-	create.pViewportState      = &viewport;
-	create.pRasterizationState = &rasterization;
-	create.pMultisampleState   = &multisample;
-	create.pColorBlendState    = &blend;
-	create.pDynamicState       = &dynamic;
-
-	std::array<vk::PipelineShaderStageCreateInfo, 2> easu_stages {};
-	easu_stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-	easu_stages[0].module = vertex;
-	easu_stages[0].pName  = "main";
-	easu_stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	easu_stages[1].module = easu_fragment;
-	easu_stages[1].pName  = "main";
-	create.stageCount     = static_cast<uint32_t>(easu_stages.size());
-	create.pStages        = easu_stages.data();
-	create.layout         = m_easu_layout;
-	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_easu_pipeline),
-	    "create FSR EASU pipeline");
-
-	std::array<vk::PipelineShaderStageCreateInfo, 2> rcas_stages {};
-	rcas_stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-	rcas_stages[0].module = vertex;
-	rcas_stages[0].pName  = "main";
-	rcas_stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	rcas_stages[1].module = rcas_fragment;
-	rcas_stages[1].pName  = "main";
-	create.stageCount     = static_cast<uint32_t>(rcas_stages.size());
-	create.pStages        = rcas_stages.data();
-	create.layout         = m_rcas_layout;
-	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_rcas_pipeline),
-	    "create FSR RCAS pipeline");
-
-	std::array<vk::PipelineShaderStageCreateInfo, 2> cmaa2_stages {};
-	cmaa2_stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-	cmaa2_stages[0].module = vertex;
-	cmaa2_stages[0].pName  = "main";
-	cmaa2_stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-	cmaa2_stages[1].module = cmaa2_fragment;
-	cmaa2_stages[1].pName  = "main";
-	create.stageCount      = static_cast<uint32_t>(cmaa2_stages.size());
-	create.pStages         = cmaa2_stages.data();
-	create.layout          = m_cmaa2_layout;
-	RequireVulkanSuccess(
-	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_cmaa2_pipeline),
-	    "create CMAA2 pipeline");
-
-	device.destroyShaderModule(cmaa2_fragment, nullptr);
-	device.destroyShaderModule(rcas_fragment, nullptr);
-	device.destroyShaderModule(easu_fragment, nullptr);
-	device.destroyShaderModule(vertex, nullptr);
-}
-
-void Swapchain::DrawFsr(vk::CommandBuffer command, Presenter::Frame* source,
-                        const vk::Rect2D& game_rect) {
-	auto& graphics = m_window.graphic_ctx;
-	auto  device   = graphics.device;
-	EnsureFsrPipelines();
-
-	if (source->view == nullptr) {
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = source->image.image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = source->image.format;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &source->view),
-		                     "create video-out source image view for FSR");
-	}
-
-	if (m_upscale_slots.size() <= m_frame_index) {
-		m_upscale_slots.resize(std::max<size_t>(m_images.size(), m_frame_index + 1));
-	}
-	if (m_upscale_slots[m_frame_index] == nullptr) {
-		m_upscale_slots[m_frame_index] = std::make_unique<UpscaleSlot>();
-	}
-	auto& slot = *m_upscale_slots[m_frame_index];
-
-	if (slot.image.image != nullptr &&
-	    (slot.image.extent.width != game_rect.extent.width ||
-	     slot.image.extent.height != game_rect.extent.height ||
-	     slot.image.format != m_format)) {
-		device.destroyImageView(slot.view, nullptr);
-		slot.view = nullptr;
-		graphics.DeleteImage(slot.image);
-	}
-	if (slot.image.image == nullptr) {
-		vk::ImageCreateInfo create {};
-		create.sType         = vk::StructureType::eImageCreateInfo;
-		create.imageType     = vk::ImageType::e2D;
-		create.extent        = {game_rect.extent.width, game_rect.extent.height, 1};
-		create.mipLevels     = 1;
-		create.arrayLayers   = 1;
-		create.format        = m_format;
-		create.tiling        = vk::ImageTiling::eOptimal;
-		create.initialLayout = vk::ImageLayout::eUndefined;
-		create.usage =
-		    vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
-		create.sharingMode   = vk::SharingMode::eExclusive;
-		create.samples       = vk::SampleCountFlagBits::e1;
-		if (!graphics.CreateImage(create, slot.image)) {
-			EXIT("failed to allocate FSR upscale intermediate image\n");
-		}
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = slot.image.image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = m_format;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &slot.view),
-		                     "create FSR upscale intermediate image view");
-	}
-
-	vk::ImageMemoryBarrier to_upscale_color {};
-	to_upscale_color.sType               = vk::StructureType::eImageMemoryBarrier;
-	to_upscale_color.dstAccessMask       = vk::AccessFlagBits::eColorAttachmentWrite;
-	to_upscale_color.oldLayout           = vk::ImageLayout::eUndefined;
-	to_upscale_color.newLayout           = vk::ImageLayout::eColorAttachmentOptimal;
-	to_upscale_color.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_upscale_color.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_upscale_color.image               = slot.image.image;
-	to_upscale_color.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	to_upscale_color.subresourceRange.baseMipLevel   = 0;
-	to_upscale_color.subresourceRange.levelCount     = 1;
-	to_upscale_color.subresourceRange.baseArrayLayer = 0;
-	to_upscale_color.subresourceRange.layerCount     = 1;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
-	                        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                        vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
-	                        &to_upscale_color);
-
-	vk::RenderingAttachmentInfo easu_attachment {};
-	easu_attachment.imageView   = slot.view;
-	easu_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-	easu_attachment.loadOp      = vk::AttachmentLoadOp::eDontCare;
-	easu_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-
-	vk::RenderingInfo easu_rendering {};
-	easu_rendering.renderArea.extent    = game_rect.extent;
-	easu_rendering.layerCount           = 1;
-	easu_rendering.colorAttachmentCount = 1;
-	easu_rendering.pColorAttachments    = &easu_attachment;
-	command.beginRendering(&easu_rendering);
-
-	const vk::Viewport easu_viewport {0.0f, 0.0f,
-	                                  static_cast<float>(game_rect.extent.width),
-	                                  static_cast<float>(game_rect.extent.height),
-	                                  0.0f, 1.0f};
-	const vk::Rect2D easu_scissor {{0, 0}, game_rect.extent};
-	command.setViewport(0, 1, &easu_viewport);
-	command.setScissor(0, 1, &easu_scissor);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_easu_pipeline);
-
-	const vk::DescriptorImageInfo easu_source_desc {
-	    m_fsr_sampler, source->view, vk::ImageLayout::eShaderReadOnlyOptimal};
-	vk::WriteDescriptorSet easu_write {};
-	easu_write.dstBinding      = 0;
-	easu_write.descriptorCount = 1;
-	easu_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-	easu_write.pImageInfo      = &easu_source_desc;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_easu_layout, 0, 1,
-	                             &easu_write);
-
-	const struct {
-		float source_w;
-		float source_h;
-		float output_w;
-		float output_h;
-	} easu_params {
-		static_cast<float>(source->image.extent.width),
-		static_cast<float>(source->image.extent.height),
-		static_cast<float>(game_rect.extent.width),
-		static_cast<float>(game_rect.extent.height)
-	};
-	command.pushConstants(m_easu_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(easu_params), &easu_params);
-	command.draw(3, 1, 0, 0);
-	command.endRendering();
-
-	vk::ImageMemoryBarrier to_upscale_read {};
-	to_upscale_read.sType               = vk::StructureType::eImageMemoryBarrier;
-	to_upscale_read.srcAccessMask       = vk::AccessFlagBits::eColorAttachmentWrite;
-	to_upscale_read.dstAccessMask       = vk::AccessFlagBits::eShaderRead;
-	to_upscale_read.oldLayout           = vk::ImageLayout::eColorAttachmentOptimal;
-	to_upscale_read.newLayout           = vk::ImageLayout::eShaderReadOnlyOptimal;
-	to_upscale_read.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_upscale_read.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_upscale_read.image               = slot.image.image;
-	to_upscale_read.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	to_upscale_read.subresourceRange.baseMipLevel   = 0;
-	to_upscale_read.subresourceRange.levelCount     = 1;
-	to_upscale_read.subresourceRange.baseArrayLayer = 0;
-	to_upscale_read.subresourceRange.layerCount     = 1;
-	command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                        vk::PipelineStageFlagBits::eFragmentShader,
-	                        vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
-	                        &to_upscale_read);
-
-	vk::RenderingAttachmentInfo rcas_attachment {};
-	rcas_attachment.imageView   = m_image_views[m_image_index];
-	rcas_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-	rcas_attachment.loadOp      = (game_rect.extent == m_extent)
-	                                  ? vk::AttachmentLoadOp::eDontCare
-	                                  : vk::AttachmentLoadOp::eLoad;
-	rcas_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-
-	vk::RenderingInfo rcas_rendering {};
-	rcas_rendering.renderArea.extent    = m_extent;
-	rcas_rendering.layerCount           = 1;
-	rcas_rendering.colorAttachmentCount = 1;
-	rcas_rendering.pColorAttachments    = &rcas_attachment;
-	command.beginRendering(&rcas_rendering);
-
-	const vk::Viewport rcas_viewport {0.0f, 0.0f,
-	                                  static_cast<float>(m_extent.width),
-	                                  static_cast<float>(m_extent.height),
-	                                  0.0f, 1.0f};
-	command.setViewport(0, 1, &rcas_viewport);
-	command.setScissor(0, 1, &game_rect);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_rcas_pipeline);
-
-	const vk::DescriptorImageInfo rcas_source_desc {
-	    m_fsr_sampler, slot.view, vk::ImageLayout::eShaderReadOnlyOptimal};
-	vk::WriteDescriptorSet rcas_write {};
-	rcas_write.dstBinding      = 0;
-	rcas_write.descriptorCount = 1;
-	rcas_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-	rcas_write.pImageInfo      = &rcas_source_desc;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_rcas_layout, 0, 1,
-	                             &rcas_write);
-
-	const struct {
-		int32_t x;
-		int32_t y;
-		int32_t width;
-		int32_t height;
-		float   sharpness;
-	} rcas_params {
-		game_rect.offset.x,
-		game_rect.offset.y,
-		static_cast<int32_t>(game_rect.extent.width),
-		static_cast<int32_t>(game_rect.extent.height),
-		m_upscale_mode.sharpness
-	};
-	command.pushConstants(m_rcas_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(rcas_params), &rcas_params);
-	command.draw(3, 1, 0, 0);
-	command.endRendering();
-}
-
-void Swapchain::DrawRcasNative(vk::CommandBuffer command, Presenter::Frame* source,
-                               const vk::Rect2D& game_rect) {
-	auto& graphics = m_window.graphic_ctx;
-	auto  device   = graphics.device;
-	EnsureFsrPipelines();
-
-	if (source->view == nullptr) {
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = source->image.image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = source->image.format;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &source->view),
-		                     "create video-out source image view for native RCAS");
-	}
-
-	vk::RenderingAttachmentInfo rcas_attachment {};
-	rcas_attachment.imageView   = m_image_views[m_image_index];
-	rcas_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-	rcas_attachment.loadOp      = (game_rect.extent == m_extent)
-	                                  ? vk::AttachmentLoadOp::eDontCare
-	                                  : vk::AttachmentLoadOp::eLoad;
-	rcas_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-
-	vk::RenderingInfo rcas_rendering {};
-	rcas_rendering.renderArea.extent    = m_extent;
-	rcas_rendering.layerCount           = 1;
-	rcas_rendering.colorAttachmentCount = 1;
-	rcas_rendering.pColorAttachments    = &rcas_attachment;
-	command.beginRendering(&rcas_rendering);
-
-	const vk::Viewport rcas_viewport {0.0f, 0.0f,
-	                                  static_cast<float>(m_extent.width),
-	                                  static_cast<float>(m_extent.height),
-	                                  0.0f, 1.0f};
-	command.setViewport(0, 1, &rcas_viewport);
-	command.setScissor(0, 1, &game_rect);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_rcas_pipeline);
-
-	const vk::DescriptorImageInfo rcas_source_desc {
-	    m_fsr_sampler, source->view, vk::ImageLayout::eShaderReadOnlyOptimal};
-	vk::WriteDescriptorSet rcas_write {};
-	rcas_write.dstBinding      = 0;
-	rcas_write.descriptorCount = 1;
-	rcas_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-	rcas_write.pImageInfo      = &rcas_source_desc;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_rcas_layout, 0, 1,
-	                             &rcas_write);
-
-	const struct {
-		int32_t x;
-		int32_t y;
-		int32_t width;
-		int32_t height;
-		float   sharpness;
-	} rcas_params {
-		game_rect.offset.x,
-		game_rect.offset.y,
-		static_cast<int32_t>(game_rect.extent.width),
-		static_cast<int32_t>(game_rect.extent.height),
-		m_upscale_mode.sharpness
-	};
-	command.pushConstants(m_rcas_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(rcas_params), &rcas_params);
-	command.draw(3, 1, 0, 0);
-	command.endRendering();
-}
-
-void Swapchain::DrawCmaa2(vk::CommandBuffer command, Presenter::Frame* source,
-                          const vk::Rect2D& game_rect) {
-	auto& graphics = m_window.graphic_ctx;
-	auto  device   = graphics.device;
-	EnsureFsrPipelines();
-
-	if (source->view == nullptr) {
-		vk::ImageViewCreateInfo view_info {};
-		view_info.image            = source->image.image;
-		view_info.viewType         = vk::ImageViewType::e2D;
-		view_info.format           = source->image.format;
-		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
-		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &source->view),
-		                     "create video-out source image view for CMAA2");
-	}
-
-	vk::RenderingAttachmentInfo cmaa2_attachment {};
-	cmaa2_attachment.imageView   = m_image_views[m_image_index];
-	cmaa2_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-	cmaa2_attachment.loadOp      = (game_rect.extent == m_extent)
-	                                   ? vk::AttachmentLoadOp::eDontCare
-	                                   : vk::AttachmentLoadOp::eLoad;
-	cmaa2_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-
-	vk::RenderingInfo cmaa2_rendering {};
-	cmaa2_rendering.renderArea.extent    = m_extent;
-	cmaa2_rendering.layerCount           = 1;
-	cmaa2_rendering.colorAttachmentCount = 1;
-	cmaa2_rendering.pColorAttachments    = &cmaa2_attachment;
-	command.beginRendering(&cmaa2_rendering);
-
-	const vk::Viewport cmaa2_viewport {0.0f, 0.0f,
-	                                   static_cast<float>(m_extent.width),
-	                                   static_cast<float>(m_extent.height),
-	                                   0.0f, 1.0f};
-	command.setViewport(0, 1, &cmaa2_viewport);
-	command.setScissor(0, 1, &game_rect);
-	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_cmaa2_pipeline);
-
-	const vk::DescriptorImageInfo cmaa2_source_desc {
-	    m_fsr_sampler, source->view, vk::ImageLayout::eShaderReadOnlyOptimal};
-	vk::WriteDescriptorSet cmaa2_write {};
-	cmaa2_write.dstBinding      = 0;
-	cmaa2_write.descriptorCount = 1;
-	cmaa2_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
-	cmaa2_write.pImageInfo      = &cmaa2_source_desc;
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_cmaa2_layout, 0, 1,
-	                             &cmaa2_write);
-
-	const struct {
-		int32_t x;
-		int32_t y;
-		int32_t width;
-		int32_t height;
-	} cmaa2_params {
-		game_rect.offset.x,
-		game_rect.offset.y,
-		static_cast<int32_t>(game_rect.extent.width),
-		static_cast<int32_t>(game_rect.extent.height)
-	};
-	command.pushConstants(m_cmaa2_layout, vk::ShaderStageFlagBits::eFragment, 0,
-	                      sizeof(cmaa2_params), &cmaa2_params);
-	command.draw(3, 1, 0, 0);
-	command.endRendering();
 }
 
 void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
@@ -1284,8 +796,11 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
+	// The main bus ignores alpha.
 	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
-	                       frame.source_flags | (layer.bus == 0 ? 16u : 0u);
+	                       (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
+	                       (layer.bus == 0 ? 16u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -1314,32 +829,20 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
-	command.InvalidateDynamicState();
+	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
-	const bool convert_source =
-	    source != nullptr && VideoOutSourceNeedsDraw(source->source_flags, m_hdr_active);
-	const auto* aspect_source = source != nullptr ? source : overlay.frame;
-	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
-	                               ? FitAspect(aspect_source->image.extent, m_extent)
-	                               : vk::Rect2D {{0, 0}, m_extent};
-	const bool  upscaled      = m_upscale_mode.fsr && source != nullptr && !convert_source &&
-	                            (game_rect.extent.width > source->image.extent.width ||
-	                             game_rect.extent.height > source->image.extent.height);
-	const bool native_1_1 = source != nullptr && !convert_source &&
-	                        game_rect.extent.width == source->image.extent.width &&
-	                        game_rect.extent.height == source->image.extent.height;
-	const bool native_rcas     = m_upscale_mode.rcas && native_1_1;
-	const bool native_cmaa2    = m_upscale_mode.cmaa2 && native_1_1;
-	const bool filter_source   = upscaled || native_rcas || native_cmaa2;
-	const bool blit_source     = source != nullptr && !convert_source && !filter_source;
+	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
+	const bool blit_source     = source != nullptr && !convert_source;
+	// The overlays bind their own graphics pipelines and set their own dynamic state
+	// (KYTY_FIX_DRAW_STATE_FILTER).
+	command.InvalidateGraphicsState();
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment =
-	    convert_source || draw_overlay || draw_system_overlay || filter_source;
+	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
 	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
 	}
-	if (convert_source || filter_source) {
+	if (convert_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
 	}
@@ -1361,10 +864,15 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.levelCount     = 1;
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
+	// Match the acquire wait stage so the layout transition cannot precede acquisition.
 	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
 	                           nullptr, 0, nullptr, 1, &to_transfer);
 
+	const auto* aspect_source = source != nullptr ? source : overlay.frame;
+	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
+	                               ? FitAspect(aspect_source->image.extent, m_extent)
+	                               : vk::Rect2D {{0, 0}, m_extent};
 	if (source == nullptr || game_rect.extent != m_extent) {
 		const vk::ClearColorValue black {};
 		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
@@ -1425,6 +933,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 	                           &to_present);
 	if (draw_attachment) {
+		// Each pass blends over the color writes of the previous one.
 		to_present.srcAccessMask      = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.oldLayout          = vk::ImageLayout::eColorAttachmentOptimal;
 		const auto attachment_barrier = [&] {
@@ -1433,36 +942,20 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 			                           &to_present);
 		};
-		if (upscaled) {
-			DrawFsr(vk_command.Direct(), source, game_rect);
-			if (draw_overlay || draw_system_overlay) {
-				attachment_barrier();
-			}
-		} else if (native_rcas) {
-			DrawRcasNative(vk_command.Direct(), source, game_rect);
-			if (draw_overlay || draw_system_overlay) {
-				attachment_barrier();
-			}
-		} else if (native_cmaa2) {
-			DrawCmaa2(vk_command.Direct(), source, game_rect);
-			if (draw_overlay || draw_system_overlay) {
-				attachment_barrier();
-			}
-		}
 		if (convert_source) {
-			DrawLayer(vk_command.Direct(), {source, 0, false}, game_rect);
+			DrawLayer(vk_command, {source, 0, false}, game_rect);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_overlay) {
-			DrawLayer(vk_command.Direct(), overlay, game_rect);
+			DrawLayer(vk_command, overlay, game_rect);
 			if (draw_system_overlay) {
 				attachment_barrier();
 			}
 		}
 		if (draw_system_overlay) {
-			m_system_overlay->Record(vk_command.Direct(), m_image_views[m_image_index]);
+			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		}
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
@@ -1474,6 +967,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
@@ -1482,44 +976,8 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	return tick;
 }
 
-[[gnu::noinline]] static void NotePresentGap() {
-	static const bool logged_stalls = std::getenv("KYTY_PIPELINE_STALL_LOG_MS") != nullptr;
-	if (!logged_stalls) {
-		return;
-	}
-	using Clock = std::chrono::steady_clock;
-	static Clock::time_point last;
-	static Clock::time_point logged;
-	static uint64_t          frames = 0, over_50 = 0, over_250 = 0, over_1000 = 0;
-	static double            lost = 0.0, worst = 0.0;
-	const auto               now = Clock::now();
-	if (last != Clock::time_point {}) {
-		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-		frames++;
-		if (ms > 50.0) {
-			over_50++;
-			lost += ms - 50.0;
-		}
-		over_250 += ms > 250.0 ? 1u : 0u;
-		over_1000 += ms > 1000.0 ? 1u : 0u;
-		worst = std::max(worst, ms);
-		if (ms > 250.0) {
-			Log::WriteToConsoleAndLog(fmt::format("[kyty-frames] gap {:.0f} ms @{}\n", ms,
-			                                      now.time_since_epoch().count()));
-		}
-	} else {
-		logged = now;
-	}
-	last = now;
-	if (now - logged >= std::chrono::seconds(10)) {
-		logged = now;
-		Log::WriteToConsoleAndLog(fmt::format("[kyty-frames] presents {} over 50 ms {} (lost {:.3f} s) over 250 ms {} "
-		                                      "over 1 s {} worst {:.0f} ms\n",
-		                                      frames, over_50, lost / 1000.0, over_250, over_1000, worst));
-	}
-}
-
 Swapchain::Status Swapchain::Present() {
+	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
@@ -1531,7 +989,8 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		CommandRecorder::SyncQueue(); // before the queue lock
+		QueueLockGuard lock(m_window.graphic_ctx.queue_mutex, "swapchain.cpp:1019");
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
@@ -1547,7 +1006,6 @@ Swapchain::Status Swapchain::Present() {
 			return Status::SurfaceLost;
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
-	NotePresentGap();
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;
 }
@@ -1565,8 +1023,8 @@ void Presenter::AttachSurface() {
 }
 #endif
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
-                                          uint64_t video_out_format, bool headset) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
+                                          bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -1576,8 +1034,8 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		default: break;
 	}
 	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
-	frame->source_flags = VideoOutSourceFlags(video_out_format);
-	frame->blank        = false;
+	frame->hdr   = hdr;
+	frame->blank = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
@@ -1586,7 +1044,132 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	TraceFrameTime(DebugPresentCount().fetch_add(1) + 1);
+	SyncTimeline::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_SYNC_TIMELINE
+	Common::StartupTrace::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_STARTUP
+	if (DebugRtEnabled()) {
+		// Same numbering as the window title (blank frames included, first frame = 1).
+		const auto      n            = DebugPresentCount().load();
+		const char*     dir          = Common::EnvRead::FrameDir();
+		DebugReadSamples(m_impl->window.graphic_ctx);
+		std::vector<DebugRtRecord>                    records;
+		std::vector<std::pair<std::string, uint32_t>> zero_draws;
+		std::vector<DebugCsRecord>                    cs_records;
+		{
+			std::scoped_lock lock(DebugRtMutex());
+			records.swap(DebugRtFrame());
+			zero_draws.swap(DebugZeroDraws());
+			cs_records.swap(DebugCsFrame());
+		}
+		bool triggered = false;
+		if (DebugCaptureFrame().exchange(false)) {
+			triggered = true;
+		} else if (const char* trigger = DebugRtTriggerPath(); trigger != nullptr) {
+			if (FILE* file = std::fopen(trigger, "rb")) {
+				std::fclose(file);
+				std::remove(trigger);
+				// Capture the whole next frame (compute outputs too), then dump at its present.
+				DebugCaptureIndex() = 0;
+				DebugCaptureFrame() = true;
+			}
+		}
+		// KYTY_TRACE_RT_DUMP_TIMES: the listed second that has just passed (one dump per second listed).
+		static size_t next_time = 0;
+		int64_t       due_time  = -1;
+		if (const auto& times = DebugRtDumpTimes(); next_time < times.size()) {
+			const double age = Common::StartupTrace::ProcessAge();
+			while (next_time < times.size() && age >= static_cast<double>(times[next_time])) {
+				due_time = times[next_time++];
+			}
+			if (due_time >= 0) {
+				std::fprintf(stderr, "RT_DUMP_TIME t=%lld frame=%u age=%.2f\n", static_cast<long long>(due_time), n,
+				             age);
+			}
+		}
+		// The next frames record their draws and dispatches for the dump (DebugRtCollecting) only when one of them
+		// may be dumped: a captured frame, a listed second less than 2 s away, a listed frame number up to 3 ahead.
+		{
+			bool        collect = DebugCaptureFrame().load();
+			const auto& times   = DebugRtDumpTimes();
+			if (next_time < times.size() &&
+			    static_cast<double>(times[next_time]) - Common::StartupTrace::ProcessAge() <= 2.0) {
+				collect = true;
+			}
+			for (const auto frame: DebugRtDumpFrames()) {
+				if (frame > n && frame <= n + 3u) collect = true;
+			}
+			DebugRtCollect().store(collect, std::memory_order_relaxed);
+		}
+		if (triggered || due_time >= 0 || std::ranges::find(DebugRtDumpFrames(), n) != DebugRtDumpFrames().end()) {
+			auto& graphics = m_impl->window.graphic_ctx;
+			auto& cache    = m_impl->renderer.GetTextureCache();
+			if (dir != nullptr) {
+				DebugQueueFullDump(graphics, buffer.Handle(), image,
+				                   std::string(dir) + (due_time >= 0 ? "/rttime" + std::to_string(due_time)
+				                                                     : "/rtframe" + std::to_string(n)) +
+				                       "_presented",
+				                   false);
+			}
+			for (size_t r = 0; r < records.size(); ++r) {
+				const auto& record = records[r];
+				std::string shaders;
+				for (size_t k = 0; k < record.shaders.size(); ++k) {
+					const auto& [vs, ps] = record.shaders[k];
+					char text[48];
+					std::snprintf(text, sizeof(text), " %016llx/%016llx", static_cast<unsigned long long>(vs),
+					              static_cast<unsigned long long>(ps));
+					shaders += " [" + (k < record.markers.size() ? record.markers[k] : std::string("-")) + "]";
+					shaders += text;
+				}
+				std::fprintf(stderr, "RT_DUMP frame=%u rt=%zu addr=0x%llx extent=%ux%u depth=%d draws=%u vs/ps:%s\n", n,
+				             r, static_cast<unsigned long long>(record.address), record.width, record.height,
+				             record.depth ? 1 : 0, record.draws, shaders.c_str());
+				if (dir == nullptr || (!triggered && std::getenv("KYTY_TRACE_RT_DUMP_PRESENTED_ONLY") != nullptr)) {
+					continue;
+				}
+				for (auto* alias: cache.DebugImagesAt(record.address)) {
+					if (alias->backing.extent.width != record.width || alias->backing.extent.height != record.height) {
+						continue;
+					}
+					char name[96];
+					std::snprintf(name, sizeof(name), "/rtframe%u_rt%02zu_%llx", n, r,
+					              static_cast<unsigned long long>(record.address));
+					DebugQueueFullDump(graphics, buffer.Handle(), *alias, std::string(dir) + name);
+				}
+			}
+			for (const auto& cs: cs_records) {
+				std::fprintf(stderr, "RT_CS frame=%u marker=[%s] hash=0x%016llx count=%u writes:%s reads:%s\n", n,
+				             cs.marker.c_str(), static_cast<unsigned long long>(cs.hash), cs.count, cs.writes.c_str(),
+				             cs.reads.c_str());
+			}
+			for (const auto& [path, count]: zero_draws) {
+				std::fprintf(stderr, "RT_ZERO frame=%u marker=[%s] zero_instance_draws=%u\n", n, path.c_str(), count);
+			}
+			std::fflush(stderr);
+		}
+	}
+	// KYTY_TRACE_PROXY_COUNTS alone (renderCompute.cpp): its buffer dumps are written at each present.
+	static const bool proxy_counts_only = Common::EnvRead::ProxyCounts() &&
+	                                      !Common::EnvRead::Flips() && !DebugRtEnabled();
+	if (proxy_counts_only) DebugReadSamples(m_impl->window.graphic_ctx);
+	if (Common::EnvRead::Flips()) {
+		static uint32_t presented = 0;
+		const auto n = presented++;
+		// Samples queued at the previous point are read one frame later.
+		DebugReadSamples(m_impl->window.graphic_ctx);
+		// Inside the trace window (KYTY_TRACE_STENCIL_TRIGGER) every presented frame is dumped too.
+		if (n == 3u || n == 10u || n % 30u == 0u || DebugStencilWindow() || DebugFrameRange()) {
+			DebugArm().fetch_add(1);
+			auto& graphics = m_impl->window.graphic_ctx;
+			DebugQueueSample(graphics, buffer.Handle(), image, "frame" + std::to_string(n) + " presented");
+			if (const char* dir = Common::EnvRead::FrameDir(); dir != nullptr) {
+				DebugQueueFullDump(graphics, buffer.Handle(), image,
+				                   std::string(dir) + "/frame" + std::to_string(n));
+			}
+		}
+	}
 	if (headset) {
+		// The frame holds the raw display-encoded pixels the headset needs.
 		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
 		               vk::AccessFlagBits2::eTransferRead);
 		Vr::OpenXrQueueEyeSource(buffer, frame->image);
@@ -1594,13 +1177,50 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	return *frame;
 }
 
+// KYTY_TRACE_FRAMETIME=1 (diagnostic): one "FRAMETIME frame=<n> ms=<time since the previous present>"
+// line per presented frame, for frame-time percentiles (scripts/analysis/frametime.py).
+#if defined(KYTY_PGO_GENERATE)
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
+static void TraceFrameTime(uint32_t frame) {
+#if defined(KYTY_PGO_GENERATE)
+	// KYTY_PGO_WRITE_FRAME=<n> (instrumented PGO builds only): write the profile (LLVM_PROFILE_FILE) at every n-th
+	// presented frame; runs end with a forced stop, which skips the write at exit, and a long play must not lose it all.
+	static const uint32_t pgo_write_frame = [] {
+		const char* value = std::getenv("KYTY_PGO_WRITE_FRAME");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	if (pgo_write_frame != 0 && frame % pgo_write_frame == 0) {
+		const int result = __llvm_profile_write_file();
+		std::fprintf(stderr, "PGO_PROFILE_WRITTEN frame=%u result=%d\n", frame, result);
+	}
+#endif
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_FRAMETIME");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (!on) return;
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	const auto  ms   = std::chrono::duration<double, std::milli>(now - last).count();
+	last             = now;
+	std::fprintf(stderr, "FRAMETIME frame=%u ms=%.1f\n", frame, ms);
+	Common::SlowFrame::Report(frame, ms); // KYTY_TRACE_SLOW_FRAMES
+}
+
 Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
                                                CommandBuffer* producer) {
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
-	frame->source_flags = 0;
-	frame->blank        = true;
+	frame->hdr   = false;
+	frame->blank = true;
+	// The renderer lock stays in presentation (upstream d58aefde4 removed it): it also orders the present scheduler
+	// below with Impl::Present, which takes it under present_mutex, so this path must not take present_mutex inside it.
+	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	TraceFrameTime(DebugPresentCount().fetch_add(1) + 1);
+	SyncTimeline::NoteFrame(DebugPresentCount().load()); // KYTY_TRACE_SYNC_TIMELINE
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -1608,7 +1228,6 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
-		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1623,6 +1242,10 @@ bool Presenter::PresentLastFrame() {
 	}
 	m_impl->Present();
 	return true;
+}
+
+bool Presenter::IsGuestPaused() const noexcept {
+	return m_impl->window.loop.paused.load(std::memory_order_acquire);
 }
 
 bool Presenter::IsHdrSupported() const noexcept {
@@ -1648,6 +1271,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
 			m_impl->frames.Release(previous.frame);
@@ -1671,45 +1295,69 @@ void Presenter::ClearLayer(int bus) {
 
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
-	using Common::DebugCounters::Counter;
-	using Common::DebugCounters::ScopedTimer;
-	ScopedTimer present_time(Counter::PresentNs);
+	window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
 	const auto* main_frame = layers[0].frame;
 	const bool hdr_changed = main_frame != nullptr && !main_frame->blank &&
-	                         swapchain.SetHdr((main_frame->source_flags & 4u) != 0);
+	                         swapchain.SetHdr(main_frame->hdr);
+	// Some window systems keep presenting an old swapchain after a resize.
 	if (hdr_changed || swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		if (swapchain.ImageCount() == 0) {
-			return;
-		}
 		auto status = [&] {
-			ScopedTimer acquire_time(Counter::PresentAcquireNs);
+			KYTY_PROFILER_BLOCK("Present::Acquire");
 			return swapchain.AcquireNextImage(present_scheduler);
 		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay = [&] {
-			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled() ||
-			        ManifestProgressVisible()) &&
-			       swapchain.PrepareSystemOverlay();
-		}();
-		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-		                                draw_system_overlay);
-		const auto tick = swapchain.Submit(present_scheduler);
-		for (const auto& layer: layers) {
-			if (layer.frame != nullptr) {
-				layer.frame->present_tick = tick;
+		{
+			// The renderer lock stays here (upstream d58aefde4 dropped it from presentation and relies on present_mutex
+			// and queue_mutex only); our renderer and KYTY_TRACE_PERF render_lock statistics keep it.
+			std::optional<Common::LockGuard> render_lock_holder;
+			const auto lock_start = std::chrono::steady_clock::now(); // KYTY_TRACE_PERF: RenderLockStats
+			{
+				KYTY_PROFILER_BLOCK("Present::RenderLock");
+				render_lock_holder.emplace(renderer.GetMutex());
+			}
+			const auto lock_got = std::chrono::steady_clock::now();
+			KYTY_PROFILER_BLOCK("Present::RecordSubmit");
+			auto&             command = present_scheduler.BeginCommand();
+			// The performance panel (F2) is drawn by the same pass.
+			const bool draw_system_overlay =
+			    (overlay_visual.active || PerformanceOverlayEnabled()) &&
+			    swapchain.PrepareSystemOverlay();
+			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+			                                draw_system_overlay);
+			const auto submit_start = std::chrono::steady_clock::now();
+			const auto tick = swapchain.Submit(present_scheduler);
+			for (const auto& layer: layers) {
+				if (layer.frame != nullptr) {
+					layer.frame->present_tick = tick;
+				}
+			}
+			{
+				const auto ns = [](auto d) {
+					return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+				};
+				const auto now  = std::chrono::steady_clock::now();
+				auto&      st   = GetRenderLockStats();
+				const auto hold = ns(now - lock_got);
+				st.present_wait_ns.fetch_add(ns(lock_got - lock_start), std::memory_order_relaxed);
+				st.present_hold_ns.fetch_add(hold, std::memory_order_relaxed);
+				st.present_submit_ns.fetch_add(ns(now - submit_start), std::memory_order_relaxed);
+				NoteMax(st.present_hold_max_ns, hold);
+				st.presents.fetch_add(1, std::memory_order_relaxed);
 			}
 		}
-		status = swapchain.Present();
+		status = [&] {
+			KYTY_PROFILER_BLOCK("Present::QueuePresent");
+			return swapchain.Present();
+		}();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
@@ -1729,4 +1377,4 @@ void Presenter::Discard(Frame& frame) {
 
 WindowContext::WindowContext() = default;
 
-}
+} // namespace Libs::Graphics

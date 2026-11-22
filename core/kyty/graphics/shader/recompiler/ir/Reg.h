@@ -18,4 +18,4 @@ constexpr uint32_t RegIndex(VectorReg reg) {
 	return static_cast<uint32_t>(reg);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

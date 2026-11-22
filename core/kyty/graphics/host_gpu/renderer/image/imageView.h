@@ -6,6 +6,8 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
+
 namespace Libs::Graphics {
 
 namespace ImageViewOps {
@@ -23,7 +25,7 @@ namespace ImageViewOps {
 		default: return false;
 	}
 }
-}
+} // namespace ImageViewOps
 
 [[nodiscard]] inline bool IsSupportedSampledDepthFormat(vk::Format image_format,
                                                         vk::Format view_format) noexcept {
@@ -37,15 +39,18 @@ namespace ImageViewOps {
 	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
 }
 
-[[nodiscard]] inline vk::Format SrgbUnormViewFormat(vk::Format image_format) noexcept {
+// Whether the device samples R8_SRGB views (optional in Vulkan; set once at device creation, vulkanWindow.cpp). A guest
+// 8_SRGB T# read then gets an R8_SRGB view of its R8_UNORM image: the sampler decodes before filtering, as on the PS5.
+[[nodiscard]] inline std::atomic<bool>& SampledR8SrgbSupported() noexcept {
+	static std::atomic<bool> supported {false};
+	return supported;
+}
+
+[[nodiscard]] inline vk::Format SrgbStorageViewFormat(vk::Format image_format) noexcept {
 	switch (image_format) {
 		case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
-		case vk::Format::eBc1RgbaSrgbBlock: return vk::Format::eBc1RgbaUnormBlock;
-		case vk::Format::eBc2SrgbBlock: return vk::Format::eBc2UnormBlock;
-		case vk::Format::eBc3SrgbBlock: return vk::Format::eBc3UnormBlock;
-		case vk::Format::eBc7SrgbBlock: return vk::Format::eBc7UnormBlock;
-		default: return image_format;
+		default: return vk::Format::eUndefined;
 	}
 }
 
@@ -130,6 +135,6 @@ ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource
 	}
 }
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGEVIEW_H_

@@ -12,6 +12,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// A standard list provides stable instruction addresses without adding an intrusive-container
+// dependency.
 class Block {
 public:
 	using InstructionList = std::list<Inst>;
@@ -73,7 +75,6 @@ public:
 	std::array<Value, NumScalarRegs> ssa_thread_bit_sreg_values {};
 	std::array<Value, NumScalarRegs> ssa_sreg_mask_tags {};
 	std::array<Value, NumVectorRegs> ssa_vreg_values {};
-	std::array<Value, 8>             ssa_flag_values {};
 
 private:
 	InstructionList     instructions;
@@ -85,4 +86,4 @@ private:
 
 using BlockList = std::vector<Block*>;
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

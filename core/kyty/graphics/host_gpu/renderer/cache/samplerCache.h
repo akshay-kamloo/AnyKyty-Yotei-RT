@@ -24,10 +24,18 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
+	// Samplers are created once per key and destroyed only by ~SamplerCache, never replaced: a
+	// per-thread memo (samplerCache.cpp) answers repeated keys without taking m_mutex.
 	vk::Sampler GetSampler(const ShaderSamplerResource& r, bool integer_border);
 
 private:
 	using SamplerKey = std::array<uint32_t, 5>;
+
+	static uint64_t NextInstanceId();
+
+	// m_mutex must be held; finds or creates the sampler of `key`.
+	vk::Sampler GetSamplerLocked(const ShaderSamplerResource& r, bool integer_border,
+	                             const SamplerKey& key);
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {
@@ -42,9 +50,11 @@ private:
 	};
 
 	GraphicContext&                                             m_graphics;
+	const uint64_t                                              m_instance_id = NextInstanceId(); // never reused, names this cache in the per-thread memo
+	Common::Mutex                                               m_mutex;
 	std::unordered_map<SamplerKey, vk::Sampler, SamplerKeyHash> m_samplers;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SAMPLERCACHE_H_

@@ -13,6 +13,8 @@
 #include <utility>
 #include <zarchive/zarchivereader.h>
 
+// POSIX hosts and MinGW's pthread-backed libstdc++ have cancellable condition waits.
+// MSVC/ClangCL and MinGW's native Win32 threading backend do not use pthread waits.
 #if !defined(_WIN32) || defined(_GLIBCXX_GCC_GTHR_POSIX_H)
 #include <pthread.h>
 #define KYTY_ARCHIVE_PTHREAD_CANCELLATION
@@ -20,6 +22,8 @@
 
 namespace Common {
 
+// Backends expose immutable metadata and offset-based reads. Cursor management, path routing,
+// reader lifetime and the host-stack worker are shared by every archive format.
 class ArchiveReader {
 public:
 	struct Entry {
@@ -70,6 +74,7 @@ public:
 	}
 
 	uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) override {
+		// ZArchiveReader already serializes access to its stream and decompression cache.
 		return m_reader->ReadFromFile(static_cast<ZArchiveNodeHandle>(id), offset, size, data);
 	}
 
@@ -106,6 +111,8 @@ const ArchiveFormat* FindFormat(NativeView path) {
 }
 
 size_t FindMarker(NativeView path) {
+	// Native files use this check on every operation. The usual path has no marker and allocates
+	// nothing.
 	for (auto marker = path.find('!'); marker != NativeView::npos;
 	     marker      = path.find('!', marker + 1)) {
 		if ((marker + 1 == path.size() || path[marker + 1] == '/' || path[marker + 1] == '\\') &&
@@ -157,9 +164,14 @@ std::optional<ParsedPath> ParsePath(const std::filesystem::path& path) {
 std::mutex                                                              g_readers_mutex;
 std::unordered_map<std::filesystem::path, std::weak_ptr<ArchiveReader>> g_readers;
 
+// Guest stacks can be only 64 KiB. Decompress on an ordinary host stack, then copy into guest
+// memory on the caller so GPU-tracked writes use its fault handler. A single worker bounds host
+// threads and avoids duplicating the archive's own block cache. Requests live on waiting callers.
 class ArchiveIoThread {
 public:
 	static ArchiveIoThread& Instance() {
+		// Guest exit can run static destructors while other guest threads are still reading.
+		// Keep the worker alive until process termination, as with the guest threads themselves.
 		static auto* instance = new ArchiveIoThread;
 		return *instance;
 	}
@@ -215,6 +227,8 @@ private:
 				std::lock_guard lock(m_mutex);
 				request->result = result;
 				request->done   = true;
+				// Notify before releasing the mutex: the waiting caller owns the condition
+				// variable.
 				request->ready.notify_one();
 			}
 		}
@@ -226,7 +240,7 @@ private:
 	Request*                m_last  = nullptr;
 };
 
-}
+} // namespace
 
 struct ArchiveFile::Private {
 	std::shared_ptr<ArchiveReader> reader;
@@ -250,6 +264,8 @@ bool ArchiveFile::Seek(uint64_t offset) {
 
 void ArchiveFile::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 #if defined(KYTY_ARCHIVE_PTHREAD_CANCELLATION)
+	// A pending cancellation must not destroy the waiting request or its TLS buffer while the
+	// worker still uses them. Restore the caller's state only after the copy is complete.
 	int cancellation_state = PTHREAD_CANCEL_ENABLE;
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancellation_state);
 #endif
@@ -325,6 +341,7 @@ std::shared_ptr<ArchiveReader> OpenArchive(const std::filesystem::path& path) {
 			}
 		}
 	}
+	// Do not hold the cache mutex while opening an unrelated archive from disk.
 	auto reader = format->open(archive);
 	if (reader == nullptr) {
 		return {};
@@ -377,4 +394,4 @@ std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path) 
 	return std::unique_ptr<ArchiveFile>(new ArchiveFile(std::move(p)));
 }
 
-}
+} // namespace Common

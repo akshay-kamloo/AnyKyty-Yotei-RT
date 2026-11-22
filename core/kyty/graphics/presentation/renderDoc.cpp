@@ -1,19 +1,27 @@
-#if !defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/presentation/renderDoc.h"
 
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "graphics/host_gpu/queueLockSite.h"
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <renderdoc_app.h>
 #include <string>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef min
+#undef max
 #else
 #include <dlfcn.h>
 #endif
@@ -30,6 +38,20 @@ static RENDERDOC_API_1_6_0*        g_api             = nullptr;
 static std::atomic<RenderDocState> g_state           = RenderDocState::Idle;
 static uint32_t                    g_captured_flips  = 0;
 static std::atomic_bool            g_unavailable_log = false;
+
+// RenderDoc events also go to stderr: test runs keep the printf log silent, and captures are rare.
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define RD_LOG(...)                                                                                \
+	do {                                                                                           \
+		LOGF(__VA_ARGS__);                                                                         \
+		std::fprintf(stderr, __VA_ARGS__);                                                         \
+	} while (false)
+
+// Guest flips a capture spans. A captured guest frame can take minutes (RenderDoc diffs every persistently mapped
+// allocation at each submit).
+static uint32_t CaptureFlips() {
+	return 2u;
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
@@ -51,7 +73,7 @@ static bool BindRenderDocApi(void* module) {
 	g_api = static_cast<RENDERDOC_API_1_6_0*>(api);
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
-	LOGF("RenderDoc: API 1.6.0 bound\n");
+	RD_LOG("RenderDoc: API 1.6.0 bound\n");
 	return true;
 }
 
@@ -88,7 +110,7 @@ void RenderDocInit() {
 	}
 
 	if (!BindRenderDocApi(module)) {
-		LOGF("RenderDoc: API 1.6.0 is unavailable\n");
+		RD_LOG("RenderDoc: API 1.6.0 is unavailable\n");
 	}
 }
 
@@ -108,7 +130,7 @@ void RenderDocInit() {
 	}
 
 	if (!BindRenderDocApi(module)) {
-		LOGF("RenderDoc: API 1.6.0 is unavailable\n");
+		RD_LOG("RenderDoc: API 1.6.0 is unavailable\n");
 		::dlclose(module);
 	}
 }
@@ -117,22 +139,27 @@ void RenderDocInit() {
 
 void RenderDocRequestCapture() {
 	if (g_api == nullptr) {
+		// The Vulkan loader loads RenderDoc's layer (VK_LAYER_PATH + VK_INSTANCE_LAYERS, no registration) only when
+		// the instance is created, after the startup RenderDocInit(); look for it again now.
+		RenderDocInit();
+	}
+	if (g_api == nullptr) {
 		if (!g_unavailable_log.exchange(true)) {
-			LOGF("RenderDoc: capture requested, but RenderDoc is unavailable\n");
+			RD_LOG("RenderDoc: capture requested, but RenderDoc is unavailable\n");
 		}
 		return;
 	}
 
 	RenderDocState expected = RenderDocState::Idle;
 	if (g_state.compare_exchange_strong(expected, RenderDocState::Requested)) {
-		LOGF("RenderDoc: capture requested\n");
+		RD_LOG("RenderDoc: capture requested\n");
 	}
 }
 
 static void StartCapture() {
 	if (g_api->IsFrameCapturing() != 0) {
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF("RenderDoc: capture request ignored because a capture is already active\n");
+		RD_LOG("RenderDoc: capture request ignored because a capture is already active\n");
 		return;
 	}
 
@@ -144,37 +171,39 @@ static void StartCapture() {
 	g_api->StartFrameCapture(nullptr, nullptr);
 	if (g_api->IsFrameCapturing() == 0) {
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF("RenderDoc: capture failed to start\n");
+		RD_LOG("RenderDoc: capture failed to start\n");
 		return;
 	}
 	g_captured_flips = 0;
 	g_state.store(RenderDocState::Capturing, std::memory_order_release);
-	LOGF("RenderDoc: capture started\n");
+	RD_LOG("RenderDoc: capture started\n");
 }
 
 void RenderDocOnGuestFlip(RenderContext& renderer) {
 	const auto state = g_state.load(std::memory_order_acquire);
-	if (state == RenderDocState::Idle) {
+	if (g_api == nullptr || state == RenderDocState::Idle) {
 		return;
 	}
 	if (state == RenderDocState::Capturing) {
+		// The count advances outside the log macro: RD_LOG expands its arguments twice and LOGF skips them when silent.
 		++g_captured_flips;
-		LOGF("RenderDoc: captured guest flip %u/2\n", g_captured_flips);
-		if (g_captured_flips < 2) {
+		RD_LOG("RenderDoc: captured guest flip %u/%u\n", g_captured_flips, CaptureFlips());
+		if (g_captured_flips < CaptureFlips()) {
 			return;
 		}
 	}
 
+	// Capture boundaries follow presentation and exclude concurrent queue access.
 	Common::LockGuard render_lock(renderer.GetMutex());
-	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
+	CommandRecorder::SyncQueue(); // before the queue lock
+	QueueLockGuard queue_lock(renderer.GetGraphics().queue_mutex, "renderDoc.cpp:203");
 	if (state == RenderDocState::Requested) {
 		StartCapture();
 	} else {
 		const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
-		LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
+		RD_LOG(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
 	}
 }
 
-}
-#endif
+} // namespace Libs::Graphics

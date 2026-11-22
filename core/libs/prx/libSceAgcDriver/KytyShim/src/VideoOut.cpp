@@ -8,7 +8,6 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
-#include "graphics/presentation/precompileNotice.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -63,6 +62,12 @@ std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
 
 }
 
+#if defined(ANYPS5_KYTY_DLL)
+namespace KytyShim {
+const void* DllFlipOwner(const AgcDriver::IFlipRequest* request) noexcept;
+}
+#endif
+
 namespace KytyShim::Present {
 
 void WaitRendering(std::uint32_t handle, std::uint32_t index);
@@ -81,7 +86,11 @@ struct PendingFlip {
 };
 
 struct ReadyFlip {
+#if defined(ANYPS5_KYTY_DLL)
+    std::shared_ptr<AgcDriver::IFlipRequest> request;
+#else
     std::weak_ptr<AgcDriver::IFlipRequest> request;
+#endif
     const void* owner = nullptr;
     std::uint32_t handle = 0;
     int index = 0;
@@ -164,7 +173,7 @@ void WaitRunningUrgentCommands(std::function<void()> blocking) {
     static auto* const waiter = new BlockingWaiter;
     auto waiting = waiter->Start(std::move(blocking));
     while (waiting.wait_for(std::chrono::microseconds(200)) != std::future_status::ready) {
-        Libs::Graphics::GuestGpu::RunUrgentCommandsWhileWaiting();
+        Libs::Graphics::GuestGpu::RunCommandsWhileWaiting();
     }
     waiting.get();
 }
@@ -345,7 +354,7 @@ void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs
     flip.source = flip.request->Source();
     if (!flip.source.has_value()) return;
     const auto info = DisplayImageInfo(*flip.source);
-    flip.frame = &presenter.PrepareFrame(buffer, info, flip.source->pixelFormat, false);
+    flip.frame = &presenter.PrepareFrame(buffer, info, false, false);
 }
 
 std::uint64_t DropFlip(std::uint32_t handle, int index) {
@@ -363,10 +372,13 @@ std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Pres
         auto& state = State();
         std::lock_guard lock(state.mutex);
         for (auto flip = state.ready.begin(); flip != state.ready.end();) {
+#if !defined(ANYPS5_KYTY_DLL)
             if (flip->request.expired()) {
                 if (flip->frame != nullptr) abandoned.push_back(flip->frame);
                 flip = state.ready.erase(flip);
-            } else if (!taken.has_value() && flip->owner == context) {
+            } else
+#endif
+            if (!taken.has_value() && flip->owner == context) {
                 taken = std::move(*flip);
                 flip = state.ready.erase(flip);
             } else {
@@ -487,7 +499,12 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
                 return;
             }
             request = std::move(pending.request);
-            state.ready.push_back({request, dynamic_cast<const void*>(request.get()), pending.handle, pending.index, std::move(pending.source), pending.frame});
+#if defined(ANYPS5_KYTY_DLL)
+            const void* owner = KytyShim::DllFlipOwner(request.get());
+#else
+            const void* owner = dynamic_cast<const void*>(request.get());
+#endif
+            state.ready.push_back({request, owner, pending.handle, pending.index, std::move(pending.source), pending.frame});
             state.flips.erase(found);
         }
         request->GpuReady(std::make_shared<AgcDriver::FrameTiming>(request_id));
@@ -508,7 +525,11 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
     }
 }
 
-void VideoOutDriver::WaitFlipDone(const uint64_t*) {
+bool VideoOutDriver::IsSafeForRendering(int, int) {
+    return true;
+}
+
+void VideoOutDriver::WaitFlipDone(int, int) {
     std::fprintf(stderr, "[kyty-videoout] Kyty's wait-flip-done packet reached the kyty backend, but AnyPS5's libSceAgc emits the rendering wait packet instead\n");
     std::fflush(stderr);
     LibcTerminate_nid_no_patch(1);
@@ -546,9 +567,7 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
     auto host = std::make_unique<WindowContext>();
     host->graphic_ctx.screen_width = width;
     host->graphic_ctx.screen_height = height;
-    host->graphic_ctx.pipeline_cache_persistent =
-        !KytyShim::Replay::Tracking() || std::getenv("APS5_HEADLESS_PIPELINE_CACHE") != nullptr;
-    host->host_get_instance_proc_addr = KytyShim::Present::LoadVulkanLoader();
+        host->host_get_instance_proc_addr = KytyShim::Present::LoadVulkanLoader();
     host->host_extensions = KytyShim::Present::SurfaceInstanceExtensions(host->host_get_instance_proc_addr);
     host->host_create_surface = &KytyShim::Present::CreateHostSurface;
     host->CreateVulkan();
@@ -649,31 +668,7 @@ bool PerformanceOverlayEnabled() noexcept {
     return false;
 }
 
-bool ManifestProgressVisible() noexcept {
-    return false;
-}
 
-void ShowManifestProgress(const ManifestProgress&) {}
-
-void HideManifestProgress() {}
-
-void ShowPrecompileNotice(const PrecompileNotice& notice) {
-    static std::atomic<bool> told{false};
-    if (notice.visible && !told.exchange(true)) {
-        std::fprintf(stderr, "[kyty-videoout] the pipeline precompile notice is not drawn with ANYPS5_GPU_BACKEND=kyty: the game waits for its pipelines without it\n");
-        std::fflush(stderr);
-    }
-}
-
-void HidePrecompileNotice() {}
-
-PrecompileAnswer TakePrecompileAnswer() noexcept {
-    return PrecompileAnswer::None;
-}
-
-bool PrecompileNoticeVisible() noexcept {
-    return false;
-}
 
 }
 
@@ -700,8 +695,7 @@ void OpenXrQueueEyeSource(Graphics::CommandBuffer&, const Graphics::VulkanImage&
 extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationWindow& window) {
     if (window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: incomplete presentation window");
     KytyShim::Entry::JoinPrestart(true);
-    if (!KytyShim::Entry::Renderer().GetGpu().Pipelined()) throw std::runtime_error("kyty presentation: the Kyty GPU must run pipelined (GPU pipeline stages must include the command processor)");
-    auto& state = KytyShim::Present::State();
+        auto& state = KytyShim::Present::State();
     Libs::Graphics::WindowContext* host = nullptr;
     {
         std::lock_guard lock(state.mutex);
@@ -730,6 +724,12 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     state.attaching = false;
 }
 
+#if defined(ANYPS5_KYTY_DLL)
+namespace KytyShim {
+const void* DllFlipOwner(const AgcDriver::IFlipRequest* request) noexcept;
+}
+#endif
+
 namespace KytyShim::Present {
 namespace {
 
@@ -754,11 +754,11 @@ struct PreparedFrames {
 
 std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext& renderer, Libs::Graphics::Presenter& presenter, const std::optional<GuestImage>& main, const std::optional<GuestImage>& overlay) {
     auto prepared = std::make_shared<PreparedFrames>();
-    renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, main, overlay, prepared] {
+    renderer.GetGpu().SendCommandSync([&renderer, &presenter, main, overlay, prepared] {
         auto& scheduler = renderer.GetCommandScheduler();
-        if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, main->pixelFormat, false);
-        if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, overlay->pixelFormat, false);
-        if (main.has_value()) scheduler.DeferHostOperation([prepared] { prepared->done.release(); }, true);
+        if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, false, false);
+        if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, false, false);
+        if (main.has_value()) scheduler.DeferOperation([prepared] { prepared->done.release(); });
         prepared->tick = scheduler.CurrentTick();
         scheduler.Flush();
     });

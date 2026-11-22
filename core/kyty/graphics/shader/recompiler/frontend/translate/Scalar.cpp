@@ -22,6 +22,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			if (!graphics_compute || (inst.src0.value != 0x1818u && inst.src0.value != 0x0a18u))
 				EXIT("unsupported S_GETREG_B32 at pc 0x%08x: selector=0x%04x graphics_compute=%u",
 				     inst.pc, inst.src0.value, static_cast<unsigned>(graphics_compute));
+			// HW_ID2 identifies graphics compute as QUEUE=6, ME=0.
 			WriteOperand(inst.dst, IR::Value(inst.src0.value == 0x1818u ? 6u : 0u));
 			return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
@@ -141,6 +142,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::IAbs32, IR::Type::U32, false, false, true);
 		case O::S_SEXT_I32_I8:
 		case O::S_SEXT_I32_I16: {
+			// Sign extension leaves SCC unchanged.
 			const auto bits = inst.opcode == O::S_SEXT_I32_I8 ? 8u : 16u;
 			WriteOperand(inst.dst, IR::U32(ir.Emit(IR::ValueOpcode::BitFieldSExtract,
 			    {ReadU32(inst.src0), IR::Value(0u), IR::Value(bits)})));
@@ -191,6 +193,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			                     true);
 		case O::S_BCNT0_I32_B64:
 		case O::S_BCNT1_I32_B64: {
+			// Vulkan bit counts operate on 32-bit words; avoid packing only to split again.
 			auto value = ReadU32Pair(inst.src0);
 			if (inst.opcode == O::S_BCNT0_I32_B64) {
 				value[0] = ir.BitwiseNot(value[0]);
@@ -286,4 +289,4 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

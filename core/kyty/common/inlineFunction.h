@@ -9,6 +9,8 @@
 
 namespace Common {
 
+// A move-only void() callable stored in place when it fits in Capacity bytes, so queuing it
+// does not allocate; larger callables fall back to the heap.
 template <size_t Capacity>
 class InlineFunction {
 public:
@@ -16,7 +18,7 @@ public:
 
 	template <typename F, typename Callable = std::decay_t<F>,
 	          typename = std::enable_if_t<!std::is_same_v<Callable, InlineFunction>>>
-	InlineFunction(F&& function) {
+	InlineFunction(F&& function) { // NOLINT(google-explicit-constructor)
 		if constexpr (Fits<Callable>) {
 			::new (static_cast<void*>(m_storage)) Callable(std::forward<F>(function));
 			m_invoke = [](void* storage) { (*std::launder(static_cast<Callable*>(storage)))(); };
@@ -87,6 +89,6 @@ private:
 	void (*m_manage)(void* target, void* source) = nullptr;
 };
 
-}
+} // namespace Common
 
-#endif
+#endif // KYTY_COMMON_INLINEFUNCTION_H_

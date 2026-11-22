@@ -52,6 +52,6 @@ constexpr Opcode LookupOpcode(const OpcodeTable<Entry, EncodingCount, EntryCount
 	return entry != nullptr ? entry->decoded : Opcode::UNSUPPORTED;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder::Detail
 
-#endif
+#endif // EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_DECOMPILER_OPCODETABLE_H_

@@ -116,6 +116,14 @@ static GuestThreadState& CurrentGuestState() {
     return state;
 #endif
 }
+extern "C" PthreadPrivate* CurrentGuestPthreadOrNull_nid_no_patch() {
+#ifdef _WIN32
+    auto* state = WindowsThreadLocal<GuestThreadState>::TryGet();
+    return state != nullptr ? state->current : nullptr;
+#else
+    return CurrentGuestState().current;
+#endif
+}
 static std::mutex& stackLock = *new std::mutex();
 static auto& liveStacks = *new std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>();
 static auto& protectedStackPages = *new std::map<std::uintptr_t, std::size_t>();

@@ -1,75 +1,73 @@
-#include "loader/demonsSoulsTitle.h"
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
+#include "common/profiler.h"
+#include "graphics/guest_gpu/chunkLead.h"
+#include "graphics/host_gpu/renderer/indirectLoadFast.h"
+#include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
+#include "common/liveAb.h"
 #include "common/logging/log.h"
-#include "common/emulatorConfig.h"
-#include "common/hackNotice.h"
+#include "common/onceValue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/guest_gpu/scout.h"
-#include "graphics/host_gpu/bdaDirtyRegions.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/presentation/videoOut.h"
-#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
-#include "graphics/shader/shaderBindings.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 #include "libs/errno.h"
-#include "loader/demonsSoulsPageFree.h"
 
-#include <atomic>
-#include <span>
-#include <bit>
 #include <algorithm>
-#include <array>
-#include <bit>
-#include <map>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <chrono>
-#include <cstring>
-
-namespace {
-uint32_t BdaSwitch(const char* name, uint32_t fallback) {
-	const char* value = std::getenv(name);
-	return value != nullptr && value[0] != 0 ? static_cast<uint32_t>(std::strtoul(value, nullptr, 0)) : fallback;
-}
-uint32_t BdaRegionsMode() {
-	static const uint32_t mode = BdaSwitch("KYTY_BDA_REGIONS", Loader::DemonsSoulsTitle::IsSupportedGame() ? 1u : 0u);
-	return mode;
-}
-uint32_t BdaDirtyRegionsMode() {
-	static const uint32_t mode = BdaSwitch("KYTY_BDA_DIRTY_REGIONS", 1);
-	return mode;
-}
-}
 
 namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint64_t VsharpBaseReach = uint64_t {32} << 20u;
+// The BDA sync epoch: PrepareBda's pass runs only when guest writes became visible to the GPU work that follows, not
+// whenever any guest thread wrote anywhere. A guest CPU write is visible only to GPU work the guest ordered after it (a
+// later submission, or a label a WAIT_REG_MEM or a packet deciding on guest memory read): the regions a guest thread's
+// write fault dirties are deferred (regionManager.h) and the GPU thread publishes them at those points (GuestGpu::Process,
+// WaitRegMem, COND_EXEC, the conditional INDIRECT_BUFFER, SET_PREDICATION, REWIND); the GPU thread's own writes and
+// asynchronous completions stay visible at once, and CP packets writing guest memory publish their range. Bound buffers
+// still synchronize their exact ranges at every draw.
 
-}
+} // namespace
 
-RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
-    : m_graphics(graphics), m_render_executor(*this),
-      m_command_scheduler(*this, graphics,
-                          (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RECORDING) != 0),
+RenderContext::RenderContext(GraphicContext& graphics)
+    : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_sampler_cache(graphics),
-      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache, this),
+      // No image heap source: upstream's image heap needs upstream's MaterializeIndirectDescriptor, not taken -
+      // SESJA-SYNC1 (m_image_heap).
+      m_pipeline_cache(graphics, nullptr), m_sampler_cache(graphics),
+      m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
+      m_bindless_table(graphics, m_command_scheduler) {
+	m_texture_cache.on_bindless_unregister = [this](ImageId id, const char* reason) {
+		m_bindless_table.OnImageUnregistered(id, reason);
+	};
+	// The list path of bindless tables over 1 MiB: their left-out LRU touches, answered for the cache (none without the
+	// tables).
+	if (m_bindless_table.TablesEnabled()) {
+		m_texture_cache.bindless_fast_keep = [this](ImageId id, uint64_t age) {
+			return m_bindless_table.FastTouchKeeps(id, age);
+		};
+	}
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_ray_tracing = std::make_unique<RayTracing>(*this);
-#if defined(ANYPS5_KYTY)
-	m_pipeline_cache.SetRenderContext(this);
-#endif
 }
 
 RenderContext::~RenderContext() {
 	ShutdownGpu();
+	// Background shader compiles may use the bindless table, which is destroyed before the pipeline cache.
+	m_pipeline_cache.StopBackgroundCompiles();
 	m_command_scheduler.Shutdown();
+	// The bindless table is destroyed before the texture cache, whose destructor unregisters images.
+	m_texture_cache.on_bindless_unregister = nullptr;
+	m_texture_cache.bindless_fast_keep     = nullptr;
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
@@ -103,230 +101,102 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	// The host reports the faulting byte, not the instruction's access width. Both caches
+	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
-	if (access == PageFaultAccess::Execute && LibKernel::Memory::IsGuestExecutable(fault_vaddr) &&
-	    m_page_manager.AllowExecute(fault_vaddr)) {
-		return true;
-	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
-		if (!GuestRange {fault_vaddr, fault_size}.Valid() || !m_page_manager.IsWatched(fault_vaddr)) {
-			return false;
-		}
+		return false;
 	}
-	if (WaitWriteBacks(fault_vaddr, fault_size)) {
+	// Image read coherence (textureCache.cpp): only a guest thread's read is served; a guest thread is the one the guest
+	// kernel knows, HLE code it runs included. The access runs again when this returns.
+	const bool is_write = access == PageFaultAccess::Write;
+	if (m_page_manager.ImageReadArmed(fault_vaddr)) {
+		const bool guest_thread = LibKernel::PthreadSelfOrNull() != nullptr;
+		if (guest_thread && !is_write) {
+			ServeImageRead(fault_vaddr);
+		} else {
+			TextureCache::NoteImageReadLift(fault_vaddr, !guest_thread);
+			LiftImageRead(fault_vaddr, fault_size, is_write);
+		}
 		return true;
 	}
-	if (access == PageFaultAccess::Write && GuestGpu::IsGpuThread()) {
-		m_bda_generation++;
+	// Another thread opened the page first: the fault would not have happened now.
+	if (m_page_manager.WatchersAllow(fault_vaddr, is_write)) {
+		return true;
 	}
 	if (access == PageFaultAccess::Write) {
-		const auto owner   = m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
-		const bool texture = m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		const bool heap    = m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
-		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
-		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
-			m_page_manager.NoteWriteFault(fault_vaddr);
-			BufferCache::CountWriteFault(owner, texture || heap);
+		KYTY_PROFILER_BLOCK("Fault::Write");
+		if (BufferCache::UploadClobberCheck()) m_buffer_cache.NoteGuestWriteFault(fault_vaddr); // KYTY_D6_C0=2/3
+		{
+			// The BDA sync epoch: a guest thread's write waits for the next point that orders it before GPU work; the GPU
+			// thread's own writes and asynchronous completions stay visible at once.
+			CpuDirtyDeferScope defer(!GuestGpu::IsGpuThread() && !CommandScheduler::InDeferredOperation());
+			m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
 		}
+		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		// (Upstream also invalidates its image heap here; not in use, see m_image_heap.)
 	} else {
-		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
-		m_texture_cache.FlushLazyReadback(fault_vaddr, fault_size);
+		// Read faults that reach the synchronizing path (counted).
+		static std::atomic_uint read_faults {0};
+		if (((read_faults.fetch_add(1) + 1) & 0xfffu) == 0 && Common::EnvRead::PerfLines()) {
+			std::fprintf(stderr, "FAULT_SYNC reads=%u last=0x%llx\n", read_faults.load(),
+			             static_cast<unsigned long long>(fault_vaddr));
+		}
+		KYTY_PROFILER_BLOCK("Fault::Read");
+		PerfReasonScope reason(GuestGpu::IsGpuThread() ? PerfReason::FaultGpu : PerfReason::FaultGame);
+		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
 }
 
-void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
-	m_page_manager.CollectHotPageWrites(
-	    [](void* context, uint64_t begin, uint64_t end) {
-		    auto& self = *static_cast<RenderContext*>(context);
-		    self.m_buffer_cache.InvalidateMemory(begin, end - begin, true);
-		    self.m_texture_cache.InvalidateMemory(begin, end - begin);
-		    self.m_image_heap.InvalidateMemory(begin, end - begin);
-		    self.m_strict_watch.InvalidateMemory(begin, end - begin);
-	    },
-	    this, vaddr, size);
-}
-
-static bool UrgentWriteBackWait() {
-	static const bool on = [] {
-		const char* value = std::getenv("KYTY_URGENT_WRITEBACK_WAIT");
-		return value == nullptr || value[0] != '0';
-	}();
-	return on;
-}
-
-bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
-	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
-	if (tick == 0) {
-		return false;
-	}
-	if (GuestGpu::IsGpuThread()) {
-		m_command_scheduler.Wait(tick);
-	} else if (tick == m_command_scheduler.CurrentTick()) {
-		if (UrgentWriteBackWait() && !GuestGpu::IsCommandProcessorThread()) {
-			GetGpu().SendUrgentCommandSync(
-			    [this, tick] {
-				    if (tick == m_command_scheduler.CurrentTick()) {
-					    m_command_scheduler.Flush();
-				    }
-			    },
-			    false);
-			m_command_scheduler.GetMasterSemaphore().Wait(tick);
-		} else {
-			GetGpu().SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
-		}
-	}
-	m_command_scheduler.WaitPriorityOperations(tick);
-	return true;
-}
-
-void RenderContext::WriteFromCompletion(void* destination, const void* data,
-                                        uint64_t size) noexcept {
-	const auto vaddr = reinterpret_cast<uint64_t>(destination);
-	if (GuestRange {vaddr, size}.Valid() && LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
-		const auto page_size = TRACKER_PAGE_SIZE;
-		for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
-			if (m_page_manager.IsWatched(page)) {
-				m_buffer_cache.InvalidateUnlessGpuModified(vaddr, size);
-				m_texture_cache.InvalidateMemory(vaddr, size);
-				m_image_heap.InvalidateMemory(vaddr, size);
-				break;
-			}
-		}
+void RenderContext::ServeImageRead(uint64_t vaddr) {
+	if (m_gpu != nullptr && m_gpu->IsStopping()) {
+		m_page_manager.DisarmImageRead(vaddr, 1); // nothing serves any more
 		return;
 	}
-	if (size == sizeof(uint32_t)) {
-		uint32_t value = 0;
-		std::memcpy(&value, data, sizeof(value));
-		*static_cast<volatile uint32_t*>(destination) = value;
-	} else if (size == sizeof(uint64_t)) {
-		uint64_t value = 0;
-		std::memcpy(&value, data, sizeof(value));
-		*static_cast<volatile uint64_t*>(destination) = value;
+	TextureCache::CpuReadServe serve;
+	const auto                 request = [this, &serve, vaddr] { serve = m_texture_cache.BeginCpuRead(vaddr); };
+	if (m_gpu == nullptr) {
+		request();
 	} else {
-		std::memcpy(destination, data, size);
+		m_gpu->SendCommandSync(request);
 	}
-	LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
+	const auto start = std::chrono::steady_clock::now();
+	if (serve.tick != 0) {
+		m_command_scheduler.GetMasterSemaphore().Wait(serve.tick);
+		// An older publication of the same bytes (an eviction's download) must not land after this one.
+		m_command_scheduler.WaitPriorityOperations(serve.tick);
+	}
+	m_texture_cache.FinishCpuRead(serve);
+	TextureCache::NoteImageReadWait(static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
 }
 
-void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t* values,
-                                              uint32_t count, uint64_t stride) noexcept {
-	const auto vaddr = reinterpret_cast<uint64_t>(destination);
-	if (count == 0) {
-		return;
+void RenderContext::LiftImageRead(uint64_t vaddr, uint64_t size, bool is_write) {
+	// The bit goes at once (the region's lock only: the caller may hold anything, the GPU thread included); the images, under
+	// m_lock, at the GPU thread's next packet boundary, never in this fault.
+	m_page_manager.DisarmImageRead(vaddr, size);
+	const auto settle = [this, vaddr, size, is_write] { m_texture_cache.SettleImageReadLift(vaddr, size, is_write); };
+	if (m_gpu == nullptr) {
+		settle();
+	} else if (!m_gpu->IsStopping()) {
+		m_gpu->PostCommand(settle);
 	}
-	const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
-	if (GuestRange {vaddr, size}.Valid() &&
-	    LibKernel::Memory::TryWriteBackingQwords(vaddr, values, count, stride)) {
-		for (uint32_t i = 0; i < count; i++) {
-			const auto address = vaddr + i * stride;
-			if (m_page_manager.IsWatched(address & ~(TRACKER_PAGE_SIZE - 1))) {
-				m_buffer_cache.InvalidateUnlessGpuModified(address, sizeof(uint64_t));
-				m_texture_cache.InvalidateMemory(address, sizeof(uint64_t));
-				m_image_heap.InvalidateMemory(address, sizeof(uint64_t));
-			}
-		}
-		return;
-	}
-	for (uint32_t i = count; i-- > 0;) {
-		WriteFromCompletion(static_cast<uint8_t*>(destination) + i * stride, &values[i],
-		                    sizeof(uint64_t));
-	}
-}
-
-void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
-	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
-	const auto page_size = TRACKER_PAGE_SIZE;
-	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
-		return;
-	}
-	for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
-		if (m_page_manager.IsWatched(page)) {
-			(void)HandleFault(PageFaultAccess::Write, std::max(page, vaddr));
-		}
-	}
-}
-
-bool RenderContext::WriteAroundGpuWrites(void* destination, const void* data, uint64_t size) {
-	const auto vaddr = reinterpret_cast<uint64_t>(destination);
-	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
-		return false;
-	}
-	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
-		if (!m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size)) {
-			return false;
-		}
-		m_texture_cache.InvalidateMemory(vaddr, size);
-		return true;
-	}
-	return m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size);
 }
 
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
-	(void)WaitWriteBacks(vaddr, size);
 	if (!IsMapped(vaddr, size)) {
 		return false;
+	}
+	// An emulator write may run in kernel mode (a file read into guest memory), where a no-access page fails the call instead
+	// of faulting: the image read watch is lifted first.
+	if (m_page_manager.ImageReadArmedInRange(vaddr, size)) {
+		TextureCache::NoteImageReadLift(vaddr, false);
+		LiftImageRead(vaddr, size, true);
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
-	m_strict_watch.InvalidateMemory(vaddr, size);
 	return true;
-}
-
-bool RenderContext::InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size) {
-	(void)WaitWriteBacks(vaddr, size);
-	if (!IsMapped(vaddr, size)) {
-		return false;
-	}
-	m_buffer_cache.InvalidateMemoryForWrite(vaddr, size);
-	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
-	m_strict_watch.InvalidateMemory(vaddr, size);
-	return true;
-}
-
-void RenderContext::MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEachInRange(vaddr, size, [&](uint64_t begin, uint64_t end) { out.Add(begin, end - begin); });
-}
-
-void RenderContext::FreedByGame(uint64_t vaddr, uint64_t size) {
-	static const uint32_t mode = [] {
-		const char* value = std::getenv("KYTY_ENGINE_FREE_BUFFERS");
-		return value != nullptr && (value[0] == '0' || value[0] == '2') ? static_cast<uint32_t>(value[0] - '0') : 1u;
-	}();
-	if (mode == 0 || m_gpu == nullptr || m_gpu->IsStopping() || !GuestRange {vaddr, size}.Valid()) return;
-	m_gpu->SendCommand([this, vaddr, size] {
-		if (!IsMapped(vaddr, size)) return;
-		const auto start = std::chrono::steady_clock::now();
-		static BufferCache::FreeBlockSplits splits;
-		static uint64_t                     blocks = 0, bytes = 0, let_go = 0, ns = 0, max_ns = 0;
-		static auto                         next = start + std::chrono::seconds(30);
-		const auto                          lists = splits.lists;
-		const auto freed = m_buffer_cache.DropFreedRange(vaddr, size, mode != 2, &Loader::DemonsSoulsPageFree::FreeBlocksIn, &splits);
-		const auto took  = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-		ns += took;
-		max_ns = std::max(max_ns, took);
-		if (freed != 0) {
-			blocks++;
-			bytes += size;
-			let_go += freed;
-		}
-		if ((freed == 0 && splits.lists == lists) || start < next) return;
-		std::printf("Engine frees: %llu freed blocks (%.0f MiB) had buffers over them: %.0f MiB of buffers let go (%.0f MiB cut off "
-		            "buffers over other free blocks too, the allocator's lists read %llu times), %.1f ms on the GPU thread (at most "
-		            "%.2f ms a block) (KYTY_ENGINE_FREE_BUFFERS)\n",
-		            static_cast<unsigned long long>(blocks), static_cast<double>(bytes) / 1048576.0,
-		            static_cast<double>(let_go) / 1048576.0, static_cast<double>(splits.cut) / 1048576.0,
-		            static_cast<unsigned long long>(splits.lists), static_cast<double>(ns) / 1e6,
-		            static_cast<double>(max_ns) / 1e6);
-		std::fflush(stdout);
-		blocks = bytes = let_go = ns = max_ns = 0;
-		splits = {};
-		next   = start + std::chrono::seconds(30);
-	});
 }
 
 bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
@@ -337,45 +207,69 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
-uint64_t RenderContext::MappedRangesVersion() const noexcept {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	return m_mapped_ranges_version;
+void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
+	m_buffer_cache.QueueFallbackMap(vaddr, size); // the BDA fallback (M06)
+	std::lock_guard lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.Add(vaddr, size);
+	// Upstream queues the range for its BDA sync here (d58aefde4, BufferCache::SynchronizeBda); PrepareBda takes the
+	// CPU-dirty tracker regions instead (the BDA region pass, the BDA sync epoch).
 }
 
-bool RenderContext::UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	if (version == m_mapped_ranges_version) {
+// A guest unmap of a range a cache holds, or with any priority operation pending, waits for what the unmap needs from the
+// GPU (8.11; town walk, live A/B: +3.3% fps without images,
+// +2.4% / +7.0% (pairs, two runs) with images):
+//  - the asynchronous publishes of guest bytes into the range (BufferCache::PendingGuestWriteTick): a priority operation
+//    writing an unmapped range fails, or writes the next mapping's memory. The rest needs no wait: VkImages and their
+//    views are destroyed deferred, cache buffers outlive the mapping, the BDA fallback table is cleared in the command
+//    stream (ClearFallback), a direct range finishes by itself (DeactivateDirect), and the GPU-written bytes of the range
+//    are downloaded by InvalidateMemory (ReadMemory with its own waits). End-of-pipe labels are written on the GPU thread
+//    after this command, as before;
+//  - registered images in the range: the open command buffer is submitted without a wait, so the images' drops land in a
+//    new tick (tables holding a dropped slot translate again before their next draw), and their table slots keep the
+//    image's view until the GPU finished the drop's tick (BindlessTable::DeferUnmapDrop; the views die only then too):
+//    draws recorded before the unmap sample the image, those after it the placeholder, as with a Finish. Heap keys go
+//    pending in the shared translation buffer at once (OnImageUnregistered): an unmap of an image with heap keys
+//    finishes all GPU work (Finish). The check counters (late_reads, reassigned, heap_miss) were 0 over the walk
+//    (PERF unmap_image_defer).
+namespace {
+// KYTY_TRACE_PERF: PERF unmap_image_defer every ~5 s (unmaps with images deferred / finished for heap keys, slots, checks).
+void ReportUnmapDefer(BindlessTable::UnmapDeferStats& stats) {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (!Common::EnvRead::PerfLines() || now - last < std::chrono::seconds(5)) return;
+	last = now;
+	std::fprintf(stderr,
+	             "PERF unmap_image_defer deferred=%llu finished=%llu slots=%llu late_reads=%llu reassigned=%llu "
+	             "heap_miss=%llu\n",
+	             static_cast<unsigned long long>(stats.defer), static_cast<unsigned long long>(stats.keys),
+	             static_cast<unsigned long long>(stats.slots), static_cast<unsigned long long>(stats.late_reads),
+	             static_cast<unsigned long long>(stats.reassigned), static_cast<unsigned long long>(stats.heap_miss));
+	stats = {};
+}
+
+// Returns whether the unmap's table slot drops wait for the GPU to finish the current tick (BindlessTable::SetUnmapDeferred).
+bool UnmapWait(CommandScheduler& scheduler, BufferCache& buffers, TextureCache& textures, BindlessTable& bindless,
+               uint64_t vaddr, uint64_t size, uint64_t tick) {
+	const bool images = textures.IsRegionRegistered(vaddr, size);
+	if (images && textures.AnyUnmapImage(vaddr, size, [&](ImageId id) { return bindless.HasImageKeys(id); })) {
+		scheduler.Finish();
+		scheduler.WaitPriorityOperations(tick);
+		bindless.unmap_defer.keys++;
+		ReportUnmapDefer(bindless.unmap_defer);
 		return false;
 	}
-	if (version < m_unmap_log_floor) {
-		return true;
+	if (images && !scheduler.Current().IsInvalid()) scheduler.Flush();
+	if (const uint64_t publish = buffers.PendingGuestWriteTick(vaddr, size); publish != 0) {
+		scheduler.Wait(publish);
+		scheduler.WaitPriorityOperations(publish);
 	}
-	for (auto it = m_unmap_log.rbegin(); it != m_unmap_log.rend() && it->version > version; ++it) {
-		if (vaddr < it->vaddr + it->size && it->vaddr < vaddr + size) {
-			return true;
-		}
+	if (images) {
+		bindless.unmap_defer.defer++;
+		ReportUnmapDefer(bindless.unmap_defer);
 	}
-	return false;
+	return images;
 }
-
-void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
-	{
-		std::lock_guard lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.Add(vaddr, size);
-		if (size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size)) NoteBdaSpan(vaddr, size);
-		m_mapped_ranges_version++;
-		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
-		m_bda_mapped_since_sync.emplace_back(vaddr, size);
-	}
-	if (m_texture_cache.HasPartialCandidates()) {
-		const auto map = [this, vaddr, size] { m_texture_cache.MapMemory(vaddr, size); };
-		if (m_gpu == nullptr || m_gpu->IsStopping()) {
-			map();
-		} else {
-			m_gpu->SendUrgentCommandSync(map);
-		}
-	}
-}
+} // namespace
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
@@ -384,916 +278,154 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
-		m_page_manager.ForgetHotPages(vaddr, size);
-		if (m_command_scheduler.Active()) {
-			m_command_scheduler.PopPendingOperations();
+		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
+		// access a range with no cached data, so they must finish before it is unmapped.
+		bool deferred = false; // the images' table slot drops wait for the GPU (UnmapWait)
+		if (m_command_scheduler.Active() &&
+		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
+		     m_command_scheduler.HasPendingPriorityOperations())) {
+			const auto              tick = m_command_scheduler.CurrentTick();
+			SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::Unmap); // KYTY_TRACE_SYNC_TIMELINE
+			deferred = UnmapWait(m_command_scheduler, m_buffer_cache, m_texture_cache, m_bindless_table, vaddr, size, tick);
 		}
-		const bool drain = m_command_scheduler.Active() &&
-		                   (m_buffer_cache.IsRegionGpuModified(vaddr, size) ||
-		                    m_texture_cache.HasGpuWrittenImages(vaddr, size) ||
-		                    m_command_scheduler.HasPendingGuestOperations(vaddr, size));
-		if (drain) {
-			const auto tick = m_command_scheduler.CurrentTick();
-			m_command_scheduler.Finish();
-			m_command_scheduler.WaitPriorityOperations(tick);
-		}
-		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
-		m_buffer_cache.ForgetCommandBuffers(vaddr, size);
+		if (m_command_scheduler.Active()) m_buffer_cache.UnmapDirect(vaddr, size); // KYTY_PERF_DIRECT_RANGES
 		m_buffer_cache.InvalidateMemory(vaddr, size);
-		if (registered) {
-			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);
-			m_buffer_cache.SplitUnmappedBuffers(vaddr, size);
+		m_buffer_cache.ClearFallback(vaddr, size); // the BDA fallback (M06)
+		// No image read watch outlives the mapping (lifted while it is still mapped).
+		if (GuestRange {vaddr, size}.Valid()) {
+			m_page_manager.DisarmImageRead(vaddr, size);
 		}
+		m_bindless_table.SetUnmapDeferred(deferred);
 		m_texture_cache.UnmapMemory(vaddr, size);
-		m_image_heap.UnmapMemory(vaddr, size);
-		m_strict_watch.UnmapMemory(vaddr, size);
-		m_occlusion_queries.OnUnmap(vaddr, size);
-		if (size != 0 && vaddr <= UINT64_MAX - size) {
-			m_guest_bvh_memory.erase(m_guest_bvh_memory.lower_bound(vaddr), m_guest_bvh_memory.lower_bound(vaddr + size));
-			std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return tlas.header >= vaddr && tlas.header - vaddr < size; });
-		}
+		m_bindless_table.SetUnmapDeferred(false);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
-		if (registered) NoteBdaSpan(vaddr, size);
-		m_mapped_ranges_version++;
-		m_mapping_epoch.store(m_mapped_ranges_version, std::memory_order_release);
-		if (m_unmap_log.size() >= 4096) {
-			m_unmap_log_floor = m_unmap_log.front().version;
-			m_unmap_log.pop_front();
-		}
-		m_unmap_log.push_back({m_mapped_ranges_version, vaddr, size});
 	};
+	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
+	// longer accepts external work. Use the guest GPU's state for the teardown route.
 	if (m_gpu == nullptr || m_gpu->IsStopping()) {
 		unmap();
 		return;
 	}
-	m_gpu->SendUrgentCommandSync(unmap);
+	m_gpu->SendCommandSync(unmap);
 }
 
-void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
-	const auto&      program   = runtime.module->info;
-	const auto&      user_data = runtime.resources->user_data;
-	std::shared_lock lock(m_mapped_ranges_mutex);
-
-	const auto cache_after = [&](const std::array<uint32_t, 2>& pair, uint64_t window,
-	                             bool contiguous) {
-		const auto [low_reg, high_reg] = pair;
-		const auto low  = static_cast<uint64_t>(low_reg) - program.user_data_base;
-		const auto high = static_cast<uint64_t>(high_reg) - program.user_data_base;
-		if (low_reg < program.user_data_base || high_reg < program.user_data_base ||
-		    low >= user_data.size() || high >= user_data.size()) {
-			return;
-		}
-		const auto base =
-		    user_data[low] | (static_cast<uint64_t>(user_data[high] & 0xffffu) << 32u);
-		if (base > UINT64_MAX - window) {
-			return;
-		}
-		m_mapped_ranges.ForEachInRange(base, window, [&](uint64_t start, uint64_t end) {
-			if (!contiguous || start == base) {
-				(void)m_buffer_cache.FindBuffer(start, end - start);
-			}
-		});
+void RenderContext::PrepareBda() {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::Bda); // KYTY_TRACE_SLOW_FRAMES
+	const ChunkLead::FloorTimer floor_bda(ChunkLead::FpBda); // KYTY_TRACE_PEEK_CENSUS (project 15 N3.0)
+	// KYTY_TRACE_LONG_PREP: the parts' times and the region pass's counts (t_long_prep_parts 21-29).
+	const bool parts_on  = LongPrepPartsOn();
+	auto       part_last = parts_on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const auto part_mark = [&](size_t part) {
+		if (!parts_on) return;
+		const auto now = std::chrono::steady_clock::now();
+		t_long_prep_parts[part] +=
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - part_last).count());
+		part_last = now;
 	};
-	for (const auto& pair: program.info.dma_base_registers) {
-		cache_after(pair, BufferCache::CACHING_PAGESIZE, false);
-	}
-	for (const auto& pair: program.info.vsharp_base_registers) {
-		cache_after(pair, VsharpBaseReach, true);
-	}
-	CacheTlasMemory(runtime);
-}
-
-bool RenderContext::CacheSelfSizedBuffers(const ShaderStageRuntime& runtime) {
-	constexpr uint64_t CachedBytes = 4 * BufferCache::CACHING_PAGESIZE;
-	const auto&        program     = runtime.module->info;
-	const auto&        user_data   = runtime.resources->user_data;
-	const auto         value       = [&](uint32_t reg, uint32_t& result) {
-		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
-		if (reg < program.user_data_base || index >= user_data.size()) {
-			return false;
-		}
-		result = user_data[index];
-		return true;
-	};
-	bool             written = false;
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	for (const auto& buffer: program.info.self_sized_buffers) {
-		uint32_t low  = 0;
-		uint32_t high = 0;
-		if (!value(buffer.base_low_register, low) || !value(buffer.base_high_register, high)) {
-			continue;
-		}
-		written |= buffer.written;
-		const auto base = low | (uint64_t {high & 0xffffu} << 32u);
-		if (base == 0) {
-			continue;
-		}
-		m_mapped_ranges.ForEachInRange(base, CachedBytes, [this](uint64_t start, uint64_t end) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, end - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
-		});
-	}
-	return written;
-}
-
-void RenderContext::CacheTlasMemory(const ShaderStageRuntime& runtime) {
-	const auto&                  program = runtime.module->info;
-	RayTracing::TlasSource source;
-	if (!RayTracing::FindGuestTlasSource(program.info, source)) {
-		return;
-	}
-	const auto& resources = *runtime.resources;
-	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
-	};
-	uint64_t    header = 0;
-	const auto& srt    = resources.flattened_srt;
-	const auto  in_srt = [&](uint32_t slot) {
-		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot && slot < srt.size();
-	};
-	if (in_srt(source.header_slots[0]) && in_srt(source.header_slots[1])) {
-		header = srt[source.header_slots[0]] | (uint64_t {srt[source.header_slots[1]]} << 32u);
-	} else {
-		const auto& user_data = resources.user_data;
-		const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
-		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
-			return;
-		}
-		const auto pointer = RayTracing::UserPointer(
-		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
-		if (RayTracing::HeaderInUserData(source)) {
-			header = RayTracing::UserDataHeader(pointer);
-		} else if (pointer == 0 || pointer > UINT64_MAX - source.header_offset ||
-		           !readable(pointer + source.header_offset, sizeof(header))) {
-			return;
-		} else {
-			std::memcpy(&header, reinterpret_cast<const void*>(pointer + source.header_offset), sizeof(header));
-		}
-	}
-	std::vector<std::pair<uint64_t, uint64_t>> ranges;
-	const auto tlas = m_ray_tracing->ReadGuestTlas(header, source, readable, ranges);
-	if (tlas.end != 0) {
-		ranges.emplace_back(header, tlas.end);
-	}
-	for (const auto& [first, last]: ranges) {
-		m_mapped_ranges.ForEachInRange(first, last - first, [this](uint64_t start, uint64_t stop) {
-			if (const auto id = m_buffer_cache.FindBuffer(start, stop - start)) {
-				m_buffer_cache.GetBuffer(id).device_address_pinned = true;
-			}
-		});
-	}
-	if (program.info.ray_query && m_ray_tracing->Enabled()) {
-		m_ray_tracing->NoteTlasInstances(tlas.instances);
-	}
-}
-
-bool RenderContext::SynchronizeDmaFootprint(std::span<const ShaderStageRuntime* const> stages) {
-	constexpr int JoinedRuns = 6;
-	for (const auto* stage: stages) {
-		const auto& program = stage->module->info;
-		if (!program.info.uses_dma || program.info.dma_bounded || program.info.ray_query_reach.empty()) {
-			continue;
-		}
-		auto& traced  = m_traced_programs[program.shader_hash];
-		traced.recent = static_cast<uint8_t>((traced.recent << 1u) |
-		                                     (traced.unbounded_ops != m_bda_unbounded_ops ? 1u : 0u));
-		traced.unbounded_ops = m_bda_unbounded_ops;
-		if (std::popcount(traced.recent) >= JoinedRuns) {
-			return false;
-		}
-	}
-	if (!SynchronizeDmaReach(stages)) {
-		m_bda_unbounded_ops++;
-		return false;
-	}
-	return true;
-}
-
-bool RenderContext::SynchronizeDmaReach(std::span<const ShaderStageRuntime* const> stages) {
-	constexpr uint64_t MaxBufferBytes = uint64_t {256} * 1024 * 1024;
-	constexpr uint64_t WaveRecords = 64;
-	const bool unbounded_stage = std::ranges::any_of(stages, [](const auto* stage) {
-		return stage->module->info.info.uses_dma && !stage->module->info.info.dma_bounded;
-	});
-	if (unbounded_stage && BdaRegionsMode() != 0) {
-		thread_local std::vector<GuestRange> second_ranges, all_ranges;
-		all_ranges.clear();
-		bool bounded = true;
-		for (const auto* stage: stages) {
-			if (!stage->module->info.info.uses_dma) continue;
-			second_ranges.clear();
-			if (!ShaderRecompiler::IR::EvaluateBdaReadPlan(stage->module->info.bda_read_plan, *stage->resources, second_ranges)) {
-				bounded = false;
-				break;
-			}
-			all_ranges.insert(all_ranges.end(), second_ranges.begin(), second_ranges.end());
-		}
-		if (bounded && PrepareBdaReadRanges(all_ranges)) return true;
-	}
-	m_dma_spans.clear();
-	m_dma_sets.clear();
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	const auto add = [&](uint64_t address, uint64_t size) {
-		if (size != 0 && address <= UINT64_MAX - size) {
-			m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
-				m_dma_spans.emplace_back(start, end);
-			});
-		}
-	};
-	for (const auto* stage: stages) {
-		const auto& program = stage->module->info;
-		if (!program.info.uses_dma) {
-			continue;
-		}
-		if (!program.info.dma_bounded && program.info.ray_query_reach.empty()) {
-			if (!AddRecordReach(*stage)) {
-				return false;
-			}
-			continue;
-		}
-		if (!program.info.dma_bounded) {
-			if (!AddRayTracingReach(*stage)) {
-				return false;
-			}
-		}
-		const auto& user_data = stage->resources->user_data;
-		const auto  base_of   = [&](uint32_t reg, uint64_t& base) {
-			const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
-			if (reg < program.user_data_base || index + 1u >= user_data.size()) {
-				return false;
-			}
-			base = user_data[index] | (static_cast<uint64_t>(user_data[index + 1u]) << 32u);
-			return true;
-		};
-		for (const auto& window: program.info.dma_windows) {
-			uint64_t base = 0;
-			if (!base_of(window.base_register, base)) {
-				return false;
-			}
-			const auto before = static_cast<uint64_t>(-window.first) + 4u;
-			const auto start  = base > before ? base - before : 0;
-			add(start, std::min(base, UINT64_MAX - window.last) + window.last - start);
-		}
-		for (const auto& table: program.info.dma_tables) {
-			uint64_t base = 0;
-			if (!base_of(table.base_register, base)) {
-				return false;
-			}
-			const auto entries = (base & ~uint64_t {3}) + static_cast<uint64_t>(table.immediate);
-			Common::HackNotice::Report("DMA upload assumes V# indices stay within 64 records",
-			                           "RenderContext::SynchronizeDmaFootprint",
-			                           program.shader_hash, table.base_register);
-			for (uint32_t offset = table.offset_bits;; offset = (offset - 1u) & table.offset_bits) {
-				const auto address = entries + offset;
-				if (!m_mapped_ranges.Contains(address, 12) ||
-				    m_buffer_cache.IsRegionGpuModified(address, 12)) {
-					return false;
-				}
-				ShaderBufferResource descriptor;
-				std::memcpy(descriptor.fields, reinterpret_cast<const void*>(address), 12);
-				const auto stride = uint64_t {descriptor.Stride()};
-				if (descriptor.Base48() != 0 && descriptor.NumRecords() != 0) {
-					const auto wanted =
-					    descriptor.GetSize() + std::max<uint64_t>(stride, 4u) * WaveRecords;
-					if (wanted > MaxBufferBytes) {
-						Common::HackNotice::Report("DMA upload of a V# range clipped to 256 MiB",
-						                           "RenderContext::SynchronizeDmaFootprint",
-						                           program.shader_hash, table.base_register);
-					}
-					add(descriptor.Base48(), std::min(wanted, MaxBufferBytes));
-				}
-				if (offset == 0) {
-					break;
-				}
-			}
-		}
-		for (const auto& buffer: program.info.self_sized_buffers) {
-			uint64_t low  = 0;
-			uint64_t high = 0;
-			if (!base_of(buffer.base_low_register, low) || !base_of(buffer.base_high_register, high)) {
-				return false;
-			}
-			const auto base = (low & 0xffffffffu) | ((high & 0xffffu) << 32u);
-			if (base == 0) {
-				continue;
-			}
-			auto memory = m_guest_bvh_memory.upper_bound(base);
-			if (memory == m_guest_bvh_memory.begin() || base - (--memory)->first >= memory->second) {
-				return false;
-			}
-			add(base, memory->first + memory->second - base);
-		}
-		for (const auto& table: program.info.dma_record_tables) {
-			const auto& buffers = stage->resources->buffers;
-			if (table.buffer >= buffers.size()) {
-				return false;
-			}
-			const auto records = DecodeNativeDescriptor<ShaderBufferResource>(buffers[table.buffer]);
-			const auto first   = records.Base48();
-			const auto bytes   = records.GetSize();
-			if (first == 0 || bytes == 0) {
-				continue;
-			}
-			if (table.stride == sizeof(records.fields) && table.offset == 0) {
-				if (!AddBufferTable(records)) {
-					return false;
-				}
-				continue;
-			}
-			if (bytes > MaxBufferBytes || !m_mapped_ranges.Contains(first, bytes) ||
-			    m_buffer_cache.IsRegionGpuModified(first, bytes)) {
-				return false;
-			}
-			for (uint64_t offset = table.offset; offset + 12u <= bytes; offset += table.stride) {
-				ShaderBufferResource descriptor {};
-				std::memcpy(descriptor.fields, reinterpret_cast<const void*>(first + offset), 12);
-				if (descriptor.Base48() == 0 || descriptor.NumRecords() == 0) {
-					continue;
-				}
-				if (descriptor.GetSize() > MaxBufferBytes) {
-					return false;
-				}
-				add(descriptor.Base48(), descriptor.GetSize());
-			}
-		}
-	}
-	const auto reach_layout = ReachLayout();
-	lock.unlock();
-	m_buffer_cache.SynchronizeBuffersInSpans(m_dma_spans);
-	for (auto* table: m_dma_sets) {
-		if (table->synced_in == reach_layout) {
-			continue;
-		}
-		table->synced_in = reach_layout;
-		m_buffer_cache.SynchronizeBuffersInSet(table->ranges, table->regions);
-	}
-	return true;
-}
-
-bool RenderContext::AddRecordReach(const ShaderStageRuntime& runtime) {
-	using Reach = ShaderRecompiler::Decoder::RecordReach;
-	constexpr uint64_t MaxRecords = 4096;
-	constexpr uint32_t MaxIndex   = 1u << 20u;
-	constexpr uint32_t MaxOffset  = 1u << 28u;
-	const auto&        program    = runtime.module->info;
-	Reach              reach;
-	if (program.info.dma_record_reach.empty() || !Reach::Unpack(program.info.dma_record_reach, reach)) {
-		return false;
-	}
-	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
-	};
-	const auto& user_data  = runtime.resources->user_data;
-	const auto  descriptor = [&](const Reach::Descriptor& source, ShaderBufferResource& result) {
-		const auto index = uint64_t {source.user_sgpr} - program.user_data_base;
-		if (source.user_sgpr < program.user_data_base || index + 1u >= user_data.size()) {
-			return false;
-		}
-		const auto pointer = user_data[index] | (uint64_t {user_data[index + 1u]} << 32u);
-		if (pointer > UINT64_MAX - source.offset || !readable(pointer + source.offset, sizeof(result.fields))) {
-			return false;
-		}
-		std::memcpy(result.fields, reinterpret_cast<const void*>(pointer + source.offset), sizeof(result.fields));
-		return true;
-	};
-	const auto load = [&](const ShaderBufferResource& buffer, uint64_t offset, void* data, uint64_t size) {
-		std::memset(data, 0, size);
-		const auto bytes = buffer.GetSize();
-		if (buffer.Base48() == 0 || offset > bytes || size > bytes - offset) {
-			return true;
-		}
-		if (!readable(buffer.Base48() + offset, size)) {
-			return false;
-		}
-		std::memcpy(data, reinterpret_cast<const void*>(buffer.Base48() + offset), size);
-		return true;
-	};
-	const auto first_span = m_dma_spans.size();
-	const auto add        = [&](uint64_t address, uint64_t size) {
-		if (size != 0 && address <= UINT64_MAX - size) {
-			m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) {
-				const std::pair span {start, end};
-				if (std::find(m_dma_spans.begin() + static_cast<ptrdiff_t>(first_span),
-				              m_dma_spans.end(), span) == m_dma_spans.end()) {
-					m_dma_spans.push_back(span);
-				}
-			});
-		}
-	};
-	ShaderBufferResource    header;
-	ShaderBufferResource    records;
-	ShaderBufferResource    pointers;
-	std::array<uint32_t, 2> range {};
-	if (!descriptor(reach.header, header) || !descriptor(reach.records, records) ||
-	    !descriptor(reach.pointers, pointers) || records.Stride() != reach.record_size ||
-	    pointers.Stride() != sizeof(pointers.fields) || reach.record_size > 0x1000u ||
-	    !load(header, reach.header_offset, range.data(), sizeof(range)) || range[1] > MaxRecords ||
-	    range[0] > MaxIndex) {
-		return false;
-	}
-	std::array<uint8_t, 0x1000> record {};
-	const auto                  field = [&](uint32_t offset) {
-        uint32_t value = 0;
-        std::memcpy(&value, record.data() + offset, sizeof(value));
-        return value;
-	};
-	for (uint64_t index = range[0]; index < uint64_t {range[0]} + range[1]; index++) {
-		if (!load(records, index * reach.record_size, record.data(), reach.record_size)) {
-			return false;
-		}
-		const auto threads = field(reach.threads_field);
-		const auto first   = field(reach.first_field);
-		if (static_cast<uint32_t>(first + threads) <= first) {
-			continue;
-		}
-		const auto stride = (field(reach.stride_field) >> (reach.stride_byte * 8u)) & 0xffu;
-		const auto last   = uint64_t {threads - 1u} * stride;
-		const auto entry  = field(reach.pointer_field);
-		std::array<uint32_t, 2> pointer {};
-		if (last > MaxOffset || entry > MaxIndex ||
-		    !load(pointers, uint64_t {entry} * sizeof(pointers.fields), pointer.data(), sizeof(pointer))) {
-			return false;
-		}
-		const auto high = static_cast<int16_t>(pointer[1]);
-		uint64_t   low_offset  = UINT64_MAX;
-		uint64_t   high_offset = 0;
-		for (const auto& attribute: reach.attributes) {
-			uint32_t value = 0;
-			if (attribute.field != Reach::None) {
-				value = field(attribute.field);
-				if (attribute.byte < 4u) {
-					value = (value >> (attribute.byte * 8u)) & 0xffu;
-				}
-			}
-			if (value > MaxOffset) {
-				return false;
-			}
-			low_offset  = std::min(low_offset, uint64_t {value} & ~uint64_t {3});
-			high_offset = std::max(high_offset, ((value + last) & ~uint64_t {3}) + attribute.end);
-		}
-		if (high >= 0 && low_offset < high_offset) {
-			add((uint64_t {static_cast<uint16_t>(high)} << 32u | pointer[0]) + low_offset,
-			    high_offset - low_offset);
-		}
-		for (const auto store: reach.store_fields) {
-			const auto           target_entry = field(store);
-			ShaderBufferResource target;
-			if (target_entry > MaxIndex ||
-			    !load(pointers, uint64_t {target_entry} * sizeof(target.fields), target.fields, sizeof(target.fields))) {
-				return false;
-			}
-			const auto written = IndirectWriteTables::TargetRange(target);
-			add(written.address, written.size);
-		}
-	}
-	return true;
-}
-
-void RenderContext::NoteHleTlas(uint64_t header, uint64_t size, std::vector<uint64_t> blases) {
-	constexpr size_t MaxTlases = 16;
-	for (auto& tlas: m_hle_tlases) {
-		if (tlas.header == header) {
-			tlas.size   = size;
-			tlas.blases = std::move(blases);
-			return;
-		}
-	}
-	if (m_hle_tlases.size() >= MaxTlases) {
-		m_hle_tlases.erase(m_hle_tlases.begin());
-	}
-	m_hle_tlases.push_back({header, size, std::move(blases)});
-}
-
-void RenderContext::ForgetHleTlas(uint64_t header) {
-	std::erase_if(m_hle_tlases, [&](const HleTlas& tlas) { return header == 0 || tlas.header == header; });
-}
-
-void RenderContext::NoteGuestBvhMemory(uint64_t address, uint64_t size) {
-	constexpr size_t MaxCaptures = 65536;
-	if (m_guest_bvh_memory.size() >= MaxCaptures) {
-		m_guest_bvh_memory.clear();
-	}
-	m_guest_bvh_memory[address] = size;
-}
-
-bool RenderContext::GuestTlasHeader(const ShaderStageRuntime& runtime, const RayTracing::TlasSource& source,
-                                    uint64_t& header, uint64_t& header_at) {
-	const auto& program   = runtime.module->info;
-	const auto& resources = *runtime.resources;
-	const auto readable = [this](uint64_t address, uint64_t size) {
-		return GuestRange {address, size}.Valid() && m_mapped_ranges.Contains(address, size) &&
-		       !(m_buffer_cache.MayBeGpuModified(address, size) &&
-		         m_buffer_cache.IsRegionGpuModified(address, size));
-	};
-	header_at             = 0;
-	const auto& user_data = resources.user_data;
-	const auto  index     = uint64_t {source.user_sgpr} - program.user_data_base;
-	uint64_t    pointer   = 0;
-	if (source.user_sgpr >= program.user_data_base && index + 1u < user_data.size()) {
-		pointer = RayTracing::UserPointer(
-		    source, user_data[index] | (uint64_t {user_data[index + 1u]} << 32u), readable);
-	}
-	if (RayTracing::HeaderInUserData(source)) {
-		header = RayTracing::UserDataHeader(pointer);
-		return header != 0;
-	}
-	if (pointer != 0 && pointer <= UINT64_MAX - source.header_offset) {
-		header_at = pointer + source.header_offset;
-	}
-	const auto& srt    = resources.flattened_srt;
-	const auto  in_srt = [&](uint32_t slot) {
-		return slot != ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot && slot < srt.size();
-	};
-	if (in_srt(source.header_slots[0]) && in_srt(source.header_slots[1])) {
-		header = srt[source.header_slots[0]] | (uint64_t {srt[source.header_slots[1]]} << 32u);
-		return true;
-	}
-	if (header_at == 0 || !readable(header_at, sizeof(header))) {
-		return false;
-	}
-	std::memcpy(&header, reinterpret_cast<const void*>(header_at), sizeof(header));
-	return true;
-}
-
-bool RenderContext::GuestBlasMemory(uint64_t blas, uint64_t& size) {
-	constexpr uint64_t HeaderSize = 256;
-	constexpr uint64_t SizeField  = 16;
-	constexpr uint64_t MaxSize    = uint64_t {256} * 1024 * 1024;
-	size                          = 0;
-	if (!m_mapped_ranges.Contains(blas, HeaderSize)) {
-		return true;
-	}
-	std::array<uint32_t, 2> magic {};
-	uint32_t                field = 0;
-	if (!(m_buffer_cache.MayBeGpuModified(blas, HeaderSize) && m_buffer_cache.IsRegionGpuModified(blas, HeaderSize))) {
-		std::memcpy(magic.data(), reinterpret_cast<const void*>(blas), sizeof(magic));
-		std::memcpy(&field, reinterpret_cast<const void*>(blas + SizeField), sizeof(field));
-		if (magic[0] != 0x5f525350u || magic[1] != 0x4c485642u) {
-			return false;
-		}
-	} else if (const auto captured = m_guest_bvh_memory.find(blas); captured != m_guest_bvh_memory.end()) {
-		field = static_cast<uint32_t>(std::min<uint64_t>(captured->second, UINT32_MAX));
-	} else if (!Libs::LibKernel::Memory::TryReadAroundGpuWrites(blas + SizeField, &field, sizeof(field))) {
-		return false;
-	}
-	size = field;
-	return field >= HeaderSize && field <= MaxSize;
-}
-
-bool RenderContext::AddBufferTable(const ShaderBufferResource& table) {
-	constexpr uint64_t MaxTableBytes  = uint64_t {16} * 1024 * 1024;
-	constexpr size_t   MaxTables      = 4;
-	constexpr uint64_t EntryBytes     = sizeof(table.fields);
-	const auto         address        = table.Base48();
-	const auto         size           = table.GetSize() / EntryBytes * EntryBytes;
-	if (address == 0 || size == 0) {
-		return true;
-	}
-	if (table.Stride() != EntryBytes || size > MaxTableBytes || !m_mapped_ranges.Contains(address, size) ||
-	    (m_buffer_cache.MayBeGpuModified(address, size) && m_buffer_cache.IsRegionGpuModified(address, size))) {
-		return false;
-	}
-	auto cached = std::ranges::find_if(m_buffer_tables, [&](const auto& known) { return known->address == address; });
-	if (cached == m_buffer_tables.end()) {
-		if (m_buffer_tables.size() >= MaxTables) {
-			m_buffer_tables.erase(m_buffer_tables.begin());
-		}
-		m_buffer_tables.push_back(std::make_unique<BufferTable>());
-		cached            = std::prev(m_buffer_tables.end());
-		(*cached)->address = address;
-	}
-	auto&       entries = **cached;
-	const auto* memory  = reinterpret_cast<const uint8_t*>(address);
-	const auto layout = ReachLayout();
-	bool       same   = entries.copy.size() == size;
-	m_table_runs.clear();
-	if (entries.compared_in != layout || !same) {
-		entries.compared_in = layout;
-		const auto compare  = [&](uint64_t run, uint64_t bytes) {
-			const auto begin = std::max(run, address);
-			const auto end   = std::min(run + bytes, address + size);
-			if (entries.copy.size() == size && begin < end &&
-			    std::memcmp(entries.copy.data() + (begin - address), memory + (begin - address), end - begin) != 0) {
-				same = false;
-				m_table_runs.emplace_back(begin - address, end - begin);
-			}
-		};
-		m_buffer_cache.ConsumeCpuWrites(CpuWriteConsumer::BufferTables, address, size, [&](uint64_t run, uint64_t bytes) {
-			compare(run, bytes);
-			const auto first = run & ~(TRACKER_PAGE_SIZE - 1);
-			const auto last  = (run + bytes + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
-			for (const auto& other: m_buffer_tables) {
-				if (other.get() != &entries && other->address < last &&
-				    first < other->address + other->copy.size()) {
-					other->written.emplace_back(first, last - first);
-				}
-			}
-		});
-		for (const auto& [run, bytes]: entries.written) {
-			compare(run, bytes);
-		}
-		entries.written.clear();
-	}
-	if (!same) {
-		const auto range_of = [](const uint8_t* entry) {
-			ShaderBufferResource buffer;
-			std::memcpy(buffer.fields, entry, EntryBytes);
-			auto       bytes = buffer.GetSize();
-			const auto base  = buffer.Base48();
-			if (base < LOWER_ADDRESS_SIZE) {
-				bytes = std::min(bytes, LOWER_ADDRESS_SIZE - base);
-			} else if (base >= Libs::LibKernel::Memory::kExtendedMemoryBase &&
-			           base - Libs::LibKernel::Memory::kExtendedMemoryBase < Libs::LibKernel::Memory::kExtendedMemorySize) {
-				bytes = std::min(bytes, Libs::LibKernel::Memory::kExtendedMemorySize -
-				                            (base - Libs::LibKernel::Memory::kExtendedMemoryBase));
-			} else {
-				bytes = 0;
-			}
-			return std::pair {base, base != 0 ? bytes : 0};
-		};
-		const auto count = static_cast<uint32_t>(size / EntryBytes);
-		if (entries.copy.size() == size && entries.replaced <= count / 8) {
-			for (const auto& [offset, bytes]: m_table_runs) {
-				for (auto at = offset / EntryBytes * EntryBytes; at < offset + bytes; at += EntryBytes) {
-					if (std::memcmp(entries.copy.data() + at, memory + at, EntryBytes) == 0) {
-						continue;
-					}
-					std::memcpy(entries.copy.data() + at, memory + at, EntryBytes);
-					entries.replaced++;
-					if (const auto [base, length] = range_of(entries.copy.data() + at); length != 0) {
-						m_buffer_cache.AddToSet(entries.ranges, entries.regions, base, length);
-					}
-				}
-			}
-		} else {
-			entries.copy.assign(memory, memory + size);
-			entries.ranges.Clear();
-			entries.regions  = {};
-			entries.replaced = 0;
-			for (uint64_t offset = 0; offset < size; offset += EntryBytes) {
-				if (const auto [base, length] = range_of(entries.copy.data() + offset); length != 0) {
-					entries.ranges.Add(base, length);
-				}
-			}
-		}
-		entries.synced_in = {};
-	}
-	m_mapped_ranges.ForEachInRange(address, size, [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
-	if (std::ranges::find(m_dma_sets, &entries) == m_dma_sets.end()) {
-		m_dma_sets.push_back(&entries);
-	}
-	return true;
-}
-
-bool RenderContext::RayQueryTableVsharp(const ShaderStageRuntime& runtime, uint32_t table, ShaderBufferResource& vsharp) {
-	const auto& buffers = runtime.resources->buffers;
-	if ((table & ShaderRecompiler::IR::ShaderInfo::RayQuerySrtVsharp) == 0) {
-		if (table >= buffers.size()) {
-			return false;
-		}
-		vsharp = DecodeNativeDescriptor<ShaderBufferResource>(buffers[table]);
-		return true;
-	}
-	const auto& srt   = runtime.resources->flattened_srt;
-	const auto  first = table & ~ShaderRecompiler::IR::ShaderInfo::RayQuerySrtVsharp;
-	if (uint64_t {first} + 4u > srt.size()) {
-		return false;
-	}
-	for (uint32_t dword = 0; dword < 4u; dword++) {
-		vsharp.fields[dword] = srt[first + dword];
-	}
-	return true;
-}
-
-bool RenderContext::AddRayTracingReach(const ShaderStageRuntime& runtime) {
-	const auto&                  program = runtime.module->info;
-	const auto&                  reach   = program.info.ray_query_reach;
-	RayTracing::TlasSource source;
-	uint64_t                     header    = 0;
-	uint64_t                     header_at = 0;
-	if (reach.empty() || reach.size() != 1u + uint64_t {reach[0]} * 2u || !m_ray_tracing->Enabled() ||
-	    !RayTracing::FindGuestTlasSource(program.info, source) ||
-	    !GuestTlasHeader(runtime, source, header, header_at)) {
-		return false;
-	}
-	const auto tlas = std::ranges::find_if(m_hle_tlases, [&](const HleTlas& known) { return known.header == header; });
-	if (tlas == m_hle_tlases.end()) {
-		return false;
-	}
-	const auto add = [&](uint64_t address, uint64_t size) {
-		if (size != 0 && address <= UINT64_MAX - size) {
-			m_mapped_ranges.ForEachInRange(address, size,
-			                               [&](uint64_t start, uint64_t end) { m_dma_spans.emplace_back(start, end); });
-		}
-	};
-	if (header_at != 0) {
-		add(header_at, sizeof(header));
-	}
-	add(header, tlas->size);
-	m_walk_blases.clear();
-	m_ray_tracing->PendingWalks(m_walk_blases);
-	for (const auto* list: {&tlas->blases, &m_walk_blases}) {
-		for (const auto blas: *list) {
-			uint64_t size = 0;
-			if (!GuestBlasMemory(blas, size)) {
-				return false;
-			}
-			add(blas, size);
-		}
-	}
-	const auto& buffers = runtime.resources->buffers;
-	for (uint32_t test = 0; test < reach[0]; test++) {
-		const auto material = reach[1u + test * 2u];
-		const auto table    = reach[2u + test * 2u];
-		ShaderBufferResource table_vsharp;
-		if (material >= buffers.size() || !RayQueryTableVsharp(runtime, table, table_vsharp)) {
-			return false;
-		}
-		const auto records = DecodeNativeDescriptor<ShaderBufferResource>(buffers[material]);
-		add(records.Base48(), records.GetSize());
-		if (!AddBufferTable(table_vsharp)) {
-			return false;
-		}
-	}
-	m_ray_tracing->AnnounceWalks(m_walk_blases);
-	return true;
-}
-
-void RenderContext::NoteBdaSpan(uint64_t vaddr, uint64_t size) {
-	if (m_bda_spans.size() < 256) {
-		m_bda_spans.push_back({vaddr, size});
-	} else {
-		m_bda_rebuild = true;
-	}
-}
-
-void RenderContext::RefreshBdaRanges() {
-	if (!m_buffer_cache.TakeRegistrationSpans(m_bda_spans) || m_bda_spans.size() > 256) m_bda_rebuild = true;
-	if (!m_bda_rebuild && m_bda_spans.empty()) return;
-	std::vector<std::pair<uint64_t, uint64_t>> windows;
-	if (m_bda_rebuild) {
-		windows.emplace_back(0, UINT64_MAX);
-	} else {
-		std::ranges::sort(m_bda_spans, {}, &GuestRange::address);
-		for (const auto& span: m_bda_spans) {
-			const auto begin = span.address / TRACKER_REGION_SIZE * TRACKER_REGION_SIZE;
-			const auto end   = (span.End() + TRACKER_REGION_SIZE - 1) / TRACKER_REGION_SIZE * TRACKER_REGION_SIZE;
-			if (!windows.empty() && begin <= windows.back().second) {
-				windows.back().second = std::max(windows.back().second, end);
-			} else {
-				windows.emplace_back(begin, end);
-			}
-		}
-	}
-	m_bda_spans.clear();
-	m_bda_rebuild = false;
-	std::vector<std::pair<uint64_t, uint64_t>> ranges;
-	for (const auto& [window_begin, window_end]: windows) {
-		m_buffer_cache.CollectMappedRegisteredRanges(m_mapped_ranges, window_begin, window_end, ranges);
-		auto& fresh = m_fresh_bda_region_requests;
-		fresh.clear();
-		for (const auto& [address, size]: ranges) {
-			const auto end = address + size;
-			for (auto start = address; start < end;) {
-				const auto finish = std::min(end, (start / TRACKER_REGION_SIZE + 1) * TRACKER_REGION_SIZE);
-				fresh.push_back({start, finish - start});
-				start = finish;
-			}
-		}
-		const auto before = [](const BufferCache::SyncRegionRequest& request, uint64_t address) {
-			return request.address < address;
-		};
-		const auto first = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), window_begin, before);
-		const auto last  = std::lower_bound(first, m_bda_region_requests.end(), window_end, before);
-		auto       old   = first;
-		for (auto& request: fresh) {
-			while (old != last && old->address < request.address) ++old;
-			if (old != last && old->address == request.address && old->size == request.size) {
-				request = *old;
-			} else if (request.address / TRACKER_REGION_SIZE < BdaDirtyRegions::Regions) {
-				BdaDirtyRegions::Mark(request.address / TRACKER_REGION_SIZE);
-			}
-		}
-		m_bda_region_requests.insert(m_bda_region_requests.erase(first, last), fresh.begin(), fresh.end());
-	}
-}
-
-bool RenderContext::PrepareBdaReadRanges(std::span<const GuestRange> ranges) {
-	if (BdaRegionsMode() == 0) return false;
-	if (ranges.empty() || ranges.size() > 128 ||
-	    std::ranges::any_of(ranges, [](const auto& range) { return !range.Valid(); }))
-		return false;
-	m_buffer_cache.EnsureBdaReadable(ranges);
-	m_buffer_cache.PrepareFaultBuffer();
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	RefreshBdaRanges();
-	if (BdaDirtyRegionsMode() != 0) {
-		for (const auto range: ranges) SynchronizeDirtyBdaRegions(range);
-	} else {
-		for (const auto range: ranges) {
-			auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), range.address,
-			                           [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
-			for (; it != m_bda_region_requests.end() && it->address < range.End(); ++it)
-				m_buffer_cache.SynchronizeRegionRequest(*it);
-		}
-	}
-	m_fault_process_pending = true;
-	m_use_scan_pending      = true;
-	return true;
-}
-
-void RenderContext::SynchronizeDirtyBdaRegions(GuestRange range) {
-	const auto first = range.address / TRACKER_REGION_SIZE;
-	if (first >= BdaDirtyRegions::Regions) return;
-	const auto last = std::min((range.End() - 1) / TRACKER_REGION_SIZE, BdaDirtyRegions::Regions - 1);
-	for (auto word = first / 64; word <= last / 64; ++word) {
-		auto mask = ~uint64_t {0};
-		if (word == first / 64) mask &= ~uint64_t {0} << (first % 64);
-		if (word == last / 64) mask &= ~uint64_t {0} >> (63 - last % 64);
-		auto& bits = BdaDirtyRegions::g_bits[word];
-		for (auto pending = bits.load(std::memory_order_acquire) & mask; pending != 0; pending &= pending - 1) {
-			const auto bit = uint64_t {1} << std::countr_zero(pending);
-			if ((bits.fetch_and(~bit, std::memory_order_acq_rel) & bit) == 0) continue;
-			const auto region_begin = (word * 64 + static_cast<uint64_t>(std::countr_zero(pending))) * TRACKER_REGION_SIZE;
-			auto it = std::lower_bound(m_bda_region_requests.begin(), m_bda_region_requests.end(), region_begin,
-			                           [](const auto& request, uint64_t begin) { return request.address + request.size <= begin; });
-			bool unproven = false;
-			for (; it != m_bda_region_requests.end() && it->address < region_begin + TRACKER_REGION_SIZE; ++it) {
-				m_buffer_cache.SynchronizeRegionRequest(*it);
-				unproven |= it->cpu_epoch == 0;
-			}
-			if (unproven && !m_buffer_cache.DeferredProtectionPending(region_begin))
-				BdaDirtyRegions::Mark(region_begin / TRACKER_REGION_SIZE);
-		}
-	}
-}
-
-void RenderContext::PrepareBda(bool may_write, bool full_sync) {
-	[[maybe_unused]] static const bool logged = [] {
+	m_buffer_cache.ApplyFallbackMaps(); // the BDA fallback (M06)
+	part_mark(21);
+	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
-		return true;
-	}();
-	m_buffer_cache.PrepareFaultBuffer();
-	if (may_write) {
-		m_buffer_cache.NoteDeviceAddressUse();
+		m_bda_logged = true;
 	}
-	if (BdaRegionsMode() != 0 && full_sync) {
-		std::shared_lock regions_lock(m_mapped_ranges_mutex);
-		RefreshBdaRanges();
-		m_bda_mapped_since_sync.clear();
-		for (auto& request: m_bda_region_requests) m_buffer_cache.SynchronizeRegionRequest(request);
-		m_fault_process_pending = true;
-		m_use_scan_pending      = true;
+	// Nothing became CPU-modified and no buffer was created since the last pass: every buffer is
+	// already synchronized (each check below would find no upload range).
+	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+	if (epoch != m_bda_synced_epoch) {
+		// The epoch is read before the pending regions are taken: a region dirtied after that bumps
+		// the epoch again (and sets its pending bit again), so the next call handles it.
+		KYTY_PROFILER_BLOCK("PrepareBda::RegionPass");
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		BufferSyncStats  stats;
+		uint64_t         run_start = 0;
+		uint64_t         run_end   = 0;
+		// Only mapped memory (a buffer can outlive the mapping of its range). Buffers that start
+		// before the slice are found by SynchronizeBuffersInRange itself.
+		const auto flush_run = [&] {
+			if (run_end != run_start) {
+				m_mapped_ranges.ForEachInRange(run_start, run_end - run_start,
+				                               [&](uint64_t begin, uint64_t end) {
+					                               m_buffer_cache.SynchronizeBuffersInRange(
+					                                   begin, end - begin, &stats);
+				                               });
+			}
+		};
+		{
+			// The upload batch: the pass's read-only synchronizations write-protect their pages with one
+			// update per tracker region at the end of the pass (before any of their bytes is copied).
+			const BufferCache::UploadBatchScope upload_batch(m_buffer_cache);
+			TakeCpuDirtyRegions([&](uint64_t region) {
+				const uint64_t start = region * TRACKER_REGION_SIZE;
+				m_bda_counters.regions++;
+				if (parts_on) t_long_prep_parts[26]++;
+				if (start != run_end) {
+					flush_run();
+					run_start = start;
+				}
+				run_end = start + TRACKER_REGION_SIZE;
+			});
+			flush_run();
+		}
+		m_bda_counters.passes++;
+		m_bda_counters.buffers_visited += stats.buffers;
+		if (parts_on) {
+			t_long_prep_parts[27] += stats.buffers;
+			t_long_prep_parts[28] += stats.uploads;
+			t_long_prep_parts[29] += stats.bytes;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - m_bda_log_time >= std::chrono::seconds(10) && Common::EnvRead::PerfLines()) {
+			m_bda_log_time = now;
+			std::fprintf(stderr, "BDA_REGION_STATS passes=%llu regions=%llu buffers_visited=%llu\n",
+			             static_cast<unsigned long long>(m_bda_counters.passes),
+			             static_cast<unsigned long long>(m_bda_counters.regions),
+			             static_cast<unsigned long long>(m_bda_counters.buffers_visited));
+		}
+		m_bda_synced_epoch = epoch;
+		m_bda_epoch_counters.passes++;
+	}
+	part_mark(24);
+	ReportBdaSyncEpoch();
+	part_mark(25);
+	m_fault_process_pending = true;
+}
+
+// The PERF line of the BDA sync epoch about every 10 s.
+void RenderContext::ReportBdaSyncEpoch() {
+	auto& counters = m_bda_epoch_counters;
+	counters.calls++;
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_bda_epoch_log_time < std::chrono::seconds(10) || !Common::EnvRead::PerfLines()) {
 		return;
 	}
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	const std::array<uint64_t, 3> epochs {RegionManager::CpuDirtyEpoch(),
-	                                      m_buffer_cache.RegisterEpoch(), m_mapped_ranges_version};
-	const bool same_layout = epochs[1] == m_bda_sync_epochs[1] && epochs[2] == m_bda_sync_epochs[2];
-	if (full_sync && (epochs != m_bda_sync_epochs || m_buffer_cache.HasKeptPages()) &&
-	    (!same_layout || m_bda_synced_generation != m_bda_generation)) {
-		m_bda_synced_generation = m_bda_generation;
-		for (const auto& [vaddr, size]: m_bda_mapped_since_sync) {
-			m_buffer_cache.ForceSynchronization(vaddr, size);
-		}
-		m_bda_mapped_since_sync.clear();
-		m_buffer_cache.SynchronizeBuffersInRanges(m_mapped_ranges, false);
-		m_bda_sync_epochs = epochs;
-	}
-	m_fault_process_pending = true;
-	m_use_scan_pending      = true;
+	m_bda_epoch_log_time = now;
+	const auto& deferred = g_cpu_deferred_counters;
+	std::fprintf(stderr,
+	             "PERF bda_sync_epoch calls=%llu passes=%llu deferred_marks=%llu publishes=%llu "
+	             "published_regions=%llu write_regions=%llu\n",
+	             static_cast<unsigned long long>(counters.calls), static_cast<unsigned long long>(counters.passes),
+	             static_cast<unsigned long long>(deferred.deferred_marks.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(deferred.publishes.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(deferred.published_regions.load(std::memory_order_relaxed)),
+	             static_cast<unsigned long long>(deferred.write_regions.load(std::memory_order_relaxed)));
 }
 
 void RenderContext::RunGarbageCollector() {
-	m_frame_number++;
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
-	m_image_heap.RunGarbageCollector();
-	constexpr uint32_t UseScanPeriod = 256;
-	if (m_use_scan_countdown != 0) {
-		m_use_scan_countdown--;
-	} else if (m_use_scan_pending) {
-		m_use_scan_pending   = false;
-		m_use_scan_countdown = UseScanPeriod;
-		m_buffer_cache.ProcessUseBuffer();
-	}
-	if (m_indirect_write_tables.TakePendingWrites()) {
-		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
-			m_indirect_write_tables.NoteWrites(pages);
-		});
-	}
-	m_texture_cache.ProcessDownloadImages();
+	// Live shader flags (KYTY_PERF_INDIRECT_LOAD_FAST=3): this frame boundary's live A/B phase.
+	SpirvLive::Update(m_command_scheduler, *m_buffer_cache.GetFaultBuffer(),
+	                  BufferCache::FAULT_DIAG_BASE + BufferCache::FAULT_DIAG_WORDS);
 	m_texture_cache.RunGarbageCollector();
+	m_texture_cache.RunTextureMove(m_bindless_table); // texture relocation (textureMove.cpp)
+	m_texture_cache.ReportImageReadServe(); // KYTY_TRACE_READBACK
 	m_buffer_cache.RunGarbageCollector();
-	m_ray_tracing->RunGarbageCollector();
+	if (m_ray_tracing) m_ray_tracing->RunGarbageCollector();
+	m_pipeline_cache.EvictIdlePipelines(m_command_scheduler);
 }
 
 void RenderContext::AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id) {
@@ -1346,4 +478,4 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	}
 }
 
-}
+} // namespace Libs::Graphics

@@ -5,13 +5,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
-
-constexpr uint32_t UnsetRayQuerySlot = 0xfffffffeu;
 
 [[noreturn]] void Fail(std::string_view message) {
 	EXIT("shader info collection failed: %s", std::string(message).c_str());
@@ -92,6 +89,8 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
+	// Mixed interpolation modes share raw vertices at their guest export slot.
+	// Rectangle expansion alone supplies separate flat and smooth outputs.
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
 		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
 			const bool same_mode = ShaderPixelParameterIsFlat(*pixel, input) ==
@@ -177,10 +176,12 @@ void AddBuiltinInput(ShaderInfo& info, StageInputKind kind) {
 		case StageInputKind::GlobalInvocationId:
 			AddInput(info, kind, 0, 3, "gl_GlobalInvocationID");
 			break;
-		case StageInputKind::BaseVertex: AddInput(info, kind, 0, 1, "gl_BaseVertex"); break;
-		case StageInputKind::BaseInstance: AddInput(info, kind, 0, 1, "gl_BaseInstance"); break;
 		case StageInputKind::PackedAncillary:
-		case StageInputKind::Parameter: break;
+		case StageInputKind::Parameter:
+		// Draw parameters are emitter-only (GPU indirect vertex variant).
+		case StageInputKind::BaseVertex:
+		case StageInputKind::BaseInstance:
+		case StageInputKind::DrawIndex: break;
 	}
 }
 
@@ -269,7 +270,6 @@ struct InputUsage {
 	std::array<StageInputKind, static_cast<size_t>(StageInputKind::Parameter)> builtins {};
 	uint32_t builtin_mask = 0;
 	uint32_t builtin_count = 0;
-	std::vector<bool> not_constant;
 
 	void AddBuiltin(StageInputKind kind) {
 		const auto bit = 1u << static_cast<uint32_t>(kind);
@@ -288,14 +288,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
-	info.float16 |= op == ValueOpcode::PackedFPAdd16x2 || op == ValueOpcode::PackedFPMul16x2 ||
-	                op == ValueOpcode::PackedFPFma16x2 || op == ValueOpcode::PackedFPMin16x2 ||
-	                op == ValueOpcode::PackedFPMax16x2 || inst.GetType() == Type::F16;
-	for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
-		info.float16 |= inst.Arg(arg).GetType() == Type::F16;
-	}
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
+	// Buffer stores and atomics of any kind (BDA stores: Program::has_address_writes; scratch is per lane).
+	info.buffer_writes |= buffer_access == BufferAccess::Write || buffer_access == BufferAccess::Atomic;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||
 	    shared_access != SharedAccess::None) {
 		const auto index = inst.Flags<MemoryFlags>().index;
@@ -314,21 +310,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					return Fail("buffer operation has invalid resource metadata");
 				}
 				info.buffers[memory.resource].live = true;
-				const auto offset = op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer
-				                        ? inst.Arg(1).Resolve() : Value {};
-				const bool constant =
-				    offset.IsImmediate() && offset.GetType() == Type::U32 &&
-				    (static_cast<uint64_t>(offset.U32() & ~3u) + memory.offset + sizeof(uint32_t) <=
-				     UniformBufferBytes - UniformBufferBaseSlack);
-				if (!constant) {
-					inputs.not_constant[memory.resource] = true;
-				}
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
 					info.buffers[child].live = true;
-					inputs.not_constant[child] = true;
 				}
 			}
 		}
@@ -344,17 +330,15 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
 			} else {
 				info.coherent_buffers |= memory.coherent;
-				info.uses_dma |= !memory.planning_only;
 			}
 		}
 		if (buffer_access != BufferAccess::None) {
-			if (kind == ResourceKind::IndirectBuffer) {
-				info.uses_dma = true;
-				info.subgroup_local_invocation_id |= op != ValueOpcode::ReadConstBuffer;
+			if (kind == ResourceKind::IndirectBuffer && op != ValueOpcode::ReadConstBuffer) {
+				info.subgroup_local_invocation_id = true;
 			}
 			if (kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
-				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op) || memory.IsCoherentBufferPairStore(op);
+				info.buffer_int64_atomics |= memory.IsCoherentBufferPairLoad(op);
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
@@ -364,17 +348,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 					const auto bits = StorageBufferElementBits(program, selected);
 					info.buffer_u8 |= bits == 8u;
 					info.buffer_u16 |= bits == 16u;
+					info.coherent_narrow |= selected.coherent && bits != 32u;
 				};
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 					if (program.stage != ShaderType::Compute) {
-						return Fail(fmt::format(
-						    "buffer ADD_TID is only valid for compute shaders: hash=0x{:016x} "
-						    "stage={} resource={}",
-						    program.shader_hash, static_cast<unsigned>(program.stage),
-						    memory.resource));
+						return Fail("buffer ADD_TID is only valid for compute shaders");
 					}
 					info.subgroup_local_invocation_id = true;
 				}
@@ -426,6 +407,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				if (program.stage != ShaderType::Pixel || !inst.Arg(2).IsImmediate()) {
 					return Fail("f16 attribute reference is invalid");
 				}
+				// FP16_INTERP_MODE packs two halves per dword, so smooth inputs blend unpacked
+				// vertices; flat inputs unpack the provoking vertex.
 				const auto input = inst.Arg(0).U32();
 				inputs.per_vertex[input] |= !ShaderPixelParameterIsFlat(*input_info.pixel, input);
 			}
@@ -469,8 +452,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				case StageInputKind::InstanceIndex:
 				case StageInputKind::FrontFacing:
 				case StageInputKind::LocalInvocationIndex:
-				case StageInputKind::BaseVertex:
-				case StageInputKind::BaseInstance:
 					if (component != 0u) {
 						return Fail("typed scalar builtin component is out of range");
 					}
@@ -533,31 +514,25 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::GetDispatchThreadExtent:
 			info.uses_dispatch_threads |= inst.HasUses();
 			break;
-		case ValueOpcode::ReadConst:
-		case ValueOpcode::ReadCallWord: info.uses_flattened_srt = true; break;
+		case ValueOpcode::ReadConst: info.uses_flattened_srt = info.uses_read_const = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
 		case ValueOpcode::BvhIntersect:
-			info.bvh = info.uses_dma = true;
+			info.bvh = true;
 			if ((inst.Flags<uint32_t>() & BvhIntersectOracle) != 0) info.ray_query = true;
 			break;
-		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
-		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
 		case ValueOpcode::RayQueryInitialize: info.ray_query = info.ray_query_mirror = true; break;
-		case ValueOpcode::LoadDeviceAddressU32: info.uses_device_address = true; break;
 		case ValueOpcode::RayQueryInit: {
 			info.uses_dma = true;
 			auto& slots = info.ray_query_header_slots;
 			for (uint32_t word = 0; word < 2; word++) {
 				const auto* read = inst.Arg(8 + word).Resolve().TryInstruction();
-				const auto  slot = read != nullptr && read->GetOpcode() == ValueOpcode::ReadConst &&
+				const uint32_t slot = read != nullptr && read->GetOpcode() == ValueOpcode::GetUserData &&
 				                          read->NumArgs() == 2 && read->Arg(1).Resolve().IsImmediate()
 				                       ? read->Arg(1).Resolve().U32()
 				                       : ShaderInfo::NoRayQuerySlot;
-				slots[word] = slots[word] == UnsetRayQuerySlot || slots[word] == slot
-				                  ? slot
-				                  : ShaderInfo::NoRayQuerySlot;
+				slots[word] = slots[word] == 0xfffffffeu || slots[word] == slot ? slot : ShaderInfo::NoRayQuerySlot;
 			}
 			info.ray_query = true;
 			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
@@ -573,15 +548,24 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.ray_query = true;
 			info.ray_query_sites |= 1u << RayQuerySite(inst.Flags<uint32_t>());
 			break;
-		case ValueOpcode::ConditionRef:
-			info.subgroup_ballot |=
-			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+		case ValueOpcode::Bvh8Intersect: info.bvh8 = true; break;
+		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
+		case ValueOpcode::SharedAtomicIAdd32:
+		case ValueOpcode::SharedAtomicISub32: info.ordered_lds_atomics |= inst.HasUses(); break;
+		case ValueOpcode::ConditionRef: {
+			// Upstream da1950188 votes (GroupNonUniformVote); our wave-pair and lane-share paths still ballot the
+			// condition, so both capabilities stay declared as before the merge.
+			const bool vector = inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;
+			info.subgroup_vote |= vector;
+			info.subgroup_ballot |= vector;
 			break;
+		}
 		case ValueOpcode::Ballot: info.subgroup_ballot = true; break;
 		case ValueOpcode::LiveMask: info.subgroup_ballot = info.helper_invocation = true; break;
 		case ValueOpcode::SubgroupUMinU32:
 		case ValueOpcode::SubgroupUMaxU32:
-		case ValueOpcode::SubgroupOrU32: info.subgroup_arithmetic = true; break;
+		case ValueOpcode::SubgroupOrU32:
+		case ValueOpcode::WaterfallRecord0Census: info.subgroup_arithmetic = true; break; // (the census: IAdd reduce, elect)
 		case ValueOpcode::DppMoveU32:
 		case ValueOpcode::ReadFirstLane:
 		case ValueOpcode::ReadLane: {
@@ -598,8 +582,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_local_invocation_id = true;
 			break;
 		}
-		case ValueOpcode::LoadRelativeVgpr:
-		case ValueOpcode::StoreRelativeVgpr: info.relative_vgprs = true; break;
 		case ValueOpcode::SwizzleU32:
 			info.uses_swizzle = true;
 			[[fallthrough]];
@@ -618,14 +600,6 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.subgroup_local_invocation_id = true;
 			}
 			break;
-#if defined(ANYPS5_KYTY)
-		case ValueOpcode::SetTessellationAttribute:
-			if (program.stage == ShaderType::TessellationControl &&
-			    inst.Arg(0).U32() == static_cast<uint32_t>(TessellationAttribute::ControlShared)) {
-				inputs.AddBuiltin(StageInputKind::InvocationId);
-			}
-			break;
-#endif
 		case ValueOpcode::ImageQueryLod: info.compute_derivatives = true; break;
 		case ValueOpcode::ImageGatherRaw:
 			info.image_gather_extended = true;
@@ -634,7 +608,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	}
 }
 
-}
+} // namespace
 
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
@@ -646,22 +620,16 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
-	info.ray_query_mirror = false;
 	for (auto& buffer: info.buffers) buffer.live = false;
-	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
-	    info.uses_dispatch_threads = info.uses_swizzle = info.relative_vgprs = info.uses_dma = info.uses_device_address =
-	        false;
-	info.ray_query              = false;
-	info.ray_query_sites        = 0;
-	info.ray_query_header_slots = {UnsetRayQuerySlot, UnsetRayQuerySlot};
-	info.bvh = info.subgroup_ballot = info.subgroup_barrier =
-	    info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
+	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt = info.uses_read_const =
+	    info.uses_dispatch_threads = info.uses_swizzle = false;
+	info.bvh = info.bvh8 = info.bvh_stack = info.ordered_lds_atomics = info.subgroup_ballot = info.subgroup_vote =
+	    info.subgroup_barrier = info.subgroup_shuffle = info.subgroup_arithmetic = info.helper_invocation =
 	    info.subgroup_local_invocation_id = info.compute_derivatives = info.image_gather_extended =
 	    info.function_lds = info.function_scratch = info.pixel_valid_mask = info.buffer_int64_atomics =
-	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 =
-	    info.float16 = false;
+	    info.buffer_u8 = info.buffer_u16 = info.shared_int64_atomics = info.coherent_buffers = info.float64 = false;
+	info.buffer_writes = info.coherent_narrow = false;
 	InputUsage inputs;
-	inputs.not_constant.assign(info.buffers.size(), false);
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			Visit(program, input_info, inputs, inst);
@@ -670,25 +638,13 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
 	}
-	for (auto& slot: info.ray_query_header_slots) {
-		if (slot == UnsetRayQuerySlot) slot = ShaderInfo::NoRayQuerySlot;
-	}
-	for (uint32_t index = 0; index < info.buffers.size(); index++) {
-		auto& buffer         = info.buffers[index];
-		buffer.constant_only = buffer.live && !inputs.not_constant[index] &&
-		                       !buffer.written && !buffer.atomic && !buffer.formatted &&
-		                       buffer.indirect_root == BufferResource::NoIndirectBuffer &&
-		                       buffer.indirect_resources.empty() && !buffer.indirect_write_table;
-	}
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
+	// A GPU-selected sampler reads its key/ordinal mapping from the flattened SRT as well (LoadInstructionSampler).
 	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
 	                           std::ranges::any_of(info.images, uses_mapping) ||
-	                           std::ranges::any_of(info.samplers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, [](const ImageResource& image) {
-		                           return image.table_capacity != 0u;
-	                           });
+	                           std::ranges::any_of(info.samplers, uses_mapping);
 	info.uses_image_heap = std::ranges::any_of(info.images, &ImageResource::heap);
 	switch (program.stage) {
 		case ShaderType::Vertex:
@@ -698,14 +654,19 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Mesh: break;
 		case ShaderType::Pixel:
 			CollectPixelInputs(input_info.pixel, info, inputs.per_vertex, inputs.components);
-			if (input_info.pixel->object_primitive_id) {
-				if (std::ranges::any_of(info.outputs, [](const StageOutput& output) {
-					    return output.kind == StageOutputKind::Mrt && output.location == 7u;
+			// The ObjPrimID write: the slot the hardware writes VGT_OBJECT_ID (+ the primitive index) to; the guest
+			// pixel shader does not export it.
+			if (input_info.pixel->HasObjprimOutput()) {
+				if (std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+					    return output.kind == StageOutputKind::Mrt &&
+					           output.location == input_info.pixel->objprim_slot;
 				    })) {
-					return Fail("explicit MRT7 export overlaps automatic object/primitive ID");
+					return Fail("ObjPrimID slot is also an exported MRT");
 				}
-				AddBuiltinInput(info, StageInputKind::PrimitiveId);
-				AddOutput(info, StageOutputKind::ObjectPrimitiveId, 0, 7, "out_object_primitive_id");
+				AddOutput(info, StageOutputKind::ObjPrimId, 0, input_info.pixel->objprim_slot, "out_objprim_id");
+				if (input_info.pixel->objprim_add_prim_id) {
+					AddInput(info, StageInputKind::PrimitiveId, 0, 1, "gl_PrimitiveID");
+				}
 			}
 			break;
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, info); break;
@@ -717,4 +678,4 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	program.shader_info_complete = true;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

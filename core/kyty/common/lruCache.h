@@ -1,11 +1,14 @@
 #ifndef EMULATOR_SRC_COMMON_LRUCACHE_H_
 #define EMULATOR_SRC_COMMON_LRUCACHE_H_
 
+#include "common/assert.h"
+
+#include <array>
 #include <cstddef>
 #include <deque>
+#include <memory>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace Common {
 
@@ -18,25 +21,25 @@ class LeastRecentlyUsedCache {
 		Item*  prev = nullptr;
 	};
 
+	// Items live in fixed chunks of ChunkItems that never move (idea: chenxiao's fork 02041c814). MSVC's std::deque
+	// keeps one 32-byte item per heap block, so every Touch chased a block map and then a separate allocation.
+	static constexpr size_t ChunkBits  = 10;
+	static constexpr size_t ChunkItems = size_t {1} << ChunkBits;
+	static constexpr size_t MaxChunks  = 4096;
+	using Chunk                        = std::array<Item, ChunkItems>;
+
 public:
 	[[nodiscard]] size_t Insert(Object object, Tick tick) {
-		size_t id = 0;
-		if (m_free.empty()) {
-			id = m_items.size();
-			m_items.emplace_back();
-		} else {
-			id = m_free.back();
-			m_free.pop_back();
-		}
-		auto& item  = m_items[id];
-		item.object = std::move(object);
-		item.tick   = tick;
+		const auto id   = Build();
+		auto&      item = At(id);
+		item.object     = std::move(object);
+		item.tick       = tick;
 		Attach(item);
 		return id;
 	}
 
 	void Touch(size_t id, Tick tick) {
-		auto& item = m_items[id];
+		auto& item = At(id);
 		if (item.tick >= tick) {
 			return;
 		}
@@ -47,8 +50,16 @@ public:
 		}
 	}
 
+	// The tick the item holds: set by Insert, raised by Touch, never lowered.
+	[[nodiscard]] Tick GetTick(size_t id) const {
+		return At(id).tick;
+	}
+
 	void Free(size_t id) {
-		Detach(m_items[id]);
+		auto& item = At(id);
+		Detach(item);
+		item.next = nullptr;
+		item.prev = nullptr;
 		m_free.push_back(id);
 	}
 
@@ -72,36 +83,62 @@ public:
 	}
 
 private:
+	[[nodiscard]] Item& At(size_t id) { return (*m_chunks[id >> ChunkBits])[id & (ChunkItems - 1)]; }
+	[[nodiscard]] const Item& At(size_t id) const { return (*m_chunks[id >> ChunkBits])[id & (ChunkItems - 1)]; }
+
+	[[nodiscard]] size_t Build() {
+		if (m_free.empty()) {
+			const auto id    = m_count;
+			const auto chunk = id >> ChunkBits;
+			EXIT_IF(chunk >= MaxChunks);
+			if (m_chunks[chunk] == nullptr) {
+				m_chunks[chunk] = std::make_unique<Chunk>();
+			}
+			At(id) = Item {};
+			m_count++;
+			return id;
+		}
+		const auto id = m_free.front();
+		m_free.pop_front();
+		return id;
+	}
+
 	void Attach(Item& item) {
-		item.prev = m_last;
-		item.next = nullptr;
-		if (m_last != nullptr) {
-			m_last->next = &item;
-		} else {
+		if (m_first == nullptr) {
 			m_first = &item;
 		}
-		m_last = &item;
+		if (m_last == nullptr) {
+			m_last = &item;
+			return;
+		}
+		item.prev    = m_last;
+		m_last->next = &item;
+		item.next    = nullptr;
+		m_last       = &item;
 	}
 
 	void Detach(Item& item) {
 		if (item.prev != nullptr) {
 			item.prev->next = item.next;
-		} else {
-			m_first = item.next;
 		}
 		if (item.next != nullptr) {
 			item.next->prev = item.prev;
-		} else {
+		}
+		if (m_first == &item) {
+			m_first = item.next;
+		}
+		if (m_last == &item) {
 			m_last = item.prev;
 		}
 	}
 
-	std::deque<Item>    m_items;
-	std::vector<size_t> m_free;
-	Item*               m_first = nullptr;
-	Item*               m_last  = nullptr;
+	std::array<std::unique_ptr<Chunk>, MaxChunks> m_chunks;
+	size_t                                        m_count = 0;
+	std::deque<size_t>                            m_free;
+	Item*                                         m_first = nullptr;
+	Item*                                         m_last  = nullptr;
 };
 
-}
+} // namespace Common
 
-#endif
+#endif // EMULATOR_SRC_COMMON_LRUCACHE_H_

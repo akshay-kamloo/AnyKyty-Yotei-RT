@@ -57,6 +57,6 @@ private:
 	bool               m_print;
 };
 
-}
+} // namespace Common
 
-#endif
+#endif /* KYTY_COMMON_SUBSYSTEMS_H_ */

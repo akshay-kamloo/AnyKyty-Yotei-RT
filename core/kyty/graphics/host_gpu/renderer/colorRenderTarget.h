@@ -12,6 +12,7 @@
 namespace Libs::Graphics {
 
 struct RenderColorInfo {
+	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc         desc;
 	ImageId                         image_id;
 	uint32_t                        target_slot      = 0;
@@ -25,6 +26,6 @@ struct RenderColorInfo {
 	}
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COLORRENDERTARGET_H_

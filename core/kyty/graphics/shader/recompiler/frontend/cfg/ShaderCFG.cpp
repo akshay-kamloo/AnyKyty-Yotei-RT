@@ -1,9 +1,9 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 
 #include "common/assert.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fmt/format.h>
 #include <iterator>
 #include <deque>
@@ -70,6 +70,18 @@ BranchCondition ConditionForOpcode(Opcode opcode) {
 	}
 }
 
+bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
+	switch (operand.kind) {
+		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
+		case Decoder::OperandKind::VccLo: code = 106u; return true;
+		case Decoder::OperandKind::VccHi: code = 107u; return true;
+		case Decoder::OperandKind::M0: code = 124u; return true;
+		case Decoder::OperandKind::ExecLo: code = 126u; return true;
+		case Decoder::OperandKind::ExecHi: code = 127u; return true;
+		default: return false;
+	}
+}
+
 bool IsScalarCode(const Decoder::Operand& operand, uint32_t code) {
 	uint32_t operand_code = 0;
 	return ScalarOperandCode(operand, operand_code) && operand_code == code;
@@ -100,6 +112,9 @@ bool IsImmediateSigned(const Decoder::Operand& operand, int32_t& value) {
 
 bool OtherScalarSource(const Instruction& inst, uint32_t known_code,
                        const Decoder::Operand** other) {
+	if (other == nullptr) {
+		return false;
+	}
 	if (IsScalarCode(inst.src0, known_code)) {
 		*other = &inst.src1;
 		return true;
@@ -129,7 +144,9 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (candidate.opcode == Opcode::S_GETPC_B64 && IsScalarCode(candidate.dst, dst_code)) {
-			*index = candidate_index;
+			if (index != nullptr) {
+				*index = candidate_index;
+			}
 			return true;
 		}
 		if (InstructionWritesScalarCode(candidate, dst_code)) {
@@ -141,6 +158,9 @@ bool FindPreviousGetpc(const Decoder::Program& program, uint32_t before_index, u
 
 bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_index,
                            uint32_t base_code, uint32_t* pc) {
+	if (pc == nullptr) {
+		return false;
+	}
 	for (uint32_t i = before_index; i > 0; i--) {
 		const uint32_t candidate_index = i - 1u;
 		const auto&    candidate       = program.instructions[candidate_index];
@@ -208,7 +228,7 @@ bool ResolvePcRelativeBase(const Decoder::Program& program, uint32_t before_inde
 
 bool AddSignedByteOffset(uint32_t base, uint32_t encoded_offset, uint32_t* address) {
 	const auto value = static_cast<int64_t>(base) + static_cast<int32_t>(encoded_offset);
-	if (value < 0 || value > UINT32_MAX) {
+	if (address == nullptr || value < 0 || value > UINT32_MAX) {
 		return false;
 	}
 	*address = static_cast<uint32_t>(value);
@@ -222,7 +242,9 @@ bool FindPreviousScalarLoad(const Decoder::Program& program, uint32_t before_ind
 		const auto&    candidate       = program.instructions[candidate_index];
 		if (InstructionWritesScalarCode(candidate, dst_code)) {
 			if (candidate.opcode == opcode && IsScalarCode(candidate.dst, dst_code)) {
-				*index = candidate_index;
+				if (index != nullptr) {
+					*index = candidate_index;
+				}
 				return true;
 			}
 			return false;
@@ -234,6 +256,9 @@ bool FindPreviousScalarLoad(const Decoder::Program& program, uint32_t before_ind
 bool ResolveJumpTableEntryCount(const Decoder::Program& program, uint32_t before_index,
                                 const Decoder::Operand& byte_offset_operand, uint32_t stride_shift,
                                 uint32_t* entry_count) {
+	if (entry_count == nullptr) {
+		return false;
+	}
 	uint32_t byte_offset_code = 0;
 	if (!ScalarOperandCode(byte_offset_operand, byte_offset_code)) {
 		return false;
@@ -442,6 +467,8 @@ bool ResolveSetpcDwordJumpTable(const Decoder::Program& program, uint32_t setpc_
 	if (!ResolveJumpTableEntryCount(program, load_index, load.src1, 2u, &entry_count)) {
 		return false;
 	}
+	// Code-table loads are not translated, so a selector that is also the load destination
+	// keeps its scaled index at the branch.
 	uint32_t selector_code = UINT32_MAX;
 	if (!ScalarOperandCode(load.src1, selector_code) ||
 	    ScalarCodeWrittenInRange(program, load_index + 1u, setpc_index, selector_code)) {
@@ -518,11 +545,13 @@ bool ResolveSetpcTarget(const Decoder::Program& program, uint32_t setpc_index, u
 		}
 	}
 
+	// Long jump: s_getpc_b64; s_add_u32 lo, imm; s_addc_u32 hi, 0.
 	return ResolvePcRelativeBase(program, setpc_index, pc_code, &target);
 }
 
 bool ResolveSetpcTargets(const Decoder::Program& program, uint32_t setpc_index,
                          SetpcTargetInfo& info) {
+	info = {};
 	if (ResolveSetpcDwordJumpTable(program, setpc_index, info)) {
 		return true;
 	}
@@ -580,12 +609,18 @@ void RemapIds(std::vector<uint32_t>& values, const std::vector<uint32_t>& id_map
 
 void RebuildPredecessors(Graph& graph) {
 	for (auto& block: graph.blocks) {
+		block.predecessors.clear();
 		SortUnique(block.successors);
+	}
+	for (const auto& block: graph.blocks) {
 		for (auto succ: block.successors) {
 			if (succ < graph.blocks.size()) {
-				graph.blocks[succ].predecessors.push_back(block.id);
+				AddUnique(graph.blocks[succ].predecessors, block.id);
 			}
 		}
+	}
+	for (auto& block: graph.blocks) {
+		SortUnique(block.predecessors);
 	}
 }
 
@@ -628,6 +663,8 @@ void PruneUnreachableBlocks(Graph& graph) {
 	for (auto& block: graph.blocks) {
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.successors, id_map);
+		block.predecessors.clear();
+		block.dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -640,8 +677,13 @@ void PruneUnreachableBlocks(Graph& graph) {
 			target = RemapId(target, id_map);
 		}
 	}
+	graph.back_edges.clear();
+	graph.natural_loops.clear();
+	graph.components.clear();
+	RebuildPredecessors(graph);
 }
 
+// The sets below are sorted and unique; this keeps them so.
 void InsertSorted(std::vector<uint32_t>& values, uint32_t value) {
 	const auto at = std::lower_bound(values.begin(), values.end(), value);
 	if (at == values.end() || *at != value) {
@@ -649,12 +691,16 @@ void InsertSorted(std::vector<uint32_t>& values, uint32_t value) {
 	}
 }
 
-std::vector<uint32_t> SolverOrder(const Graph& graph) {
+// Visiting order for the iterative (post-)dominator solvers: a depth-first postorder over the
+// successor edges from the entry, then the blocks the walk does not reach, in index order. The
+// fixed point does not depend on the order, but in index order a shader with thousands of blocks
+// (inlined function calls) took one pass per block to converge, tens of seconds per shader.
+std::vector<uint32_t> SolverOrder(const Graph& graph, bool reverse_postorder) {
 	const auto            count = static_cast<uint32_t>(graph.blocks.size());
 	std::vector<uint32_t> order;
 	order.reserve(count);
 	std::vector<uint8_t>                       visited(count, 0);
-	std::vector<std::pair<uint32_t, uint32_t>> stack;
+	std::vector<std::pair<uint32_t, uint32_t>> stack; // (block, next successor)
 	if (graph.entry_block < count) {
 		visited[graph.entry_block] = 1;
 		stack.emplace_back(graph.entry_block, 0u);
@@ -673,7 +719,9 @@ std::vector<uint32_t> SolverOrder(const Graph& graph) {
 		order.push_back(block);
 		stack.pop_back();
 	}
-	std::reverse(order.begin(), order.end());
+	if (reverse_postorder) {
+		std::reverse(order.begin(), order.end());
+	}
 	for (uint32_t id = 0; id < count; id++) {
 		if (visited[id] == 0) {
 			order.push_back(id);
@@ -690,7 +738,8 @@ void ComputeDominators(Graph& graph) {
 		block.dominators = (block.id == graph.entry_block ? std::vector<uint32_t> {block.id} : all);
 	}
 
-	const auto order   = SolverOrder(graph);
+	// Predecessors before successors (back edges aside).
+	const auto order   = SolverOrder(graph, true);
 	bool       changed = true;
 	while (changed) {
 		changed = false;
@@ -718,6 +767,7 @@ void ComputeDominators(Graph& graph) {
 }
 
 void ComputeBackEdges(Graph& graph) {
+	graph.back_edges.clear();
 	for (const auto& block: graph.blocks) {
 		for (auto succ: block.successors) {
 			if (graph.Dominates(succ, block.id)) {
@@ -738,6 +788,10 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 	if (latch != header) {
 		stack.push_back(latch);
 	}
+	if (natural != nullptr) {
+		*natural = true;
+	}
+
 	while (!stack.empty()) {
 		const auto block_id = stack.back();
 		stack.pop_back();
@@ -746,7 +800,7 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 			continue;
 		}
 		for (auto pred: block->predecessors) {
-			if (!graph.Dominates(header, pred)) {
+			if (!graph.Dominates(header, pred) && natural != nullptr) {
 				*natural = false;
 			}
 			if (!Contains(body, pred)) {
@@ -761,7 +815,10 @@ std::vector<uint32_t> NaturalLoopBody(const Graph& graph, uint32_t header, uint3
 	return body;
 }
 
+bool HasLinearPathToTerminal(const Graph& graph, uint32_t start);
+
 void ComputeNaturalLoops(Graph& graph) {
+	graph.natural_loops.clear();
 	for (auto& edge: graph.back_edges) {
 		bool natural = true;
 		auto body    = NaturalLoopBody(graph, edge.to, edge.from, &natural);
@@ -785,7 +842,25 @@ struct TarjanState {
 	std::vector<StronglyConnectedComponent> components;
 };
 
-void TarjanFinish(TarjanState& state, uint32_t block_id) {
+void TarjanVisit(TarjanState& state, uint32_t block_id) {
+	state.index[block_id]   = state.next_index;
+	state.lowlink[block_id] = state.next_index;
+	state.next_index++;
+	state.stack.push_back(block_id);
+	state.on_stack[block_id] = true;
+
+	const auto* block = state.graph->FindBlock(block_id);
+	if (block != nullptr) {
+		for (auto succ: block->successors) {
+			if (state.index[succ] == UINT32_MAX) {
+				TarjanVisit(state, succ);
+				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.lowlink[succ]);
+			} else if (state.on_stack[succ]) {
+				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
+			}
+		}
+	}
+
 	if (state.lowlink[block_id] != state.index[block_id]) {
 		return;
 	}
@@ -821,40 +896,6 @@ void TarjanFinish(TarjanState& state, uint32_t block_id) {
 	state.components.push_back(std::move(component));
 }
 
-void TarjanVisit(TarjanState& state, uint32_t root) {
-	struct Frame {
-		uint32_t block;
-		uint32_t next_successor;
-	};
-	std::vector<Frame> frames {{root, 0}};
-	while (!frames.empty()) {
-		const auto block_id = frames.back().block;
-		if (state.index[block_id] == UINT32_MAX) {
-			state.index[block_id] = state.lowlink[block_id] = state.next_index++;
-			state.stack.push_back(block_id);
-			state.on_stack[block_id] = true;
-		}
-
-		const auto* block = state.graph->FindBlock(block_id);
-		if (block != nullptr && frames.back().next_successor < block->successors.size()) {
-			const auto succ = block->successors[frames.back().next_successor++];
-			if (state.index[succ] == UINT32_MAX) {
-				frames.push_back({succ, 0});
-			} else if (state.on_stack[succ]) {
-				state.lowlink[block_id] = std::min(state.lowlink[block_id], state.index[succ]);
-			}
-			continue;
-		}
-
-		frames.pop_back();
-		if (!frames.empty()) {
-			const auto parent     = frames.back().block;
-			state.lowlink[parent] = std::min(state.lowlink[parent], state.lowlink[block_id]);
-		}
-		TarjanFinish(state, block_id);
-	}
-}
-
 void ComputeComponents(Graph& graph) {
 	TarjanState state;
 	state.graph = &graph;
@@ -870,7 +911,8 @@ void ComputeComponents(Graph& graph) {
 		}
 	}
 
-	graph.components = std::move(state.components);
+	graph.components  = std::move(state.components);
+	graph.irreducible = false;
 	for (const auto& component: graph.components) {
 		if (component.irreducible) {
 			graph.irreducible   = true;
@@ -902,6 +944,7 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		block.id = RemapId(block.id, id_map);
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
+		RemapIds(block.dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -922,7 +965,7 @@ std::string VectorToString(const std::vector<uint32_t>& values) {
 	return text;
 }
 
-}
+} // namespace
 
 const BasicBlock* Graph::FindBlock(uint32_t id) const {
 	if (id < blocks.size() && blocks[id].id == id) {
@@ -961,6 +1004,9 @@ bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 
 namespace {
 
+// Eliminate gotos by moving them through a structured statement tree. Every Code node
+// retains exactly one guest block; only Boolean route values cross construct boundaries.
+// This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
 class GotoStructurizer {
 	using ExprOp = ConditionExpression::Op;
 	enum class Kind { Root, Code, Label, Goto, If, Loop, Break, Return, Set };
@@ -987,6 +1033,8 @@ public:
 			label->id = block.id;
 			labels.push_back(label);
 		}
+		// Give every natural loop one backedge before eliminating gotos. Otherwise
+		// multiple latches become nested loops that retest the same exit predicate.
 		struct Continue { uint32_t header; uint32_t after; size_t body_size; Node* label; };
 		std::vector<Continue> continues;
 		for (const auto& loop: source.natural_loops) {
@@ -1024,6 +1072,7 @@ public:
 			};
 			const auto& term = block.terminator;
 			if (term.kind == TerminatorKind::ConditionalBranch) {
+				// Capture at the semantic block, before movement can pass an SCC/EXEC write.
 				const auto condition = Expression(ExprOp::Variable, CaptureVariable(block.id));
 				add_goto(condition, term.true_block);
 				add_goto(1, term.false_block);
@@ -1116,6 +1165,7 @@ private:
 		auto& expression = m_route_expressions[label->id];
 		if (expression == UINT32_MAX) {
 			expression = Expression(ExprOp::Variable, label->id);
+			// SSA initializes route variables to false; clear them again on each label visit.
 			auto* reset = Insert(label->parent, std::next(label->position), Kind::Set);
 			reset->id = label->id;
 			reset->condition = 0;
@@ -1324,6 +1374,7 @@ private:
 				case Kind::Code: {
 					const auto& source = m_source.blocks[node->id];
 					const auto& previous = m_graph.blocks[current];
+					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
 					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
 						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
 					});
@@ -1385,6 +1436,7 @@ private:
 					Branch(header, body);
 					Place(body);
 					auto repeat = Visit(node, body, merge);
+					// A construct merge belongs to the loop body, not its continue construct.
 					if (repeat == UINT32_MAX || std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
 						    return block.terminator.merge_block == repeat;
 						})) {
@@ -1440,7 +1492,7 @@ private:
 	std::vector<uint32_t> m_order;
 };
 
-}
+} // namespace
 
 Graph BuildGraph(const Decoder::Program& program) {
 	Graph graph;
@@ -1540,6 +1592,7 @@ Graph BuildGraph(const Decoder::Program& program) {
 	};
 
 	for (auto& block: graph.blocks) {
+		block.terminator = {};
 		if (block.inst_begin == block.inst_end) {
 			block.terminator.kind = TerminatorKind::Return;
 			continue;
@@ -1621,8 +1674,17 @@ Graph BuildGraph(const Decoder::Program& program) {
 		}
 	}
 
+	for (auto& block: graph.blocks) {
+		SortUnique(block.successors);
+		for (auto succ: block.successors) {
+			AddUnique(graph.blocks[succ].predecessors, block.id);
+		}
+	}
+	for (auto& block: graph.blocks) {
+		SortUnique(block.predecessors);
+	}
 	PruneUnreachableBlocks(graph);
-	RebuildPredecessors(graph);
+	graph.code_table_load_pcs.clear();
 	bool indirect_setpc = false;
 	for (const auto& block: graph.blocks) {
 		if (block.terminator.kind != TerminatorKind::IndirectBranch) {
@@ -1642,6 +1704,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 	if (!indirect_setpc && std::ranges::any_of(program.instructions, [](const auto& inst) {
 		    return inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
 		})) {
+		// Linked leaf bodies follow the caller in native PC order. Visit them in
+		// execution order so returning to the caller does not manufacture goto loops.
 		std::vector<bool> visited(graph.blocks.size(), false);
 		std::vector<std::pair<uint32_t, bool>> pending {{graph.entry_block, false}};
 		std::vector<BasicBlock> ordered;
@@ -1693,19 +1757,8 @@ Graph Structurize(const Graph& graph) {
 	return GotoStructurizer(graph).Run();
 }
 
-bool ScalarOperandCode(const Decoder::Operand& operand, uint32_t& code) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::Sgpr: code = operand.reg; return true;
-		case Decoder::OperandKind::VccLo: code = 106u; return true;
-		case Decoder::OperandKind::VccHi: code = 107u; return true;
-		case Decoder::OperandKind::M0: code = 124u; return true;
-		case Decoder::OperandKind::ExecLo: code = 126u; return true;
-		case Decoder::OperandKind::ExecHi: code = 127u; return true;
-		default: return false;
-	}
-}
-
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uint32_t wave_size) {
+	// A vector lane mask (comparison or carry) spans wave_size / 32 SGPRs; a lane read writes one.
 	if (inst.family == Decoder::Family::VOP1 || inst.family == Decoder::Family::VOP2 ||
 	    inst.family == Decoder::Family::VOPC || inst.family == Decoder::Family::VOP3 ||
 	    inst.family == Decoder::Family::VOP3P) {
@@ -1720,9 +1773,9 @@ bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code, uin
 	return InstructionWritesScalarCode(inst, code);
 }
 
-uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
-                              uint32_t before, uint32_t code, uint32_t wave_size,
-                              std::vector<uint32_t>& crossed_calls) {
+std::optional<uint32_t> FindScalarDefinition(const Decoder::Program& program, const Graph& graph,
+                                             uint32_t before, uint32_t code, uint32_t wave_size,
+                                             std::vector<uint32_t>& crossed_calls) {
 	EXIT_IF(before >= program.instructions.size());
 	const auto found = std::ranges::find_if(graph.blocks, [before](const auto& block) {
 		return block.inst_begin <= before && before < block.inst_end;
@@ -1741,14 +1794,14 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		for (uint32_t i = point.second; i > block->inst_begin;) {
 			const auto& inst = program.instructions[--i];
 			if (inst.opcode == Opcode::S_SWAPPC_B64) {
-				if (MayWriteScalarRegister(inst, code, wave_size)) return AmbiguousScalarDefinition;
+				EXIT_NOT_IMPLEMENTED(MayWriteScalarRegister(inst, code, wave_size));
 				crossed_calls.push_back(i);
 				continue;
 			}
 			if (MayWriteScalarRegister(inst, code, wave_size)) { index = i; break; }
 		}
 		if (index != UINT32_MAX || block->id == graph.entry_block) {
-			if (definition && *definition != index) return AmbiguousScalarDefinition;
+			if (definition && *definition != index) return std::nullopt;
 			definition = index;
 			continue;
 		}
@@ -1758,7 +1811,7 @@ uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& grap
 		}
 	}
 	EXIT_IF(!definition);
-	return *definition;
+	return definition;
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
@@ -1847,4 +1900,4 @@ std::string GraphToString(const Graph& graph) {
 	return text;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::CFG

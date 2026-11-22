@@ -53,6 +53,7 @@ void copy_element(uint src, uint dst) {
 
 void main() {
 	uint group = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+	// Reject padding groups before multiplying: the active range may approach 4 GiB.
 	if (group > (info.num_texels - 1u) / 64u) {
 		return;
 	}

@@ -44,4 +44,4 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

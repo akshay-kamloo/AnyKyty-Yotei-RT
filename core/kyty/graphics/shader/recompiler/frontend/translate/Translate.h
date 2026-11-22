@@ -5,7 +5,6 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <cstdint>
-#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -35,6 +34,4 @@ struct TranslateOptions {
 IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& cfg,
                              const TranslateOptions& options);
 
-bool IsWaveLaneLocal(const Decoder::Program& program, std::string* reason = nullptr);
-
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

@@ -180,7 +180,7 @@ void DefineBvhStack(EmitterState& s) {
 	if (buffer) s.lds_base_dwords = old_base;
 }
 
-}
+} // namespace
 
 void DefineTrinityFunctions(EmitterState& s) {
 	DefineBvhStack(s);
@@ -205,4 +205,4 @@ uint32_t EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

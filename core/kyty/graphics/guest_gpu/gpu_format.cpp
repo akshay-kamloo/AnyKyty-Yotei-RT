@@ -1,11 +1,33 @@
 #include "graphics/guest_gpu/gpu_format.h"
+#include "common/shaderEnv.h"
 
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 
 namespace Libs::Graphics::Prospero {
+
+// KYTY_FIX_RT_11_11_10_FLOAT=1: logged APPROXIMATION. Packed 11_11_10 UNORM (format 30) holds
+// unsigned floats in practice; it takes the 11_11_10 FLOAT format info and host format
+// (B10G11R11_UFLOAT, as SharpEmu maps it). =0 keeps format 30 unknown.
+bool Diagnostic111110UnormAsFloat() {
+	static const bool enabled = [] {
+		// Default from Common::EnvDefaults: probably hardware behaviour (M48),
+		// exactness check open: the RDNA2 ISA format table (table 47) knows this packed layout only as FLOAT (36
+		// 10_11_11_FLOAT, 43 11_11_10_FLOAT; 30-35 and 37-42 are not listed) and Mesa maps R11G11B10_FLOAT to the same
+		// COLOR_10_11_11 / IMG 10_11_11, but no document says what format 30 itself returns; to confirm: a captured
+		// render target with values > 1.0 (refinterp). =0 turns it off.
+		const char* value = Common::ShaderEnv::Read("KYTY_FIX_RT_11_11_10_FLOAT");
+		const bool on = value != nullptr && value[0] == '1' && value[1] == '\0';
+		if (on) std::fprintf(stderr, "FIX_RT_11_11_10_FLOAT APPROXIMATION enabled: 11_11_10 UNORM as UFLOAT\n");
+		return on;
+	}();
+	return enabled;
+}
+
 namespace {
 
 struct FormatInfo {
@@ -58,8 +80,6 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32_32Float, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16UNorm, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16SNorm, 8, 0, 8, true, false},
-	{BufferFormat::k16_16_16_16UScaled, 8, 0, 0, true, false},
-	{BufferFormat::k16_16_16_16SScaled, 8, 0, 0, true, false},
 	{BufferFormat::k16_16_16_16UInt, 8, 0, 8, true, true},
 	{BufferFormat::k16_16_16_16SInt, 8, 0, 8, true, false, true},
 	{BufferFormat::k16_16_16_16Float, 8, 0, 8, true, false},
@@ -180,11 +200,14 @@ constexpr auto MakeFormatInfoLookup() {
 constexpr auto kFormatInfoLookup = MakeFormatInfoLookup();
 
 const FormatInfo* FindFormatInfo(BufferFormat format) {
+	if (format == BufferFormat::k11_11_10UNorm && Diagnostic111110UnormAsFloat()) {
+		format = BufferFormat::k11_11_10Float;
+	}
 	const auto index = static_cast<size_t>(format);
 	return index < kFormatInfoLookup.size() ? kFormatInfoLookup[index] : nullptr;
 }
 
-}
+} // namespace
 
 RenderTargetFormatEncoding ResolveRenderTargetFormat(ChannelLayout layout, ChannelType type) {
 	const auto* layout_info = FindRenderTargetLayout(layout);
@@ -227,12 +250,6 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
-bool IsSrgbFormat(BufferFormat format) {
-	return (format >= BufferFormat::k8Srgb && format <= BufferFormat::k8_8_8_8Srgb) ||
-	       format == BufferFormat::kBc1Srgb || format == BufferFormat::kBc2Srgb ||
-	       format == BufferFormat::kBc3Srgb || format == BufferFormat::kBc7Srgb;
-}
-
 TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	if (info == nullptr || !info->sampled_texture) {
@@ -248,12 +265,17 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	switch (format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
-		case BufferFormat::k16_16_16_16UScaled: return BufferFormat::k16_16_16_16UNorm;
-		case BufferFormat::k16_16_16_16SScaled: return BufferFormat::k16_16_16_16SNorm;
+		// Upstream 1905b28b3 / b4406b046 sample format 30 as packed UNorm bits (R32Uint + shader decode); with
+		// KYTY_FIX_RT_11_11_10_FLOAT (default on, M48) it is an unsigned-float texture, not remapped.
 		case BufferFormat::k11_11_10UNorm:
+			return Diagnostic111110UnormAsFloat() ? format : BufferFormat::k32UInt;
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		// 8_8 sRGB has no sampled host format on every device (not on NVIDIA): UNorm backing, the shader decodes sRGB
+		// (spirvEmitterImage.cpp UnpackImageTexel / UnpackImageGather). 8 sRGB is read through an R8_SRGB view where
+		// the device samples it (descriptors.cpp).
+		case BufferFormat::k8_8Srgb: return BufferFormat::k8_8UNorm;
 		default: return format;
 	}
 }
 
-}
+} // namespace Libs::Graphics::Prospero

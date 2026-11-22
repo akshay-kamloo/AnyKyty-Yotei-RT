@@ -59,6 +59,13 @@ constexpr int PROT_WRITE = 2;
 }
 #endif
 
+#if defined(ANYPS5_KYTY_DLL)
+namespace KytyShim {
+bool DllHostReportSetting();
+void DllReportHost(const void* properties, const void* driver, const void* memory, std::uint32_t subgroupSize, const char* shaderStorePath);
+}
+#endif
+
 namespace KytyShim {
 
 void StartRuntime();
@@ -88,9 +95,16 @@ bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
 void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
     static std::atomic<bool> printed{false};
     if (printed.exchange(true)) return;
+#if defined(ANYPS5_KYTY_DLL)
+    VkPhysicalDeviceDriverProperties driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 deviceProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driverProperties};
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(graphics.physical_device, &deviceProperties);
+    driverProperties.pNext = nullptr;
+    DllReportHost(&deviceProperties.properties, &driverProperties, &graphics.physical_device_memory_properties, graphics.subgroup_size, "");
+#else
     auto facts = AgcDriver::CollectHostFacts(AgcDriver::SystemHostSources([] {
         AgcDriver::HostShaderCacheFacts cache;
-        const auto path = Libs::Graphics::ShaderStorePath();
+        const std::filesystem::path path;
         if (path.empty()) return cache;
         cache.enabled = true;
         cache.present = std::filesystem::is_regular_file(path);
@@ -104,6 +118,7 @@ void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
     const auto text = AgcDriver::FormatHostReport(facts) + '\n';
     std::fputs(text.c_str(), stderr);
     std::fflush(stderr);
+#endif
 }
 
 }
@@ -116,7 +131,11 @@ using KytyShim::Entry::g_renderer;
 
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
+#if defined(ANYPS5_KYTY_DLL)
+    const bool hostReport = KytyShim::DllHostReportSetting();
+#else
     const bool hostReport = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT"));
+#endif
     KytyShim::InstallFaultChain();
     GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
     const auto width = Config::GetScreenWidth();
@@ -305,7 +324,7 @@ std::uint32_t* AcquireFlipSlot() {
 
 void SubmitWords(Libs::Graphics::GuestGpu& gpu, std::span<const std::uint32_t> commands, std::uint32_t queue) {
     if (commands.empty()) return;
-    if (queue == 0) gpu.Submit(commands);
+    if (queue == 0) gpu.Submit(commands, {});
     else gpu.SubmitCompute(queue, commands);
 }
 
@@ -313,7 +332,7 @@ void SubmitFlipPacket(Libs::Graphics::GuestGpu& gpu, const AgcDriver::FlipInfo& 
     auto* words = AcquireFlipSlot();
     const auto packet = EncodeFlipPacket(info);
     std::copy(packet.begin(), packet.end(), words);
-    gpu.Submit(std::span<const std::uint32_t>(words, packet.size()));
+    gpu.Submit(std::span<const std::uint32_t>(words, packet.size()), {});
 }
 
 void RequireOutput(std::uint32_t handle, const char* reason) {
@@ -358,8 +377,7 @@ void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
         begin = points[i].end;
     }
     SubmitWords(gpu, commands.subspan(begin), queue);
-    if (queue == 0 && (!points.empty() || HasFlipPacket(commands))) gpu.NoteFrameSubmitted();
-    KytyShim::Replay::NoteSubmission(gpu, queue);
+        KytyShim::Replay::NoteSubmission(gpu, queue);
 }
 
 }
@@ -626,9 +644,8 @@ extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address,
 }
 
 extern "C" void AgcDriverNoteCommandSegment_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    if (auto* renderer = KytyShim::Entry::state().renderer.load(std::memory_order_acquire)) {
-        renderer->GetBufferCache().NoteCommandSegment(address, bytes);
-    }
+    static_cast<void>(address);
+    static_cast<void>(bytes);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {

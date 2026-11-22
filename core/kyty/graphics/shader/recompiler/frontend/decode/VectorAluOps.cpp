@@ -7,13 +7,17 @@ namespace {
 
 using Detail::OpcodeMap;
 
+// These profiles describe the selectors that the current translator implements. They are not
+// architectural SDWA legality classes.
 enum class Vop2SdwaProfile {
 	None,
 	Float32,
 	Float16,
 	PackedFloat16,
+	IntegerFullDestination,
 	IntegerPartialDestination,
 	ReverseRightShift,
+	Bitwise,
 	Count,
 };
 
@@ -36,20 +40,20 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x0cu, Opcode::V_MUL_HI_U32_U24, Vop2SdwaProfile::IntegerPartialDestination},
     {0x0fu, Opcode::V_MIN_F32},
     {0x10u, Opcode::V_MAX_F32},
-    {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x12u, Opcode::V_MAX_I32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x11u, Opcode::V_MIN_I32, Vop2SdwaProfile::IntegerFullDestination},
+    {0x12u, Opcode::V_MAX_I32, Vop2SdwaProfile::IntegerFullDestination},
     {0x13u, Opcode::V_MIN_U32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerFullDestination},
     {0x15u, Opcode::V_LSHR_B32},
     {0x16u, Opcode::V_LSHRREV_B32, Vop2SdwaProfile::ReverseRightShift},
     {0x17u, Opcode::V_ASHR_I32},
     {0x18u, Opcode::V_ASHRREV_I32, Vop2SdwaProfile::ReverseRightShift},
     {0x19u, Opcode::V_LSHL_B32},
     {0x1au, Opcode::V_LSHLREV_B32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x1bu, Opcode::V_AND_B32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x1cu, Opcode::V_OR_B32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x1du, Opcode::V_XOR_B32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x1eu, Opcode::V_XNOR_B32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x1bu, Opcode::V_AND_B32, Vop2SdwaProfile::Bitwise},
+    {0x1cu, Opcode::V_OR_B32, Vop2SdwaProfile::Bitwise},
+    {0x1du, Opcode::V_XOR_B32, Vop2SdwaProfile::Bitwise},
+    {0x1eu, Opcode::V_XNOR_B32, Vop2SdwaProfile::Bitwise},
     {0x1fu, Opcode::V_MAC_F32},
     {0x20u, Opcode::V_MADMK_F32},
     {0x21u, Opcode::V_MADAK_F32},
@@ -57,11 +61,11 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x23u, Opcode::V_MBCNT_LO_U32_B32},
     {0x24u, Opcode::V_MBCNT_HI_U32_B32},
     {0x25u, Opcode::V_ADD_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x28u, Opcode::V_ADDC_U32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x28u, Opcode::V_ADDC_U32, Vop2SdwaProfile::IntegerFullDestination},
     {0x29u, Opcode::V_SUB_CO_CI_U32},
     {0x2au, Opcode::V_SUBREV_CO_CI_U32},
     {0x26u, Opcode::V_SUB_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
-    {0x27u, Opcode::V_SUBREV_NC_U32, Vop2SdwaProfile::IntegerPartialDestination},
+    {0x27u, Opcode::V_SUBREV_NC_U32, Vop2SdwaProfile::IntegerFullDestination},
     {0x2bu, Opcode::V_FMAC_F32},
     {0x2cu, Opcode::V_FMAMK_F32},
     {0x2du, Opcode::V_FMAAK_F32},
@@ -147,6 +151,74 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
 };
 
 constexpr auto VOP1_OPS = Detail::MakeOpcodeTable<0x100>(VOP1_OPCODE_LIST);
+
+constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
+    {0x00u, Opcode::V_NOP},
+    {0x01u, Opcode::V_MOV_B32},
+    {0x02u, Opcode::V_READFIRSTLANE_B32},
+    {0x04u, Opcode::V_CVT_F64_I32},
+    {0x0fu, Opcode::V_CVT_F32_F64},
+    {0x10u, Opcode::V_CVT_F64_F32},
+    {0x11u, Opcode::V_CVT_F32_UBYTE0},
+    {0x12u, Opcode::V_CVT_F32_UBYTE1},
+    {0x13u, Opcode::V_CVT_F32_UBYTE2},
+    {0x14u, Opcode::V_CVT_F32_UBYTE3},
+    {0x16u, Opcode::V_CVT_F64_U32},
+    {0x17u, Opcode::V_TRUNC_F64},
+    {0x18u, Opcode::V_CEIL_F64},
+    {0x1au, Opcode::V_FLOOR_F64},
+    {0x2fu, Opcode::V_RCP_F64},
+    {0x05u, Opcode::V_CVT_F32_I32},
+    {0x06u, Opcode::V_CVT_F32_U32},
+    {0x07u, Opcode::V_CVT_U32_F32},
+    {0x08u, Opcode::V_CVT_I32_F32},
+    {0x0au, Opcode::V_CVT_F16_F32},
+    {0x0bu, Opcode::V_CVT_F32_F16},
+    {0x0cu, Opcode::V_CVT_RPI_I32_F32},
+    {0x0du, Opcode::V_CVT_FLR_I32_F32},
+    {0x0eu, Opcode::V_CVT_OFF_F32_I4},
+    {0x2au, Opcode::V_RCP_F32},
+    {0x20u, Opcode::V_FRACT_F32},
+    {0x21u, Opcode::V_TRUNC_F32},
+    {0x22u, Opcode::V_CEIL_F32},
+    {0x23u, Opcode::V_RNDNE_F32},
+    {0x24u, Opcode::V_FLOOR_F32},
+    {0x25u, Opcode::V_EXP_F32},
+    {0x27u, Opcode::V_LOG_F32},
+    {0x2bu, Opcode::V_RCP_IFLAG_F32},
+    {0x2eu, Opcode::V_RSQ_F32},
+    {0x33u, Opcode::V_SQRT_F32},
+    {0x35u, Opcode::V_SIN_F32},
+    {0x36u, Opcode::V_COS_F32},
+    {0x37u, Opcode::V_NOT_B32},
+    {0x38u, Opcode::V_BFREV_B32},
+    {0x39u, Opcode::V_FFBH_U32},
+    {0x3au, Opcode::V_FFBL_B32},
+    {0x3bu, Opcode::V_FFBH_I32},
+    {0x3eu, Opcode::V_FRACT_F64},
+    {0x3fu, Opcode::V_FREXP_EXP_I32_F32},
+    {0x40u, Opcode::V_FREXP_MANT_F32},
+    {0x42u, Opcode::V_MOVRELD_B32},
+    {0x43u, Opcode::V_MOVRELS_B32},
+    {0x50u, Opcode::V_CVT_F16_U16},
+    {0x51u, Opcode::V_CVT_F16_I16},
+    {0x52u, Opcode::V_CVT_U16_F16},
+    {0x53u, Opcode::V_CVT_I16_F16},
+    {0x54u, Opcode::V_RCP_F16},
+    {0x55u, Opcode::V_SQRT_F16},
+    {0x56u, Opcode::V_RSQ_F16},
+    {0x57u, Opcode::V_LOG_F16},
+    {0x58u, Opcode::V_EXP_F16},
+    {0x5bu, Opcode::V_FLOOR_F16},
+    {0x5cu, Opcode::V_CEIL_F16},
+    {0x5du, Opcode::V_TRUNC_F16},
+    {0x5eu, Opcode::V_RNDNE_F16},
+    {0x5fu, Opcode::V_FRACT_F16},
+    {0x60u, Opcode::V_SIN_F16},
+    {0x61u, Opcode::V_COS_F16},
+};
+
+constexpr auto VOP3_ENCODED_VOP1_OPS = Detail::MakeOpcodeTable<0x80>(VOP3_ENCODED_VOP1_OPCODE_LIST);
 
 struct VopcOpcodeInfo {
 	uint32_t encoding     = 0;
@@ -234,8 +306,8 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xf7u, Opcode::V_CMPX_T_U64, false},  {0xc9u, Opcode::V_CMP_LT_F16},
     {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
     {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
-    {0xceu, Opcode::V_CMP_GE_F16},         {0xe8u, Opcode::V_CMP_U_F16},
-    {0xe9u, Opcode::V_CMP_NGE_F16},        {0xebu, Opcode::V_CMP_NGT_F16},
+    {0xceu, Opcode::V_CMP_GE_F16},         {0xe9u, Opcode::V_CMP_NGE_F16},
+    {0xebu, Opcode::V_CMP_NGT_F16},
     {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
@@ -284,7 +356,6 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x358u, Opcode::V_MED3_I16},
     {0x359u, Opcode::V_MED3_U16},
     {0x15du, Opcode::V_SAD_U32},
-    {0x171u, Opcode::V_MSAD_U8},
     {0x15eu, Opcode::V_CVT_PK_U8_F32},
     {0x178u, Opcode::V_XOR3_B32},
     {0x12fu, Opcode::V_CVT_PKRTZ_F16_F32},
@@ -312,7 +383,6 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x314u, Opcode::V_LSHLREV_B16},
     {0x319u, Opcode::V_SUBREV_I32},
     {0x340u, Opcode::V_MAD_U16},
-    {0x344u, Opcode::V_PERM_B32},
     {0x345u, Opcode::V_XAD_U32},
     {0x346u, Opcode::V_LSHL_ADD_U32},
     {0x347u, Opcode::V_ADD_LSHL_U32},
@@ -367,6 +437,26 @@ bool IsUnsupportedVop3EncodedVop2Alias(uint32_t opcode) {
 	       opcode == 0x3au;
 }
 
+Opcode LookupVop3Opcode(uint32_t opcode) {
+	const auto direct = Detail::LookupOpcode(VOP3_OPS, opcode);
+	if (direct != Opcode::UNSUPPORTED) {
+		return direct;
+	}
+	if (opcode <= 0xffu) {
+		return Detail::LookupOpcode(VOPC_OPS, opcode);
+	}
+	if (opcode >= 0x100u && opcode <= 0x13fu) {
+		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
+			return Opcode::UNSUPPORTED;
+		}
+		return Detail::LookupOpcode(VOP2_OPS, opcode - 0x100u);
+	}
+	if (opcode >= 0x180u && opcode <= 0x1ffu) {
+		return Detail::LookupOpcode(VOP3_ENCODED_VOP1_OPS, opcode - 0x180u);
+	}
+	return Opcode::UNSUPPORTED;
+}
+
 bool IsVop3EncodedVopc(uint32_t opcode) {
 	return opcode <= 0xffu;
 }
@@ -377,26 +467,6 @@ bool IsVop3EncodedVop2(uint32_t opcode) {
 
 bool IsVop3EncodedVop1(uint32_t opcode) {
 	return opcode >= 0x180u && opcode <= 0x1ffu;
-}
-
-Opcode LookupVop3Opcode(uint32_t opcode) {
-	const auto direct = Detail::LookupOpcode(VOP3_OPS, opcode);
-	if (direct != Opcode::UNSUPPORTED) {
-		return direct;
-	}
-	if (IsVop3EncodedVopc(opcode)) {
-		return Detail::LookupOpcode(VOPC_OPS, opcode);
-	}
-	if (IsVop3EncodedVop2(opcode)) {
-		if (IsUnsupportedVop3EncodedVop2Alias(opcode - 0x100u)) {
-			return Opcode::UNSUPPORTED;
-		}
-		return Detail::LookupOpcode(VOP2_OPS, opcode - 0x100u);
-	}
-	if (IsVop3EncodedVop1(opcode)) {
-		return Detail::LookupOpcode(VOP1_OPS, opcode - 0x180u);
-	}
-	return Opcode::UNSUPPORTED;
 }
 
 Opcode LookupVintrpOpcode(uint32_t opcode) {
@@ -545,6 +615,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    // The source field extract and the destination insert are independent (Translate.cpp), so a
+    // partial destination may combine with any source selector.
     {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_BFREV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
@@ -557,8 +629,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_U16_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
-    {Opcode::V_CVT_F16_I16, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
-     SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_CVT_F16_I16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
+     SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_I16_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_RCP_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
@@ -679,21 +751,19 @@ bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
 	return true;
 }
 
-void DecodeSdwaSource(uint32_t code, uint32_t fields, uint32_t pc, Operand& operand) {
-	DecodeScalarSource(code + ((fields & 0x80u) == 0u ? 256u : 0u), pc, operand);
-	operand.sdwa_sel  = fields & 0x7u;
-	operand.sdwa_sext = (fields & 0x8u) != 0u;
-	operand.negate    = (fields & 0x10u) != 0u;
-	operand.absolute  = (fields & 0x20u) != 0u;
-}
-
 void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vdst, Instruction& inst) {
-	const auto modifier = code[word_index + 1u];
-	const auto dst_sel  = (modifier >> 8u) & 0x7u;
-	const auto dst_u    = (modifier >> 11u) & 0x3u;
-	const auto clamp    = (modifier >> 13u) & 0x1u;
-	const auto omod     = (modifier >> 14u) & 0x3u;
+	const auto modifier  = code[word_index + 1u];
+	const auto src0      = modifier & 0xffu;
+	const auto dst_sel   = (modifier >> 8u) & 0x7u;
+	const auto dst_u     = (modifier >> 11u) & 0x3u;
+	const auto clamp     = (modifier >> 13u) & 0x1u;
+	const auto omod      = (modifier >> 14u) & 0x3u;
+	const auto src0_sel  = (modifier >> 16u) & 0x7u;
+	const auto src0_sext = (modifier >> 19u) & 0x1u;
+	const auto src0_neg  = (modifier >> 20u) & 0x1u;
+	const auto src0_abs  = (modifier >> 21u) & 0x1u;
+	const auto s0        = (modifier >> 23u) & 0x1u;
 
 	SetRawWords(inst, code, word_index, 2);
 	if (!ValidateVop1Sdwa(inst, opcode, modifier)) {
@@ -706,12 +776,16 @@ void DecodeVop1Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	} else {
 		DecodeVectorGpr(vdst, inst.dst);
 	}
-	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
+	DecodeScalarSource(src0 + (s0 == 0u ? 256u : 0u), pc, inst.src0);
 	inst.dst.sdwa_sel          = dst_sel;
 	inst.dst.sdwa_dst_unused   = dst_u;
 	inst.dst.explicit_sdwa_dst = true;
 	inst.dst.clamp             = clamp != 0u;
 	inst.dst.omod              = omod;
+	inst.src0.sdwa_sel         = src0_sel;
+	inst.src0.sdwa_sext        = src0_sext != 0u;
+	inst.src0.negate           = src0_neg != 0u;
+	inst.src0.absolute         = src0_abs != 0u;
 	inst.src_count             = 1;
 	ReadLiteralOperands(code, word_index, inst);
 }
@@ -903,7 +977,6 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMP_GT_F16:
 		case Opcode::V_CMP_LG_F16:
 		case Opcode::V_CMP_GE_F16:
-		case Opcode::V_CMP_U_F16:
 		case Opcode::V_CMP_NGE_F16:
 		case Opcode::V_CMP_NGT_F16:
 		case Opcode::V_CMP_NEQ_F16:
@@ -926,30 +999,40 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 }
 
 struct Vop2SdwaFields {
-	uint32_t dst_sel  = 6;
-	uint32_t dst_u    = 0;
-	uint32_t clamp    = 0;
-	uint32_t omod     = 0;
-	uint32_t src0_sel = 6;
-	uint32_t src0_neg = 0;
-	uint32_t src0_abs = 0;
-	uint32_t src1_sel = 6;
-	uint32_t src1_neg = 0;
-	uint32_t src1_abs = 0;
+	uint32_t src0      = 0;
+	uint32_t dst_sel   = 6;
+	uint32_t dst_u     = 0;
+	uint32_t clamp     = 0;
+	uint32_t omod      = 0;
+	uint32_t src0_sel  = 6;
+	uint32_t src0_sext = 0;
+	uint32_t src0_neg  = 0;
+	uint32_t src0_abs  = 0;
+	uint32_t s0        = 0;
+	uint32_t src1_sel  = 6;
+	uint32_t src1_sext = 0;
+	uint32_t src1_neg  = 0;
+	uint32_t src1_abs  = 0;
+	uint32_t s1        = 0;
 };
 
 Vop2SdwaFields DecodeVop2SdwaFields(uint32_t modifier) {
 	Vop2SdwaFields fields;
-	fields.dst_sel  = (modifier >> 8u) & 0x7u;
-	fields.dst_u    = (modifier >> 11u) & 0x3u;
-	fields.clamp    = (modifier >> 13u) & 0x1u;
-	fields.omod     = (modifier >> 14u) & 0x3u;
-	fields.src0_sel = (modifier >> 16u) & 0x7u;
-	fields.src0_neg = (modifier >> 20u) & 0x1u;
-	fields.src0_abs = (modifier >> 21u) & 0x1u;
-	fields.src1_sel = (modifier >> 24u) & 0x7u;
-	fields.src1_neg = (modifier >> 28u) & 0x1u;
-	fields.src1_abs = (modifier >> 29u) & 0x1u;
+	fields.src0      = modifier & 0xffu;
+	fields.dst_sel   = (modifier >> 8u) & 0x7u;
+	fields.dst_u     = (modifier >> 11u) & 0x3u;
+	fields.clamp     = (modifier >> 13u) & 0x1u;
+	fields.omod      = (modifier >> 14u) & 0x3u;
+	fields.src0_sel  = (modifier >> 16u) & 0x7u;
+	fields.src0_sext = (modifier >> 19u) & 0x1u;
+	fields.src0_neg  = (modifier >> 20u) & 0x1u;
+	fields.src0_abs  = (modifier >> 21u) & 0x1u;
+	fields.s0        = (modifier >> 23u) & 0x1u;
+	fields.src1_sel  = (modifier >> 24u) & 0x7u;
+	fields.src1_sext = (modifier >> 27u) & 0x1u;
+	fields.src1_neg  = (modifier >> 28u) & 0x1u;
+	fields.src1_abs  = (modifier >> 29u) & 0x1u;
+	fields.s1        = (modifier >> 31u) & 0x1u;
 	return fields;
 }
 
@@ -971,8 +1054,11 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(), SdwaSelWords() | SdwaSelFull(),
      true, true},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, true},
+    {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
+    // Bitwise: WriteRawU32 inserts a byte or word destination like any other partial write.
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
               static_cast<size_t>(Vop2SdwaProfile::Count));
@@ -1073,6 +1159,7 @@ void FinalizeVop2Instruction(std::span<const uint32_t> code, uint32_t word_index
 			inst.src_count = 3;
 			break;
 		case Opcode::V_PK_FMAC_F16:
+			// VOP2 has no OP_SEL fields, so the high operation implicitly reads high halves.
 			inst.src0.op_sel_hi = true;
 			inst.src1.op_sel_hi = true;
 			inst.dst.op_sel_hi  = true;
@@ -1093,13 +1180,21 @@ void DecodeVop2Sdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
-	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
-	DecodeSdwaSource(vsrc1, modifier >> 24u, pc, inst.src1);
+	DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0);
+	DecodeScalarSource(vsrc1 + (fields.s1 == 0u ? 256u : 0u), pc, inst.src1);
 	inst.dst.sdwa_sel          = fields.dst_sel;
 	inst.dst.sdwa_dst_unused   = fields.dst_u;
 	inst.dst.explicit_sdwa_dst = true;
 	inst.dst.clamp             = fields.clamp != 0u;
 	inst.dst.omod              = fields.omod;
+	inst.src0.sdwa_sel         = fields.src0_sel;
+	inst.src0.sdwa_sext        = fields.src0_sext != 0u;
+	inst.src0.negate           = fields.src0_neg != 0u;
+	inst.src0.absolute         = fields.src0_abs != 0u;
+	inst.src1.sdwa_sel         = fields.src1_sel;
+	inst.src1.sdwa_sext        = fields.src1_sext != 0u;
+	inst.src1.negate           = fields.src1_neg != 0u;
+	inst.src1.absolute         = fields.src1_abs != 0u;
 	FinalizeVop2Instruction(code, word_index, inst);
 }
 
@@ -1132,7 +1227,42 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	FinalizeVop2Instruction(code, word_index, inst);
 }
 
+struct VopcSdwaFields {
+	uint32_t src0      = 0;
+	uint32_t sdst      = 0;
+	uint32_t sd        = 0;
+	uint32_t src0_sel  = 6;
+	uint32_t src0_sext = 0;
+	uint32_t src0_neg  = 0;
+	uint32_t src0_abs  = 0;
+	uint32_t s0        = 0;
+	uint32_t src1_sel  = 6;
+	uint32_t src1_sext = 0;
+	uint32_t src1_neg  = 0;
+	uint32_t src1_abs  = 0;
+	uint32_t s1        = 0;
+};
+
+VopcSdwaFields DecodeVopcSdwaFields(uint32_t modifier) {
+	VopcSdwaFields fields;
+	fields.src0      = modifier & 0xffu;
+	fields.sdst      = (modifier >> 8u) & 0x7fu;
+	fields.sd        = (modifier >> 15u) & 0x1u;
+	fields.src0_sel  = (modifier >> 16u) & 0x7u;
+	fields.src0_sext = (modifier >> 19u) & 0x1u;
+	fields.src0_neg  = (modifier >> 20u) & 0x1u;
+	fields.src0_abs  = (modifier >> 21u) & 0x1u;
+	fields.s0        = (modifier >> 23u) & 0x1u;
+	fields.src1_sel  = (modifier >> 24u) & 0x7u;
+	fields.src1_sext = (modifier >> 27u) & 0x1u;
+	fields.src1_neg  = (modifier >> 28u) & 0x1u;
+	fields.src1_abs  = (modifier >> 29u) & 0x1u;
+	fields.s1        = (modifier >> 31u) & 0x1u;
+	return fields;
+}
+
 bool SupportsVopcSdwa(Opcode opcode) {
+	// SDWA operand handling is not implemented for 64-bit compares.
 	return opcode != Opcode::UNSUPPORTED &&
 	       (opcode < Opcode::V_CMP_F_F64 || opcode > Opcode::V_CMPX_TRU_F64) &&
 	       (opcode < Opcode::V_CMP_F_I64 || opcode > Opcode::V_CMPX_T_U64);
@@ -1141,8 +1271,9 @@ bool SupportsVopcSdwa(Opcode opcode) {
 void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                     uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
 	const auto modifier = code[word_index + 1u];
+	const auto fields   = DecodeVopcSdwaFields(modifier);
 	SetRawWords(inst, code, word_index, 2);
-	if (((modifier >> 16u) & 0x7u) > 6u || ((modifier >> 24u) & 0x7u) > 6u) {
+	if (fields.src0_sel > 6u || fields.src1_sel > 6u) {
 		SetUnsupported(inst, Family::VOPC, opcode, "VOPC SDWA selector is invalid");
 		return;
 	}
@@ -1152,16 +1283,24 @@ void DecodeVopcSdwa(uint32_t pc, std::span<const uint32_t> code, uint32_t word_i
 		return;
 	}
 
-	DecodeSdwaSource(modifier & 0xffu, modifier >> 16u, pc, inst.src0);
-	DecodeSdwaSource(vsrc1, modifier >> 24u, pc, inst.src1);
+	DecodeScalarSource(fields.src0 + (fields.s0 == 0u ? 256u : 0u), pc, inst.src0);
+	DecodeScalarSource(vsrc1 + (fields.s1 == 0u ? 256u : 0u), pc, inst.src1);
 	if (IsVopcCompareExec(inst.opcode)) {
 		inst.dst.kind = OperandKind::ExecLo;
-	} else if ((modifier & 0x8000u) == 0u) {
+	} else if (fields.sd == 0u) {
 		inst.dst.kind = OperandKind::VccLo;
 	} else {
-		DecodeScalarDestination((modifier >> 8u) & 0x7fu, pc, inst.dst);
+		DecodeScalarDestination(fields.sdst, pc, inst.dst);
 	}
-	inst.src_count = 2;
+	inst.src0.sdwa_sel  = fields.src0_sel;
+	inst.src0.sdwa_sext = fields.src0_sext != 0u;
+	inst.src0.negate    = fields.src0_neg != 0u;
+	inst.src0.absolute  = fields.src0_abs != 0u;
+	inst.src1.sdwa_sel  = fields.src1_sel;
+	inst.src1.sdwa_sext = fields.src1_sext != 0u;
+	inst.src1.negate    = fields.src1_neg != 0u;
+	inst.src1.absolute  = fields.src1_abs != 0u;
+	inst.src_count      = 2;
 	ReadLiteralOperands(code, word_index, inst);
 }
 
@@ -1284,6 +1423,7 @@ void ApplyVop3pSourceModifiers(Instruction& inst, uint32_t op_sel, uint32_t op_s
 void ApplyVop3pMixAbsModifiers(Instruction& inst) {
 	Operand* sources[] = {&inst.src0, &inst.src1, &inst.src2};
 	for (auto* source: sources) {
+		// RDNA2 MIX opcodes reuse the VOP3P NEG_HI bits as source absolute modifiers.
 		source->absolute  = source->negate_hi;
 		source->negate_hi = false;
 	}
@@ -1420,6 +1560,7 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return clamp != 0u || omod != 0u;
 	}
 	if (IsNativeVop3F16TernaryOpcode(opcode)) {
+		// Clamp is applied by WriteF16 for every f16 ternary; omod only for V_FMA_F16.
 		return opcode != Opcode::V_FMA_F16 && omod != 0u;
 	}
 	if (IsNativeVop3B16TernaryOpcode(opcode)) {
@@ -1434,12 +1575,14 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	switch (opcode) {
 		case Opcode::V_MUL_HI_I32_I24:
 		case Opcode::V_MUL_HI_U32_U24:
+			// The high product fits in 32 bits, so clamp has no effect.
 			return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
 		case Opcode::V_CVT_F32_UBYTE0:
 		case Opcode::V_CVT_F32_UBYTE1:
 		case Opcode::V_CVT_F32_UBYTE2:
 		case Opcode::V_CVT_F32_UBYTE3:
+			// Byte conversions ignore input modifiers and support all output modifiers.
 			return op_sel != 0u;
 		case Opcode::V_INTERP_P1LL_F16:
 		case Opcode::V_INTERP_P2_F16:
@@ -1555,6 +1698,7 @@ bool IsVopcCompareExec(Opcode opcode) {
 	}
 }
 
+// VINTRP and VOP3 interpolation share one layout: src0 = I/J VGPR, src1 = attr, src2 = chan.
 void SetInterpolationAttribute(Instruction& inst, uint32_t attr, uint32_t chan) {
 	inst.src1.kind       = OperandKind::IntegerInlineConstant;
 	inst.src1.value      = attr;
@@ -1565,7 +1709,7 @@ void SetInterpolationAttribute(Instruction& inst, uint32_t attr, uint32_t chan) 
 	inst.src_count       = 3;
 }
 
-}
+} // namespace
 
 void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
@@ -1732,6 +1876,7 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	if (inst.opcode == Opcode::V_INTERP_P1LL_F16 || inst.opcode == Opcode::V_INTERP_P2_F16) {
+		// SRC0 packs {attr_word, attr_chan, attr}; attr_word selects the high f16 of the dword.
 		DecodeVectorGpr(vdst, inst.dst);
 		DecodeScalarSource(src1, pc, inst.src0);
 		SetInterpolationAttribute(inst, src0 & 0x3fu, (src0 >> 6u) & 0x3u);
@@ -1742,6 +1887,7 @@ void DecodeVop3(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (compare_exec) {
 		inst.dst.kind = OperandKind::ExecLo;
 	} else if (scalar_dst) {
+		// VOP3A uses VDST for VOPC and the scalar-destination lane-read opcodes.
 		DecodeScalarDestination(vdst, pc, inst.dst);
 	} else {
 		DecodeVectorGpr(vdst, inst.dst);
@@ -1915,4 +2061,4 @@ void DecodeVintrp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_ind
 	SetInterpolationAttribute(inst, attr, chan);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

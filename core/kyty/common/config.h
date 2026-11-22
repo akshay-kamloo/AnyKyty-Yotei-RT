@@ -7,9 +7,16 @@
 #define KYTY_COMPILER_GCC   1
 #define KYTY_COMPILER_CLANG 2
 
+#define KYTY_LINKER_LD       1
+#define KYTY_LINKER_LLD      2
+#define KYTY_LINKER_LLD_LINK 3
+
 #define KYTY_BUILD_DEBUG   1
 #define KYTY_BUILD_RELEASE 2
 
+#define KYTY_ENDIAN_BIG    1
+#define KYTY_ENDIAN_LITTLE 2
+
 #include "cmake_config.h"
 
-#endif
+#endif /* KYTY_COMMON_CONFIG_H_ */

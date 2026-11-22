@@ -1,12 +1,10 @@
 #include "common/hostException.h"
 
-#include "common/guardedCopy.h"
-
 #include <atomic>
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <windows.h>
+#include <windows.h> // IWYU pragma: keep
 #else
 #include <algorithm>
 #include <csignal>
@@ -16,17 +14,30 @@
 #if defined(__APPLE__)
 #include <sys/ucontext.h>
 #else
-#include <ucontext.h>
+#include <ucontext.h> // IWYU pragma: keep
 #endif
 #endif
+
+// IWYU pragma: no_include <errhandlingapi.h>
+// IWYU pragma: no_include <excpt.h>
+// IWYU pragma: no_include <minwinbase.h>
+// IWYU pragma: no_include <minwindef.h>
+// IWYU pragma: no_include <wtypes.h>
 
 namespace Common::HostException {
 
+#if !defined(__APPLE__)
+
 static std::atomic<Handler> g_handler {nullptr};
+static std::atomic_uint32_t g_install_state {0};
+
 static_assert(decltype(g_handler)::is_always_lock_free);
+static_assert(decltype(g_install_state)::is_always_lock_free);
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 
+// macOS uses the same POSIX platform setting and needs a signal stack too.
 class ThreadSignalStack {
 public:
 	ThreadSignalStack() {
@@ -62,36 +73,44 @@ private:
 };
 
 bool InitializeThreadSignalStack() {
+	// Keep fault handling off guest stacks, which GPU tracking can make read-only.
 	thread_local ThreadSignalStack signal_stack;
 	return signal_stack.IsInitialized();
-}
-
-int GuestSignalDispatchSignal() {
-#if defined(__APPLE__)
-	return SIGUSR1;
-#else
-	return SIGRTMIN + 3;
-#endif
 }
 
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
+static thread_local bool t_pass_access_violations = false;
+
+void PassAccessViolations(bool pass) {
+	t_pass_access_violations = pass;
+}
+
 static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
-	if (exception_record->ExceptionCode == 0x406D1388) {
-		return EXCEPTION_CONTINUE_EXECUTION;
+	if (t_pass_access_violations && exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+		return EXCEPTION_CONTINUE_SEARCH; // the thread's own __except handles it (PassAccessViolations)
 	}
 
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && ResumeGuardedCopy(exception->ContextRecord)) {
+	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
+	    exception_record->ExceptionCode == DBG_PRINTEXCEPTION_WIDE_C) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	if (exception_record->ExceptionCode == 0x406D1388) {
+		// Set a thread name.
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 
 	ExceptionInfo info {};
-	const bool guard_page = exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
-	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || guard_page) {
+	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
+	info.native_code       = exception_record->ExceptionCode;
+	info.native_context    = exception->ContextRecord;
+
+	if (exception_record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
 		info.type = ExceptionType::AccessViolation;
 		switch (exception_record->ExceptionInformation[0]) {
 			case 0: info.access_violation_type = AccessViolationType::Read; break;
@@ -103,133 +122,276 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
+		// Diagnostic: name the faulting instruction of a fatal arithmetic exception.
+		// Also guard-page violations (0x80000001) and stack overflows: until now the process died
+		// with no trace. The fault address and the thread's stack range tell a stack overflow on a
+		// thread whose stack the system does not grow apart from a read of another thread's stack.
+		if (exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION ||
+		    exception_record->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
+			ULONG_PTR low = 0, high = 0;
+			GetCurrentThreadStackLimits(&low, &high);
+			fprintf(stderr,
+			        "HOST_EXCEPTION_STACK code=0x%08lx rip=0x%016llx rsp=0x%016llx access=%llu addr=0x%016llx "
+			        "thread=%lu stack=[0x%016llx,0x%016llx)\n",
+			        static_cast<unsigned long>(exception_record->ExceptionCode),
+			        static_cast<unsigned long long>(exception->ContextRecord->Rip),
+			        static_cast<unsigned long long>(exception->ContextRecord->Rsp),
+			        static_cast<unsigned long long>(exception_record->NumberParameters > 0
+			                                            ? exception_record->ExceptionInformation[0]
+			                                            : 0),
+			        static_cast<unsigned long long>(exception_record->NumberParameters > 1
+			                                            ? exception_record->ExceptionInformation[1]
+			                                            : 0),
+			        GetCurrentThreadId(), static_cast<unsigned long long>(low),
+			        static_cast<unsigned long long>(high));
+			// Return addresses on the stack inside the emulator executable (resolve with the link map:
+			// scripts/resolve-perf.py), so the caller of the faulting library routine can be named.
+			const auto exe  = reinterpret_cast<uint64_t>(GetModuleHandleA(nullptr));
+			const auto* rsp = reinterpret_cast<const uint64_t*>(exception->ContextRecord->Rsp);
+			fprintf(stderr, "HOST_EXCEPTION_FRAMES exe_base=0x%016llx", static_cast<unsigned long long>(exe));
+			int found = 0;
+			for (int k = 0; k < 512 && found < 24; k++) {
+				const auto address = reinterpret_cast<uint64_t>(rsp + k);
+				if (address + 8u > high) break;
+				const auto value = rsp[k];
+				if (value > exe && value < exe + 0x10000000ull) {
+					fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(value - exe));
+					found++;
+				}
+			}
+			fprintf(stderr, "\n");
+			fflush(stderr);
+		}
+		if (exception_record->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+		    exception_record->ExceptionCode == EXCEPTION_INT_OVERFLOW ||
+		    exception_record->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+			const auto* c = exception->ContextRecord;
+			HMODULE     module = nullptr;
+			char        name[MAX_PATH] = "guest";
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       static_cast<LPCSTR>(exception_record->ExceptionAddress), &module) &&
+			    module != nullptr) {
+				GetModuleFileNameA(module, name, MAX_PATH);
+			}
+			fprintf(stderr,
+			        "HOST_EXCEPTION code=0x%08lx rip=0x%016llx module=%s base=0x%llx rax=0x%llx rcx=0x%llx "
+			        "rdx=0x%llx rbx=0x%llx rsi=0x%llx rdi=0x%llx rbp=0x%llx rsp=0x%llx r8=0x%llx r9=0x%llx "
+			        "r14=0x%llx\n",
+			        static_cast<unsigned long>(exception_record->ExceptionCode),
+			        static_cast<unsigned long long>(c->Rip), name,
+			        reinterpret_cast<unsigned long long>(module), static_cast<unsigned long long>(c->Rax),
+			        static_cast<unsigned long long>(c->Rcx), static_cast<unsigned long long>(c->Rdx),
+			        static_cast<unsigned long long>(c->Rbx), static_cast<unsigned long long>(c->Rsi),
+			        static_cast<unsigned long long>(c->Rdi), static_cast<unsigned long long>(c->Rbp),
+			        static_cast<unsigned long long>(c->Rsp), static_cast<unsigned long long>(c->R8),
+			        static_cast<unsigned long long>(c->R9), static_cast<unsigned long long>(c->R14));
+			fflush(stderr);
+		}
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
-	info.exception_address = reinterpret_cast<uint64_t>(exception_record->ExceptionAddress);
-	info.native_code       = exception_record->ExceptionCode;
-	info.native_context    = exception->ContextRecord;
 
-	const auto* registers = exception->ContextRecord;
-	info.rax              = registers->Rax;
-	info.rbx              = registers->Rbx;
-	info.rcx              = registers->Rcx;
-	info.rdx              = registers->Rdx;
-	info.rsi              = registers->Rsi;
-	info.rdi              = registers->Rdi;
-	info.rbp              = registers->Rbp;
-	info.rsp              = registers->Rsp;
-	info.r8               = registers->R8;
-	info.r9               = registers->R9;
-	info.r10              = registers->R10;
-	info.r11              = registers->R11;
-	info.r12              = registers->R12;
-	info.r13              = registers->R13;
-	info.r14              = registers->R14;
-	info.r15              = registers->R15;
+	info.rax = exception->ContextRecord->Rax;
+	info.rbx = exception->ContextRecord->Rbx;
+	info.rcx = exception->ContextRecord->Rcx;
+	info.rdx = exception->ContextRecord->Rdx;
+	info.rsi = exception->ContextRecord->Rsi;
+	info.rdi = exception->ContextRecord->Rdi;
+	info.rbp = exception->ContextRecord->Rbp;
+	info.rsp = exception->ContextRecord->Rsp;
+	info.r8  = exception->ContextRecord->R8;
+	info.r9  = exception->ContextRecord->R9;
+	info.r10 = exception->ContextRecord->R10;
+	info.r11 = exception->ContextRecord->R11;
+	info.r12 = exception->ContextRecord->R12;
+	info.r13 = exception->ContextRecord->R13;
+	info.r14 = exception->ContextRecord->R14;
+	info.r15 = exception->ContextRecord->R15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
-		if (guard_page) {
-			MEMORY_BASIC_INFORMATION page {};
-			const auto* address = reinterpret_cast<const void*>(info.access_violation_vaddr);
-			if (VirtualQuery(address, &page, sizeof(page)) == sizeof(page) && page.State == MEM_COMMIT &&
-			    (page.Protect & PAGE_GUARD) == 0) {
-				DWORD old = 0;
-				VirtualProtect(page.BaseAddress, 1, page.Protect | PAGE_GUARD, &old);
-			}
-		}
 		return EXCEPTION_CONTINUE_EXECUTION;
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#else
+#elif defined(__APPLE__)
 
-static AccessViolationType DecodeAccess(const ucontext_t* context) {
-#if defined(__APPLE__)
-	const auto error = static_cast<uint64_t>(context->uc_mcontext->__es.__err);
-#else
-	const auto error = static_cast<uint64_t>(context->uc_mcontext.gregs[REG_ERR]);
-#endif
-	if ((error & 0x10u) != 0) {
+static std::atomic<Handler> g_handler {nullptr};
+static std::atomic_uint32_t g_install_state {0};
+
+static_assert(decltype(g_handler)::is_always_lock_free);
+static_assert(decltype(g_install_state)::is_always_lock_free);
+
+// Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
+// bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
+static AccessViolationType DecodeAccess(uint64_t err) {
+	if ((err & 0x10u) != 0) {
 		return AccessViolationType::Execute;
 	}
-	if ((error & 0x2u) != 0) {
+	if ((err & 0x2u) != 0) {
 		return AccessViolationType::Write;
 	}
 	return AccessViolationType::Read;
 }
 
-static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
-	auto* context = static_cast<ucontext_t*>(native_context);
+// POSIX signal handler that mirrors the Windows vectored handler: build an ExceptionInfo
+// from the mcontext and dispatch. A resolved fault (handler returns true) simply returns,
+// re-executing the faulting instruction against the now-fixed protection. An unresolved
+// fault restores the default disposition so the retry terminates the process.
+static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
+	auto*       uc = static_cast<ucontext_t*>(uctx);
+	const auto* mc = uc->uc_mcontext;
+	const auto& ss = mc->__ss;
 
 	ExceptionInfo info {};
-#if defined(__APPLE__)
-	const auto& registers  = context->uc_mcontext->__ss;
-	info.exception_address = registers.__rip;
-	info.rax               = registers.__rax;
-	info.rbx               = registers.__rbx;
-	info.rcx               = registers.__rcx;
-	info.rdx               = registers.__rdx;
-	info.rsi               = registers.__rsi;
-	info.rdi               = registers.__rdi;
-	info.rbp               = registers.__rbp;
-	info.rsp               = registers.__rsp;
-	info.r8                = registers.__r8;
-	info.r9                = registers.__r9;
-	info.r10               = registers.__r10;
-	info.r11               = registers.__r11;
-	info.r12               = registers.__r12;
-	info.r13               = registers.__r13;
-	info.r14               = registers.__r14;
-	info.r15               = registers.__r15;
-#else
-	const auto* registers  = context->uc_mcontext.gregs;
-	info.exception_address = static_cast<uint64_t>(registers[REG_RIP]);
-	info.rax               = static_cast<uint64_t>(registers[REG_RAX]);
-	info.rbx               = static_cast<uint64_t>(registers[REG_RBX]);
-	info.rcx               = static_cast<uint64_t>(registers[REG_RCX]);
-	info.rdx               = static_cast<uint64_t>(registers[REG_RDX]);
-	info.rsi               = static_cast<uint64_t>(registers[REG_RSI]);
-	info.rdi               = static_cast<uint64_t>(registers[REG_RDI]);
-	info.rbp               = static_cast<uint64_t>(registers[REG_RBP]);
-	info.rsp               = static_cast<uint64_t>(registers[REG_RSP]);
-	info.r8                = static_cast<uint64_t>(registers[REG_R8]);
-	info.r9                = static_cast<uint64_t>(registers[REG_R9]);
-	info.r10               = static_cast<uint64_t>(registers[REG_R10]);
-	info.r11               = static_cast<uint64_t>(registers[REG_R11]);
-	info.r12               = static_cast<uint64_t>(registers[REG_R12]);
-	info.r13               = static_cast<uint64_t>(registers[REG_R13]);
-	info.r14               = static_cast<uint64_t>(registers[REG_R14]);
-	info.r15               = static_cast<uint64_t>(registers[REG_R15]);
-#endif
-	info.native_code    = static_cast<uint32_t>(signal_number);
-	info.native_context = context;
-	if (signal_number == SIGILL) {
+	info.exception_address = ss.__rip;
+	info.native_code       = static_cast<uint32_t>(si->si_code);
+	info.native_context    = uctx;
+
+	if (sig == SIGILL) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
 		info.type                   = ExceptionType::AccessViolation;
-		info.access_violation_type  = DecodeAccess(context);
-		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
+		info.access_violation_type  = DecodeAccess(mc->__es.__err);
+		info.access_violation_vaddr = reinterpret_cast<uint64_t>(si->si_addr);
 	}
+
+	info.rax = ss.__rax;
+	info.rbx = ss.__rbx;
+	info.rcx = ss.__rcx;
+	info.rdx = ss.__rdx;
+	info.rsi = ss.__rsi;
+	info.rdi = ss.__rdi;
+	info.rbp = ss.__rbp;
+	info.rsp = ss.__rsp;
+	info.r8  = ss.__r8;
+	info.r9  = ss.__r9;
+	info.r10 = ss.__r10;
+	info.r11 = ss.__r11;
+	info.r12 = ss.__r12;
+	info.r13 = ss.__r13;
+	info.r14 = ss.__r14;
+	info.r15 = ss.__r15;
+
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
+		return; // retry the faulting instruction against the fixed mapping
+	}
+
+	// Unresolved: restore the default action so the re-executed instruction terminates.
+	struct sigaction dfl {};
+	dfl.sa_handler = SIG_DFL;
+	sigemptyset(&dfl.sa_mask);
+	sigaction(sig, &dfl, nullptr);
+}
+
+#else
+
+// x86-64 page-fault error bits.
+constexpr uint64_t PAGE_FAULT_ERROR_WRITE       = 0x02;
+constexpr uint64_t PAGE_FAULT_ERROR_INSTRUCTION = 0x10;
+
+// Let the kernel handle an unresolved fault on retry.
+static void ChainToDefault(int signal_number) noexcept {
+	struct sigaction restore {};
+	restore.sa_handler = SIG_DFL;
+	sigemptyset(&restore.sa_mask);
+	restore.sa_flags = 0;
+	::sigaction(signal_number, &restore, nullptr);
+}
+
+static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
+	auto* context = static_cast<ucontext_t*>(native_context);
+	auto* gregs   = context->uc_mcontext.gregs;
+
+	ExceptionInfo info {};
+	info.exception_address = static_cast<uint64_t>(gregs[REG_RIP]);
+	info.native_code       = static_cast<uint32_t>(signal_number);
+	info.native_context    = context;
+
+	if (signal_number == SIGSEGV || signal_number == SIGBUS) {
+		info.type             = ExceptionType::AccessViolation;
+		const auto error_code = static_cast<uint64_t>(gregs[REG_ERR]);
+		if ((error_code & PAGE_FAULT_ERROR_INSTRUCTION) != 0) {
+			info.access_violation_type = AccessViolationType::Execute;
+		} else if ((error_code & PAGE_FAULT_ERROR_WRITE) != 0) {
+			info.access_violation_type = AccessViolationType::Write;
+		} else {
+			info.access_violation_type = AccessViolationType::Read;
+		}
+		info.access_violation_vaddr = reinterpret_cast<uint64_t>(signal_info->si_addr);
+	} else if (signal_number == SIGILL) {
+		info.type = ExceptionType::IllegalInstruction;
+	} else {
+		ChainToDefault(signal_number);
+		return;
+	}
+
+	info.rax = static_cast<uint64_t>(gregs[REG_RAX]);
+	info.rbx = static_cast<uint64_t>(gregs[REG_RBX]);
+	info.rcx = static_cast<uint64_t>(gregs[REG_RCX]);
+	info.rdx = static_cast<uint64_t>(gregs[REG_RDX]);
+	info.rsi = static_cast<uint64_t>(gregs[REG_RSI]);
+	info.rdi = static_cast<uint64_t>(gregs[REG_RDI]);
+	info.rbp = static_cast<uint64_t>(gregs[REG_RBP]);
+	info.rsp = static_cast<uint64_t>(gregs[REG_RSP]);
+	info.r8  = static_cast<uint64_t>(gregs[REG_R8]);
+	info.r9  = static_cast<uint64_t>(gregs[REG_R9]);
+	info.r10 = static_cast<uint64_t>(gregs[REG_R10]);
+	info.r11 = static_cast<uint64_t>(gregs[REG_R11]);
+	info.r12 = static_cast<uint64_t>(gregs[REG_R12]);
+	info.r13 = static_cast<uint64_t>(gregs[REG_R13]);
+	info.r14 = static_cast<uint64_t>(gregs[REG_R14]);
+	info.r15 = static_cast<uint64_t>(gregs[REG_R15]);
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
 	if (handler != nullptr && handler(info)) {
 		return;
 	}
 
-	struct sigaction restore {};
-	restore.sa_handler = SIG_DFL;
-	sigemptyset(&restore.sa_mask);
-	::sigaction(signal_number, &restore, nullptr);
+	ChainToDefault(signal_number);
 }
 
 #endif
 
-static bool InstallPlatformHandler() {
+bool InstallHandler(Handler handler) {
+	if (handler == nullptr) {
+		return false;
+	}
+
+	uint32_t expected_state = 0;
+	if (!g_install_state.compare_exchange_strong(expected_state, 1, std::memory_order_acq_rel)) {
+		return expected_state == 2 && g_handler.load(std::memory_order_acquire) == handler;
+	}
+
+	g_handler.store(handler, std::memory_order_release);
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
+		g_handler.store(nullptr, std::memory_order_release);
+		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
+		return false;
+	}
+#elif defined(__APPLE__)
+	struct sigaction sa {};
+	sa.sa_sigaction = SignalHandler;
+	sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
+	sigemptyset(&sa.sa_mask);
+	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
+	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request
+	// cannot preempt the handler between the protection fix and the retry.
+	sigaddset(&sa.sa_mask, SIGUSR1);
+
+	// macOS raises SIGBUS for protection faults on some paths and SIGSEGV on others;
+	// SIGILL covers instructions the host cannot execute (routed to the x64 emulator).
+	bool ok = sigaction(SIGSEGV, &sa, nullptr) == 0 && sigaction(SIGBUS, &sa, nullptr) == 0 &&
+	          sigaction(SIGILL, &sa, nullptr) == 0;
+	if (!ok) {
+		g_handler.store(nullptr, std::memory_order_release);
+		g_install_state.store(0, std::memory_order_release);
+		printf("sigaction() failed to install the host fault handler\n");
 		return false;
 	}
 #else
@@ -237,24 +399,19 @@ static bool InstallPlatformHandler() {
 	action.sa_sigaction = SignalHandler;
 	sigemptyset(&action.sa_mask);
 	action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
-	sigaddset(&action.sa_mask, GuestSignalDispatchSignal());
 
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {
+			g_handler.store(nullptr, std::memory_order_release);
+			g_install_state.store(0, std::memory_order_release);
 			printf("sigaction(%d) failed\n", signal_number);
 			return false;
 		}
 	}
 #endif
+
+	g_install_state.store(2, std::memory_order_release);
 	return true;
 }
 
-bool InstallHandler(Handler handler) {
-	static const bool installed = [handler] {
-		g_handler.store(handler, std::memory_order_release);
-		return InstallPlatformHandler();
-	}();
-	return installed && g_handler.load(std::memory_order_acquire) == handler;
-}
-
-}
+} // namespace Common::HostException

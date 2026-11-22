@@ -5,18 +5,7 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
-uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
-                 std::initializer_list<uint32_t> args) {
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), opcode, args);
-	return result;
-}
-
 uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
-	if (state.profile.relaxed_float) {
-		return EmitExt(state, TypeF64(state), max_value ? GLSLstd450NMax : GLSLstd450NMin,
-		               {lhs, rhs});
-	}
 	const auto bits_type = TypeU32Vector(state, 2);
 	const auto lhs_bits = Unary(state, spv::OpBitcast, bits_type, lhs);
 	const auto rhs_bits = Unary(state, spv::OpBitcast, bits_type, rhs);
@@ -24,12 +13,15 @@ uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max
 	                            TypeBool(state), lhs, rhs);
 	auto result = Select(state, TypeF64(state), ordered, lhs, rhs);
 
+	// Equal values have identical bits except signed zero: min chooses -0, max chooses +0.
 	const auto equal = Binary(state, spv::OpFOrdEqual, TypeBool(state), lhs, rhs);
 	const auto equal_bits = Binary(state, max_value ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
 	                               bits_type, lhs_bits, rhs_bits);
 	result = Select(state, TypeF64(state), equal,
 	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
 
+	// Non-IEEE mode selects the other operand for NaN, and lhs when both are NaN. The ordered
+	// compares already pick rhs for a NaN lhs.
 	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
 	              lhs, result);
 }
@@ -55,7 +47,16 @@ uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, b
 	return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, max_value), c, max_value);
 }
 
+uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
+                 std::initializer_list<uint32_t> args) {
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, type, result, GlslStd450(state), opcode, args);
+	return result;
+}
+
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
+	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
+	// float below the integer limit are selected afterwards.
 	const auto clamped =
 	    EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	            {src, ConstantF32(state, signed_value ? 0xcf000000u : 0u),
@@ -73,9 +74,10 @@ uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
 	              ConstantU32(state, 0), high);
 }
 
-}
+} // namespace
 
 uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
+	// Native half conversion causes regressions; use compact integer RTZ conversion.
 	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
 	const auto sign = EmitAndConstant(
 	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, ConstantU32(state, 16)),
@@ -84,12 +86,14 @@ uint32_t EmitF32BitsToF16RtzBits(EmitterState& state, uint32_t bits) {
 	                        ConstantU32(state, 23));
 	const auto mant = EmitAndConstant(state, abs, 0x007fffffu);
 
+	// Align the hidden bit to the half subnormal mantissa. Even unused shifts must be < 32.
 	const auto shift = EmitUMin32(
 	    state, Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 126), exp),
 	    ConstantU32(state, 31));
 	const auto sub = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
 	                        EmitOrU32(state, mant, ConstantU32(state, 0x00800000u)), shift);
 
+	// Drop 13 mantissa bits and rebias the exponent; finite overflow saturates to max half.
 	const auto truncated = Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs,
 	                              ConstantU32(state, 13));
 	const auto normal = EmitUMin32(
@@ -116,10 +120,17 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	const auto product = EmitFPMul32(state, a, b);
+	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24
+	// on NVIDIA RTX 5080 Laptop GPU, so leave them disabled for this experiment.
+	// a = EmitFlushF32DenormToSignedZero(state, a);
+	// b = EmitFlushF32DenormToSignedZero(state, b);
+	// c = EmitFlushF32DenormToSignedZero(state, c);
+	const auto product = EmitNative<spv::OpFMul, IR::Type::F32, uint32_t, uint32_t>(state, a, b);
 	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
-	const auto sum = EmitFPAdd32(state, product, c);
+	// const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	const auto sum = EmitNative<spv::OpFAdd, IR::Type::F32, uint32_t, uint32_t>(state, product, c);
 	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	// return EmitFlushF32DenormToSignedZero(state, sum);
 	return sum;
 }
 
@@ -131,115 +142,8 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpBitwiseAnd, IR::Type::U8>(state, arg0, ConstantU32(state, 0xffu));
 }
 
-uint32_t EmitF32ToF16Bits(EmitterState& state, uint32_t arg0) {
-	const auto pair = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
-	                          ConstantF32(state, 0));
-	return EmitPackHalf2x16(state, pair);
-}
-
-namespace {
-
-uint32_t HalfOfU32(EmitterState& state, uint32_t bits, uint32_t lane) {
-	const auto halves = Unary(state, spv::OpBitcast, TypeF16x2(state), bits);
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeExtract, TypeF16(state), result, halves, lane);
-	return result;
-}
-
-uint32_t LaneOf(IR::Value lane) {
-	return lane.Resolve().U32() != 0u ? 1u : 0u;
-}
-
-uint32_t HalfOperation(EmitterState& state, spv::Op opcode, uint32_t glsl,
-                       std::initializer_list<uint32_t> args, bool exact) {
-	const auto result = state.builder.AllocateId();
-	const auto* arg   = args.begin();
-	if (opcode != spv::OpExtInst) {
-		if (args.size() == 1) {
-			state.builder.AddFunction(opcode, TypeF16(state), result, arg[0]);
-		} else {
-			state.builder.AddFunction(opcode, TypeF16(state), result, arg[0], arg[1]);
-		}
-	} else if (args.size() == 1) {
-		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
-		                          arg[0]);
-	} else if (args.size() == 2) {
-		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
-		                          arg[0], arg[1]);
-	} else {
-		state.builder.AddFunction(spv::OpExtInst, TypeF16(state), result, GlslStd450(state), glsl,
-		                          arg[0], arg[1], arg[2]);
-	}
-	if (exact) {
-		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
-	}
-	return result;
-}
-
-}
-
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
-	return HalfOfU32(state, EmitF32ToF16Bits(state, arg0), 0u);
-}
-
-uint32_t EmitConvertF32F16(EmitterState& state, uint32_t arg0) {
-	return Unary(state, spv::OpFConvert, TypeF32(state), arg0);
-}
-
-uint32_t EmitBitCastF16U16(EmitterState& state, uint32_t arg0) {
-	return HalfOfU32(state, arg0, 0u);
-}
-
-uint32_t EmitBitCastU16F16(EmitterState& state, uint32_t arg0) {
-	const auto halves = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF16x2(state), halves, arg0,
-	                          state.builder.Constant(spv::OpConstant, TypeF16(state), 0u));
-	return Unary(state, spv::OpBitcast, TypeU32(state), halves);
-}
-
-uint32_t EmitExtractF16Lane(EmitterState& state, uint32_t bits, IR::Value lane) {
-	return HalfOfU32(state, bits, LaneOf(lane));
-}
-
-uint32_t EmitInsertF16Lane(EmitterState& state, uint32_t bits, uint32_t value, IR::Value lane) {
-	const auto halves   = Unary(state, spv::OpBitcast, TypeF16x2(state), bits);
-	const auto inserted = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeInsert, TypeF16x2(state), inserted, value, halves,
-	                          LaneOf(lane));
-	return Unary(state, spv::OpBitcast, TypeU32(state), inserted);
-}
-
-uint32_t EmitFPAdd16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return HalfOperation(state, spv::OpFAdd, 0, {arg0, arg1}, true);
-}
-
-uint32_t EmitFPSub16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return HalfOperation(state, spv::OpFSub, 0, {arg0, arg1}, true);
-}
-
-uint32_t EmitFPMul16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return HalfOperation(state, spv::OpFMul, 0, {arg0, arg1}, true);
-}
-
-uint32_t EmitFPFma16(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
-	return HalfOperation(state, spv::OpExtInst, GLSLstd450Fma, {arg0, arg1, arg2}, true);
-}
-
-uint32_t EmitFPMin16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return HalfOperation(state, spv::OpExtInst, GLSLstd450NMin, {arg0, arg1}, false);
-}
-
-uint32_t EmitFPMax16(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return HalfOperation(state, spv::OpExtInst, GLSLstd450NMax, {arg0, arg1}, false);
-}
-
-uint32_t EmitFPAbs16(EmitterState& state, uint32_t arg0) {
-	return HalfOperation(state, spv::OpExtInst, GLSLstd450FAbs, {arg0}, false);
-}
-
-uint32_t EmitFPNeg16(EmitterState& state, uint32_t arg0) {
-	return HalfOperation(state, spv::OpFNegate, 0, {arg0}, false);
+	return EmitF32ToF16Bits(state, arg0);
 }
 
 uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
@@ -290,15 +194,51 @@ uint32_t EmitCompositeExtractU32x2(EmitterState& state, uint32_t arg0, IR::Value
 }
 
 uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1) {
+	if (const auto native = EmitPackF16RtzNative(state, arg0, arg1); native != 0) return native;
+	// The low half's upper 16 bits are zero, so one bit-field insert packs the pair (upstream 10a852c2a).
 	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
 	    state, EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg0)),
 	    EmitF32BitsToF16RtzBits(state, EmitBitcastF32ToU32(state, arg1)),
 	    ConstantU32(state, 16), ConstantU32(state, 16));
 }
 
+void ClampNanCheck(EmitterState& state, uint32_t is_nan, uint32_t counter) {
+	if (state.fault_buffer_variable == 0) {
+		static std::atomic<uint32_t> lines {0};
+		if (lines.fetch_add(1) < 16u) {
+			std::fprintf(stderr, "FIX_CLAMP_NAN check hash=%016llx: no fault buffer, counts not recorded\n",
+			             static_cast<unsigned long long>(state.program.shader_hash));
+		}
+		return;
+	}
+	EmitIfCondition(state, is_nan, [&] {
+		(void)FaultDiagAdd(state, IR::ClampNanDiagWord + counter, ConstantU32(state, 1));
+		const auto slot = FaultDiagAdd(state, IR::ClampNanDiagWord + 2, ConstantU32(state, 1));
+		const auto room = Binary(state, spv::OpULessThan, TypeBool(state), slot, ConstantU32(state, IR::ClampNanDiagSlots));
+		EmitIfCondition(state, room, [&] {
+			const auto hash = state.program.shader_hash;
+			FaultDiagStore(state, IR::ClampNanDiagWord + 3, slot, 2, 0, ConstantU32(state, static_cast<uint32_t>(hash)));
+			FaultDiagStore(state, IR::ClampNanDiagWord + 3, slot, 2, 1,
+			               ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+		});
+	});
+}
+
+// The `.clamp` output modifier (ApplyF32ResultModifiers) and every other f32 saturate. KYTY_FIX_CLAMP_NAN=1 with
+// DX10_CLAMP: NClamp, whose NMax(NaN, 0) is 0 (GLSL.std.450: NMax returns the other operand for a NaN), as the GCN
+// clamp; equal to FClamp for every other input. DX10_CLAMP=0 keeps today's FClamp.
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
-	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	// Upstream 4f1f3b1bb makes this NClamp unconditionally; here it is KYTY_FIX_CLAMP_NAN=1 (M124, with the DX10_CLAMP
+	// check), which stays the switch for that behaviour.
+	const int  mode  = IR::ClampNanModeFor(state.program.shader_hash);
+	const bool dx10  = mode != 0 && ProgramDx10Clamp(state);
+	const auto clamp = mode == 1 && dx10 ? GLSLstd450NClamp : GLSLstd450FClamp;
+	const auto result =
+	    EmitExt(state, TypeF32(state), clamp, {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	if (mode == 2 && dx10) {
+		ClampNanCheck(state, Unary(state, spv::OpIsNan, TypeBool(state), result), 0);
+	}
+	return result;
 }
 
 uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1) {
@@ -343,53 +283,6 @@ uint32_t EmitFPMax32(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF32Value(state, arg0, arg1, true);
 }
 
-namespace {
-
-uint32_t PackedF16Operation(EmitterState& state, spv::Op opcode, uint32_t glsl,
-                            std::initializer_list<uint32_t> args) {
-	std::array<uint32_t, 3> halves {};
-	size_t                  count = 0;
-	for (const auto arg: args) {
-		halves[count++] = Unary(state, spv::OpBitcast, TypeF16x2(state), arg);
-	}
-	const auto result = state.builder.AllocateId();
-	if (opcode == spv::OpExtInst) {
-		if (count == 2) {
-			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
-			                          glsl, halves[0], halves[1]);
-		} else {
-			state.builder.AddFunction(spv::OpExtInst, TypeF16x2(state), result, GlslStd450(state),
-			                          glsl, halves[0], halves[1], halves[2]);
-		}
-	} else {
-		state.builder.AddFunction(opcode, TypeF16x2(state), result, halves[0], halves[1]);
-	}
-	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
-	return Unary(state, spv::OpBitcast, TypeU32(state), result);
-}
-
-}
-
-uint32_t EmitPackedFPAdd16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return PackedF16Operation(state, spv::OpFAdd, 0, {arg0, arg1});
-}
-
-uint32_t EmitPackedFPMul16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return PackedF16Operation(state, spv::OpFMul, 0, {arg0, arg1});
-}
-
-uint32_t EmitPackedFPFma16x2(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
-	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450Fma, {arg0, arg1, arg2});
-}
-
-uint32_t EmitPackedFPMin16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMin, {arg0, arg1});
-}
-
-uint32_t EmitPackedFPMax16x2(EmitterState& state, uint32_t arg0, uint32_t arg1) {
-	return PackedF16Operation(state, spv::OpExtInst, GLSLstd450NMax, {arg0, arg1});
-}
-
 uint32_t EmitFPMin64(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMinMaxF64(state, arg0, arg1, false);
 }
@@ -407,7 +300,7 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 }
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	const auto source = EmitFlushF32InputUnlessHost(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -417,26 +310,28 @@ uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
+	// Integer-to-float inputs used by IFLAG cannot be denormal.
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), arg0);
 }
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
+	// A denormal input already rounds to 1.0, the result for its flushed zero (upstream 93071ebdf).
 	return EmitExt(state, TypeF32(state), GLSLstd450Exp2, {arg0});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {EmitFlushF32InputUnlessHost(state, arg0)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
@@ -445,7 +340,7 @@ uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 }
 
 uint32_t EmitFPSin(EmitterState& state, uint32_t arg0) {
-	auto source = EmitTrigCycleF32(state, arg0, !state.profile.relaxed_float);
+	auto source = EmitTrigCycleF32(state, arg0, true);
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Sin, {source});
 }
@@ -456,4 +351,4 @@ uint32_t EmitFPCos(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

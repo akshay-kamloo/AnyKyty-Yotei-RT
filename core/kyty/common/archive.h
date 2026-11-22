@@ -32,6 +32,7 @@ private:
 	friend std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path);
 };
 
+// Virtual paths use "archive.ext!/member" and retain native host-path encoding.
 [[nodiscard]] std::filesystem::path       MakeArchivePath(const std::filesystem::path& archive,
                                                           const std::filesystem::path& member = {});
 [[nodiscard]] bool                        IsSupportedArchive(const std::filesystem::path& path);
@@ -41,12 +42,16 @@ private:
 [[nodiscard]] std::filesystem::path       GetArchiveHostPath(const std::filesystem::path& path);
 [[nodiscard]] std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path);
 
+// Retain this handle while a mount or metadata scan is active to reuse the index and block cache.
+// Accepts either a host archive filename or a virtual path inside the archive.
 [[nodiscard]] std::shared_ptr<ArchiveReader> OpenArchive(const std::filesystem::path& path);
 
+// Packs a host directory into a new ZArchive outside it. progress gets 0 < done <= total and
+// returns false to cancel. A failed or cancelled pack removes the partial archive.
 [[nodiscard]] bool PackArchive(const std::filesystem::path& directory,
                                const std::filesystem::path& archive,
                                const std::function<bool(uint64_t done, uint64_t total)>& progress);
 
-}
+} // namespace Common
 
-#endif
+#endif /* KYTY_COMMON_ARCHIVE_H_ */

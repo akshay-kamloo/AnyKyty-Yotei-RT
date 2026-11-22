@@ -50,4 +50,4 @@ std::string TypeName(Type type) {
 	return result;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

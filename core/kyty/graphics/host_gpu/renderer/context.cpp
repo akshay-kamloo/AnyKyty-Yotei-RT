@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "graphics/host_gpu/renderer/drawCoverage.h"
 #include "common/common.h"
 #include "common/profiler.h"
 #include "common/threads.h"
@@ -13,29 +14,26 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
-#include <utility>
 namespace Libs::Graphics {
 
-CommandBuffer::CommandBuffer(CommandScheduler& scheduler, CommandStream* stream)
-    : m_scheduler(scheduler), m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
-      m_stream(stream) {}
+CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
-void CommandBuffer::InvalidateDynamicState() const {
-	m_scheduler.GetDynamicState().Invalidate();
+bool CommandBuffer::IsInvalid() const {
+	return m_buffer == nullptr;
 }
 
-CommandRecorder CommandBuffer::Handle() const {
-	return m_stream != nullptr ? CommandRecorder(m_stream) : CommandRecorder(m_buffer);
+vk::CommandBuffer CommandBuffer::Handle() const {
+	EXIT_IF(IsInvalid());
+	return m_buffer;
 }
 
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());
-	if (m_stream != nullptr) {
-		return;
-	}
-	auto buffer = m_buffer;
+	EXIT_IF(m_rendering || IsInvalid());
+	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
 	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
@@ -43,24 +41,43 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// A new command buffer starts without any pipeline or dynamic state (KYTY_FIX_DRAW_STATE_FILTER).
+	InvalidateGraphicsState();
+}
+
+void CommandBuffer::InvalidateGraphicsState() const noexcept {
+	m_graphics_state = GraphicsState {};
+	// The record packets: the recording thread's copy is forgotten at the same place of the command stream.
+	NoteGraphicsStateInvalidated(m_buffer);
 }
 
 void CommandBuffer::End() const {
 	EndRendering();
-	if (m_stream != nullptr) {
-		return;
-	}
-	auto buffer = m_buffer;
+	auto buffer = Handle();
 
 	auto result = buffer.end();
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	m_debug_op        = op;
+	m_debug_submit_id = submit_id;
+	m_debug_arg0      = arg0;
+	m_debug_arg1      = arg1;
+	m_debug_arg2      = arg2;
+	m_debug_arg3      = arg3;
+	m_debug_arg4      = arg4;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
+	DrawCoverage::t_render_begins++; // KYTY_TRACE_PEEK_CENSUS (way B W0 Table B)
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
@@ -68,8 +85,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		const auto& attachment = state.color_attachments[i];
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp       = vk::AttachmentLoadOp::eLoad;
-		colors[i].storeOp      = vk::AttachmentStoreOp::eStore;
+		colors[i].loadOp =
+		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
+		colors[i].clearValue.color.uint32 = attachment.clear_value;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
@@ -96,25 +115,30 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	const auto recorder = Handle();
-	recorder.beginRendering(rendering);
+	FlushComputeAccess(Handle()); // compute writes before rendering reads them
+	Handle().beginRendering(rendering);
+	// The open pass holds the cleared contents, so a later clear begins a new pass.
 	m_render_state = state;
+	for (auto& color: m_render_state.color_attachments) {
+		color.is_clear = false;
+	}
 	m_render_state.depth_stencil_attachment.depth_clear   = false;
 	m_render_state.depth_stencil_attachment.stencil_clear = false;
 	m_rendering                                           = true;
-	m_context.GetOcclusionQueries().OnBeginRendering(recorder);
 }
 
 void CommandBuffer::EndRendering() const {
-	if (m_rendering) {
-		const auto recorder = Handle();
-		m_context.GetOcclusionQueries().OnEndRendering(recorder);
-		recorder.endRendering();
-		m_rendering = false;
+	if (!m_rendering) {
+		return;
 	}
-	if (m_pending_shader_writes) {
-		ShaderWriteBarrier(Handle(), std::exchange(m_pending_shader_writes, {}));
-	}
+	// KYTY_FIX_OCCLUSION_QUERIES: a host occlusion query begun in this render pass instance ends in it; slots for
+	// the next ones are reset outside it.
+	auto& occlusion = m_context.GetOcclusionQueries();
+	occlusion.BeforeEndRendering(Handle());
+	Handle().endRendering();
+	m_rendering    = false;
+	m_render_state = {};
+	occlusion.AfterEndRendering(Handle());
 }
 
-}
+} // namespace Libs::Graphics

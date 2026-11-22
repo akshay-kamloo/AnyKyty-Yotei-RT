@@ -98,20 +98,11 @@ std::pair<std::uint64_t, std::uint64_t> Progress() {
     return {accepted, completed};
 }
 
-std::size_t Blocked(std::array<Libs::Graphics::GuestGpu::BlockedWait, WaitCapacity>& waits) {
-    if (!Entry::GpuStarted()) return 0;
-    return Entry::Gpu().BlockedWaits(waits.data(), waits.size());
-}
-
 bool Settled() {
-    std::array<Libs::Graphics::GuestGpu::BlockedWait, WaitCapacity> waits{};
-    const auto count = Blocked(waits);
     auto& s = state();
     for (std::size_t slot = 0; slot < SerialQueues; ++slot) {
         const auto done = Completed(slot);
-        if (s.queues[slot].accepted.load(std::memory_order_acquire) <= done) continue;
-        const bool parked = std::any_of(waits.begin(), waits.begin() + static_cast<std::ptrdiff_t>(count), [slot](const auto& wait) { return wait.queue == slot; });
-        if (!parked) return false;
+        if (s.queues[slot].accepted.load(std::memory_order_acquire) > done) return false;
     }
     return true;
 }
@@ -182,7 +173,7 @@ void NoteSubmission(Libs::Graphics::GuestGpu& gpu, std::uint32_t queue) {
     packet.words = {ReleaseMemHeader, BottomOfPipeEvent, LabelData64, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), static_cast<std::uint32_t>(serial), static_cast<std::uint32_t>(serial >> 32u), 0};
     entry.accepted.store(serial, std::memory_order_release);
     const std::span<const std::uint32_t> words(packet.words);
-    if (queue == 0) gpu.Submit(words);
+    if (queue == 0) gpu.Submit(words, {});
     else gpu.SubmitCompute(queue, words);
 }
 
@@ -222,15 +213,17 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
             if (!KytyShim::Replay::Readable(format)) throw KytyShim::Replay::Unreadable(format);
             if (image.backing.extent.width < buffer.width || image.backing.extent.height < buffer.height) throw std::runtime_error("kyty replay: the display image is smaller than the display buffer");
             const auto bytes = static_cast<std::uint64_t>(buffer.width) * buffer.height * 4;
-            auto download = renderer.GetBufferCache().GetUtilityBuffer(Graphics::MemoryUsage::Download).MapDownload(bytes, 4);
+            auto& download_buffer = renderer.GetBufferCache().GetUtilityBuffer(Graphics::MemoryUsage::Download);
+            const auto [mapped, offset] = download_buffer.Map(bytes, 4);
             vk::BufferImageCopy copy{};
-            copy.bufferOffset = download.offset;
+            copy.bufferOffset = offset;
             copy.imageSubresource = vk::ImageSubresourceLayers{vk::ImageAspectFlagBits::eColor, 0, 0, 1};
             copy.imageExtent = vk::Extent3D{buffer.width, buffer.height, 1};
-            image.Download(std::span(&copy, 1), download.buffer->Handle(), download.offset, bytes);
+            image.Download(std::span(&copy, 1), download_buffer.Handle(), offset, bytes);
+            download_buffer.Commit();
             scheduler.Finish();
-            download.buffer->Invalidate(download.offset, bytes);
-            const auto* source = download.mapped;
+            download_buffer.Invalidate(offset, bytes);
+            const auto* source = mapped;
             for (std::size_t pixel = 0; pixel < pixels.size() / 4; ++pixel) {
                 const auto converted = KytyShim::Replay::Bgra(format, source + pixel * 4);
                 std::memcpy(pixels.data() + pixel * 4, converted.data(), converted.size());
@@ -271,19 +264,10 @@ extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
         s.held = true;
         return true;
     }
-    auto& gpu = KytyShim::Entry::Gpu();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<std::int64_t>(0, milliseconds));
-    for (;;) {
-        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
-        if (!gpu.HoldSubmissions(static_cast<std::uint32_t>(std::clamp<std::int64_t>(left, KytyShim::Replay::HoldGraceMs, std::numeric_limits<std::uint32_t>::max())))) return false;
-        if (KytyShim::Replay::Settled()) {
-            s.held = true;
-            return true;
-        }
-        gpu.ReleaseSubmissions();
-        if (std::chrono::steady_clock::now() >= deadline) return false;
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-    }
+    static_cast<void>(milliseconds);
+    KytyShim::Entry::Gpu().WaitForIdle();
+    s.held = true;
+    return true;
 }
 
 extern "C" void AgcDriverReleaseSettled_nid_postfix() {
@@ -291,17 +275,11 @@ extern "C" void AgcDriverReleaseSettled_nid_postfix() {
     std::lock_guard lock(s.holdMutex);
     if (!s.held) return;
     s.held = false;
-    if (KytyShim::Entry::GpuStarted()) KytyShim::Entry::Gpu().ReleaseSubmissions();
+
 }
 
-extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity) {
-    std::array<Libs::Graphics::GuestGpu::BlockedWait, KytyShim::Replay::WaitCapacity> blocked{};
-    const auto count = std::min(capacity, KytyShim::Replay::Blocked(blocked));
-    for (std::size_t index = 0; index < count; ++index) {
-        const auto& wait = blocked[index];
-        waits[index] = AgcDriver::AwaitedWait{wait.address, wait.reference, wait.mask, wait.function, wait.bytes};
-    }
-    return count;
+extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*, std::size_t) {
+    return 0;
 }
 
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {

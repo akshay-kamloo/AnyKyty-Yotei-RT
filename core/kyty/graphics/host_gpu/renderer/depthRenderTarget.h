@@ -11,20 +11,14 @@
 
 namespace Libs::Graphics {
 
-struct RenderDepthInfo;
-namespace HW {
-class Context;
-}
-
-[[nodiscard]] bool DepthStencilTargetWanted(const HW::Context& hw);
-void ApplyDepthStencilTestState(const HW::Context& hw, RenderDepthInfo& r);
-
 struct RenderDepthInfo {
+	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
 	bool                        depth_clear_enable       = false;
 	vk::ImageAspectFlags        load_clear_aspects;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
+	// Effective draw writes; discovery applies test, target-write and clear controls.
 	bool                        depth_write_enable       = false;
 	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
@@ -72,6 +66,7 @@ inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
+	// The attachment layout must permit load clears as well as draw writes.
 	const bool depth_write   = static_cast<bool>(writes & vk::ImageAspectFlagBits::eDepth);
 	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {
@@ -94,6 +89,6 @@ inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
 	return vk::ImageLayout::eDepthStencilReadOnlyOptimal;
 }
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DEPTHRENDERTARGET_H_

@@ -1,58 +1,21 @@
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
+#include "common/profiler.h"
+#include "graphics/guest_gpu/command_processor/passCensus.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/onceValue.h"
 #include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/gpuTimer.h"
+#include "graphics/host_gpu/renderer/syncTimeline.h"
 
-#if defined(ANYPS5_KYTY)
-#include <algorithm>
-#include <cinttypes>
+#include <chrono>
 #include <cstdio>
-#endif
+#include <cstdlib>
 
 namespace Libs::Graphics {
-
-#if defined(ANYPS5_KYTY)
-void MasterSemaphore::ReportStall(uint64_t tick) {
-	static std::atomic_flag reported_gpu     = ATOMIC_FLAG_INIT;
-	static std::atomic_flag reported_pending = ATOMIC_FLAG_INIT;
-	const bool              pending          = tick >= CurrentTick();
-	if ((pending ? reported_pending : reported_gpu).test_and_set()) {
-		return;
-	}
-	uint64_t reached = 0;
-	(void)m_graphics.device.getSemaphoreCounterValue(m_semaphore, &reached);
-	if (pending) {
-		std::fprintf(stderr,
-		             "[kyty] tick %" PRIu64 " has been awaited for 10 s and is not submitted yet (next tick %" PRIu64
-		             ", the GPU is at %" PRIu64 "): the CPU side holds it\n",
-		             tick, CurrentTick(), reached);
-		return;
-	}
-	std::fprintf(stderr,
-	             "[kyty] the GPU has not reached tick %" PRIu64 " in 10 s (it is at %" PRIu64 ", %" PRIu64
-	             " ticks issued after it): the GPU stopped, look for an NVIDIA Xid in dmesg\n",
-	             tick, reached, CurrentTick() - 1 - reached);
-	std::array<uint64_t, 24> shaders {};
-	size_t                   count = 0;
-	const auto               next  = m_work_next.load(std::memory_order_relaxed);
-	for (uint32_t i = 1; i <= m_work.size() && count < shaders.size(); i++) {
-		const auto& work = m_work[(next - i) % m_work.size()];
-		if (work.tick.load(std::memory_order_relaxed) != reached + 1) {
-			continue;
-		}
-		const auto shader = work.shader.load(std::memory_order_relaxed);
-		if (std::find(shaders.begin(), shaders.begin() + count, shader) == shaders.begin() + count) {
-			shaders[count++] = shader;
-		}
-	}
-	std::fprintf(stderr, "[kyty] compute shaders of the unfinished tick %" PRIu64 ", last first:", reached + 1);
-	for (size_t i = 0; i < count; i++) {
-		std::fprintf(stderr, " 0x%016" PRIx64, shaders[i]);
-	}
-	std::fprintf(stderr, count == 0 ? " none recorded\n" : "\n");
-}
-#endif
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
@@ -67,12 +30,54 @@ MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics)
 }
 
 MasterSemaphore::~MasterSemaphore() {
-	m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	if (m_semaphore != nullptr) {
+		m_graphics.device.destroySemaphore(m_semaphore, nullptr);
+	}
 }
 
+MasterSemaphore::Stats& MasterSemaphore::GetStats() {
+	static Stats stats;
+	return stats;
+}
+
+namespace {
+thread_local uint32_t t_query_site = 3; // KYTY_TRACE_PERF: who calls RefreshNow
+struct QuerySite {
+	explicit QuerySite(uint32_t site): previous(t_query_site) { t_query_site = site; }
+	~QuerySite() { t_query_site = previous; }
+	uint32_t previous;
+};
+} // namespace
+
 void MasterSemaphore::Refresh() {
+	const QuerySite site(0);
+	constexpr int64_t PollNs = 100'000; // the semaphore is queried (a kernel call) at most every 100 us
+	const auto        now    = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+	if (now - m_last_refresh_ns.load(std::memory_order_relaxed) < PollNs) {
+		return;
+	}
+	m_last_refresh_ns.store(now, std::memory_order_relaxed);
+	RefreshNow();
+}
+
+void MasterSemaphore::RefreshNow() {
 	uint64_t   counter = 0;
+	const auto start   = std::chrono::steady_clock::now();
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	{
+		auto& s = GetStats();
+		s.queries[t_query_site].fetch_add(1, std::memory_order_relaxed);
+		s.query_ns[t_query_site].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                                              std::chrono::steady_clock::now() - start)
+		                                                              .count()),
+		                                   std::memory_order_relaxed);
+	}
+	if (result != vk::Result::eSuccess) {
+		std::fprintf(stderr, "getSemaphoreCounterValue failed: %s\n", vk::to_string(result).c_str());
+		GpuCheckpoints::Dump(m_graphics.queue);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
@@ -83,13 +88,21 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	const Common::SlowFrame::Scope slow_frame_scope(Common::SlowFrame::FenceWait); // KYTY_TRACE_SLOW_FRAMES
+	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait");
 	if (IsFree(tick)) {
 		return;
 	}
-	Refresh();
+	{
+		const QuerySite site(1);
+		RefreshNow();
+	}
 	if (IsFree(tick)) {
 		return;
 	}
+	const auto block_start = std::chrono::steady_clock::now();
+	// KYTY_TRACE_SYNC_TIMELINE: a wait that blocks, attributed to its thread, site and reader.
+	SyncTimeline::WaitScope timeline(SyncTimeline::Site::None, tick, CurrentTick(), KnownGpuTick());
 
 	vk::SemaphoreWaitInfo wait_info {};
 	wait_info.semaphoreCount = 1;
@@ -98,18 +111,25 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-#if defined(ANYPS5_KYTY)
-	constexpr uint64_t StallNs = 10'000'000'000ull;
-	auto result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
-	while (result == vk::Result::eTimeout) {
-		ReportStall(tick);
-		result = m_graphics.device.waitSemaphores(&wait_info, StallNs);
-	}
-#else
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-#endif
+	PassCensus::t_wait_ns += static_cast<uint64_t>(
+	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - block_start).count()); // KYTY_TRACE_PASS_CENSUS
+	if (GpuTimer::Enabled() && GpuTimer::TimelineCpuActive()) GpuTimer::NoteCpuWait('f', block_start); // KYTY_TRACE_GPU_TIMELINE
+	if (result != vk::Result::eSuccess) {
+		std::fprintf(stderr, "waitSemaphores failed: %s\n", vk::to_string(result).c_str());
+		GpuCheckpoints::Dump(m_graphics.queue);
+	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-	Refresh();
+	{
+		auto& s = GetStats();
+		s.blocks.fetch_add(1, std::memory_order_relaxed);
+		s.block_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                               std::chrono::steady_clock::now() - block_start)
+		                                               .count()),
+		                     std::memory_order_relaxed);
+	}
+	const QuerySite site(2);
+	RefreshNow();
 }
 
-}
+} // namespace Libs::Graphics

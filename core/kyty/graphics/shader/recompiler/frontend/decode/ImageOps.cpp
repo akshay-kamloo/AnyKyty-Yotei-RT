@@ -1,9 +1,11 @@
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
+#include "common/shaderEnv.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -68,6 +70,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 		components++;
 	}
 	if ((flags & (ImageSampleFlagLod | ImageSampleFlagLodClamp)) != 0) {
+		components++;
+	}
+	// The _CL clamp is the last body component (RDNA 2 ISA 8.2.5, "Image Opcodes with Sampler").
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
 		components++;
 	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
@@ -319,11 +325,14 @@ uint32_t CountDmaskComponents(uint32_t dmask) {
 	return count != 0 ? count : 1u;
 }
 
-}
+} // namespace
 
 ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, ImageDimension dimension,
                                                   uint32_t component) {
 	if ((flags & ImageSampleFlagA16) == 0u) return {component * 32u, 32u};
+	// A16 offsets, bias and PCF reference each take a whole VGPR, the bias as a half in its low
+	// 16 bits. The other components pack two per VGPR, except that each 1D derivative and the last
+	// two 3D ones take the low half of their own VGPR.
 	const bool     has_bias    = (flags & ImageSampleFlagBias) != 0u;
 	const uint32_t bias_index  = (flags & ImageSampleFlagOffset) != 0u ? 1u : 0u;
 	const uint32_t whole_vgprs = std::popcount(
@@ -387,7 +396,6 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;
-	inst.image_cube       = ((word0 >> 3u) & 0x7u) == 3u;
 	inst.image_nsa_dwords = nsa_dwords;
 	for (uint32_t i = 0; i < nsa_dwords * 4u; i++) {
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
@@ -470,4 +478,4 @@ const char* MimgSampledOpcodeName(uint32_t opcode) {
 	return sampled != nullptr ? sampled->name : nullptr;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

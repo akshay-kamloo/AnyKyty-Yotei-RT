@@ -63,6 +63,9 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     file(GLOB kytyShimSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/*.cpp)
     list(FILTER kytyShimSources EXCLUDE REGEX "Tests\\.cpp$")
     list(FILTER kytyShimSources EXCLUDE REGEX "/(MemoryBacking|MemoryGpu)\\.cpp$")
+    if(ANYPS5_KYTY_DLL)
+        set(kytyShimSources ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/host/DllHost.cpp)
+    endif()
     add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
@@ -98,21 +101,23 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     endif()
     set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
     add_shader_recompiler(shader_recompiler_agc_driver libc)
-    add_test_executable(kyty_rt_probe KytyShim/tools/RtProbe.cpp KytyShim/tools/RtProbeCache.cpp KytyShim/tools/RtSurvey.cpp KytyShim/src/Log.cpp)
-    add_dependencies(kyty_rt_probe agc_trace_revision)
-    target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
-    target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
-    if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
-        add_custom_command(TARGET kyty_rt_probe POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
-                -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
-                VERBATIM)
-    elseif(NOT WIN32)
-        target_link_libraries(kyty_rt_probe PRIVATE libc)
+    if(FALSE AND NOT ANYPS5_KYTY_DLL)
+        add_test_executable(kyty_rt_probe KytyShim/tools/RtProbe.cpp KytyShim/tools/RtProbeCache.cpp KytyShim/tools/RtSurvey.cpp KytyShim/src/Log.cpp)
+        add_dependencies(kyty_rt_probe agc_trace_revision)
+        target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+        target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
+        if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
+            add_custom_command(TARGET kyty_rt_probe POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
+                    VERBATIM)
+        elseif(NOT WIN32)
+            target_link_libraries(kyty_rt_probe PRIVATE libc)
+        endif()
+        set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
+        target_compile_definitions(kyty_rt_probe PRIVATE ANYPS5_KYTY_RT_PROBE)
     endif()
-    set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
-    target_compile_definitions(kyty_rt_probe PRIVATE ANYPS5_KYTY_RT_PROBE)
     if(BUILD_TESTING)
         add_test_executable(kyty_shim_entry_tests
                 KytyShim/src/EntryTests.cpp
@@ -123,6 +128,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         configure_host_test_executable(kyty_shim_entry_tests)
         add_test(NAME kyty_shim_entry COMMAND kyty_shim_entry_tests)
         set_tests_properties(kyty_shim_entry PROPERTIES TIMEOUT 20)
+        if(NOT ANYPS5_KYTY_DLL)
         add_test_executable(kyty_shim_system_content_tests
                 KytyShim/src/SystemContentTests.cpp
                 KytyShim/src/SystemContent.cpp)
@@ -131,6 +137,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         set_target_properties(kyty_shim_system_content_tests PROPERTIES CXX_EXTENSIONS OFF)
         add_test(NAME kyty_shim_system_content COMMAND kyty_shim_system_content_tests)
         set_tests_properties(kyty_shim_system_content PROPERTIES TIMEOUT 20)
+        endif()
         add_test_executable(kyty_shim_rt_probe_cache_tests KytyShim/tests/RtProbeCache.cpp KytyShim/tools/RtProbeCache.cpp)
         target_include_directories(kyty_shim_rt_probe_cache_tests PRIVATE KytyShim/tools
                 ${CMAKE_SOURCE_DIR}/3rdparty/xxHash ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
@@ -138,13 +145,15 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         configure_host_test_executable(kyty_shim_rt_probe_cache_tests)
         add_test(NAME kyty_shim_rt_probe_cache COMMAND kyty_shim_rt_probe_cache_tests)
         set_tests_properties(kyty_shim_rt_probe_cache PROPERTIES TIMEOUT 20)
-        add_dependencies(kyty_shim_rt_probe_cache_tests kyty_rt_probe)
-        add_test(NAME kyty_shim_rt_probe_export COMMAND "${CMAKE_COMMAND}"
-                "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/rt probe export"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/RtProbeExport.cmake"
-                $<TARGET_FILE:kyty_shim_rt_probe_cache_tests> $<TARGET_FILE:kyty_rt_probe>)
-        set_tests_properties(kyty_shim_rt_probe_export PROPERTIES TIMEOUT 30)
-        if(WIN32)
+        if(NOT ANYPS5_KYTY_DLL)
+            add_dependencies(kyty_shim_rt_probe_cache_tests kyty_rt_probe)
+            add_test(NAME kyty_shim_rt_probe_export COMMAND "${CMAKE_COMMAND}"
+                    "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/rt probe export"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/RtProbeExport.cmake"
+                    $<TARGET_FILE:kyty_shim_rt_probe_cache_tests> $<TARGET_FILE:kyty_rt_probe>)
+            set_tests_properties(kyty_shim_rt_probe_export PROPERTIES TIMEOUT 30)
+        endif()
+        if(WIN32 AND NOT ANYPS5_KYTY_DLL)
             set_tests_properties(kyty_shim_rt_probe_export PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
         endif()
@@ -174,6 +183,27 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
             add_test(NAME kyty_shim_memory_sparse_reads_switch
                     COMMAND sh -c "\"$0\" 2>&1 | grep -q 'ANYPS5_KYTY_SPARSE_READS=2 is neither 0 nor 1'" $<TARGET_FILE:kyty_shim_memory_tests>)
             set_tests_properties(kyty_shim_memory_sparse_reads_switch PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=2")
+        endif()
+    endif()
+    if(FALSE AND NOT ANYPS5_KYTY_DLL)
+        target_sources(libSceAgcDriver PRIVATE KytyShim/tools/ComputePipelineReplayDriver.cpp)
+        target_include_directories(libSceAgcDriver SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+        add_executable(kyty_compute_pipeline_replay EXCLUDE_FROM_ALL KytyShim/tools/ComputePipelineReplay.cpp)
+        set_target_properties(kyty_compute_pipeline_replay PROPERTIES CXX_EXTENSIONS OFF
+                RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+        target_link_libraries(kyty_compute_pipeline_replay PRIVATE libSceAgcDriver)
+        configure_windows_unwind(kyty_compute_pipeline_replay)
+        if(MINGW)
+            target_link_options(kyty_compute_pipeline_replay PRIVATE -municode)
+        endif()
+        if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
+            add_custom_target(kyty_compute_replay_runtime
+                    COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=${ANYPS5_TEST_OUTPUT_DIRECTORY}"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake"
+                    "$<TARGET_FILE:libSceAgcDriver>" "$<TARGET_FILE:libkernel>" "$<TARGET_FILE:libc>"
+                    DEPENDS libSceAgcDriver libkernel libc
+                    VERBATIM)
+            add_dependencies(kyty_compute_pipeline_replay kyty_compute_replay_runtime)
         endif()
     endif()
     add_executable(agc_frame_replay EXCLUDE_FROM_ALL
@@ -443,7 +473,7 @@ foreach(agcSampleOrderVariant IN ITEMS "R8;comp;-DTEXEL_FORMAT=r8ui" "R16;comp;-
     )
     list(APPEND agcSampleOrderShaderHeaders ${agcSampleOrderShaderHeader})
 endforeach()
-foreach(agcFirstSampleClass IN ITEMS Float Uint Sint)
+foreach(agcFirstSampleClass IN ITEMS Float Uint Sint Packed)
     string(TOUPPER "${agcFirstSampleClass}" agcFirstSampleSymbol)
     set(agcFirstSampleShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/FirstSample.frag)
     set(agcFirstSampleShaderSpv ${agcTextureDetileGeneratedDir}/FirstSample${agcFirstSampleClass}.spv)

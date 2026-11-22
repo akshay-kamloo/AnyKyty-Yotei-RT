@@ -46,6 +46,6 @@ private:
 	std::unique_ptr<Impl> m_impl;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_SYSTEMOVERLAY_H_

@@ -52,7 +52,7 @@ constexpr std::array<OpcodeMeta, static_cast<size_t>(ValueOpcode::Count)> MetaTa
 #undef VALUE_OPCODE
 }};
 
-}
+} // namespace
 
 Type TypeOf(ValueOpcode opcode) {
 	return MetaTable[static_cast<size_t>(opcode)].type;
@@ -95,7 +95,6 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
-		case ValueOpcode::StoreRelativeVgpr:
 		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::DataCacheInvalidate:
 		case ValueOpcode::RayQueryInitialize:
@@ -109,7 +108,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::RayQueryResult:
 		case ValueOpcode::RayQueryMark:
 		case ValueOpcode::RayQueryAlpha:
-		case ValueOpcode::RayQueryAlphaDistance: return true;
+		case ValueOpcode::RayQueryAlphaDistance:
+		case ValueOpcode::WaterfallRecord0Census: return true;
 		default: return false;
 	}
 }
@@ -271,4 +271,4 @@ ImageOpcodeInfo ImageOpcodeInfoOf(ValueOpcode opcode) {
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

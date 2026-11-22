@@ -14,9 +14,9 @@ struct ColorComponentMapping;
 
 enum class BlendMappingSupport {
 	Direct,
-	SourceAlpha,
-	SourceAlphaOne,
-	SourceAlphaZero,
+	SourceAlpha, // Requires logical alpha in the second blend source.
+	SourceAlphaOne, // Source alpha for RGB, one for alpha, with a shared destination equation.
+	SourceAlphaZero, // Source alpha for RGB, zero for alpha, with a shared destination equation.
 	Unsupported,
 };
 
@@ -24,6 +24,6 @@ bool                BlendFactorIsDualSource(uint8_t factor);
 BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                blend,
                                          const Prospero::ColorComponentMapping& mapping);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINE_BLENDMAPPING_H_

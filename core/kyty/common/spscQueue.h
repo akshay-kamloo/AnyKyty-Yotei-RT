@@ -28,6 +28,9 @@ inline void SpinPause() noexcept {
 #endif
 }
 
+// How long a pipeline thread spins on an empty or full handoff before it falls back to a kernel
+// wait: KYTY_GPU_SPIN_US microseconds, 2 ms by default. Within a busy frame the stages never
+// wait that long, so they never enter the kernel; an idle stage stops burning its core.
 inline std::chrono::nanoseconds SpinBudget() noexcept {
 	static const auto budget = [] {
 		uint64_t micros = 2000;
@@ -39,10 +42,13 @@ inline std::chrono::nanoseconds SpinBudget() noexcept {
 	return budget;
 }
 
+// Busy-waiting with an exponential _mm_pause backoff (1, 2, 4 ... 64 pauses per round) that
+// gives up once the spin budget is spent. The clock is read every few rounds only.
 class SpinWait {
 public:
 	SpinWait() noexcept: m_budget(SpinBudget()) {}
 
+	// Pauses once more; false once the budget is spent and the caller should sleep.
 	bool Spin() noexcept {
 		for (uint32_t i = 0; i < m_pauses; i++) {
 			SpinPause();
@@ -75,6 +81,17 @@ private:
 	uint64_t                              m_iterations = 0;
 };
 
+// A monotonically increasing counter one thread advances and any threads wait on.
+//
+// A waiter spins (SpinWait) and only then sleeps. A wake-up is only issued when the value
+// reaches the lowest target a sleeping thread registered. WaitFor() registers its target (it
+// lowers the shared one) and then reads the value, seq_cst; Notify() issues a seq_cst fence and
+// then reads the target. Either the waiter sees a value published before the fence, or Notify()
+// sees the target, takes the registration out and wakes every sleeper; a sleeper whose own
+// target is not reached yet registers it again and sleeps on. Sleepers wait on a wake count, not
+// on the value: a Notify() that takes a registration out while the value stays the same has to
+// wake them too, or the registration is gone and nobody wakes them later. Publish() alone is a
+// plain release store: a sleeper it satisfies wakes at the next Notify().
 class ProgressCounter {
 public:
 	ProgressCounter() = default;
@@ -88,10 +105,12 @@ public:
 		std::atomic_thread_fence(std::memory_order_seq_cst);
 		auto registered = m_wait_target.load(std::memory_order_relaxed);
 		if (registered <= m_value.load(std::memory_order_relaxed)) {
+			// The registered target is reached: every sleeper wakes and registers again. A
+			// lower target registered meanwhile stays.
 			(void)m_wait_target.compare_exchange_strong(registered, NoTarget,
 			                                            std::memory_order_seq_cst);
-			m_wakeups.fetch_add(1, std::memory_order_seq_cst);
-			m_wakeups.notify_all();
+			m_wake.fetch_add(1, std::memory_order_seq_cst);
+			m_wake.notify_all();
 		}
 	}
 
@@ -100,6 +119,8 @@ public:
 		Notify();
 	}
 
+	// Waits until the counter reaches `target`; the wait acquires every write the advancing
+	// thread made before it reached `target`.
 	void WaitFor(uint64_t target) noexcept {
 		if (m_value.load(std::memory_order_acquire) >= target) {
 			return;
@@ -111,16 +132,22 @@ public:
 			}
 		}
 		for (;;) {
-			const auto wakeups = m_wakeups.load(std::memory_order_seq_cst);
+			const auto wake = m_wake.load(std::memory_order_seq_cst);
+			// Lower the registered target to ours: another thread may sleep on a lower one.
 			auto registered = m_wait_target.load(std::memory_order_seq_cst);
 			while (registered > target &&
 			       !m_wait_target.compare_exchange_weak(registered, target,
 			                                            std::memory_order_seq_cst)) {
 			}
-			if (m_value.load(std::memory_order_seq_cst) >= target) {
+			const auto value = m_value.load(std::memory_order_seq_cst);
+			if (value >= target) {
 				break;
 			}
-			m_wakeups.wait(wakeups, std::memory_order_seq_cst);
+			// A Notify() took the registration out since: register again.
+			if (m_wait_target.load(std::memory_order_seq_cst) > target) {
+				continue;
+			}
+			m_wake.wait(wake, std::memory_order_seq_cst);
 		}
 	}
 
@@ -129,9 +156,24 @@ private:
 
 	alignas(64) std::atomic_uint64_t m_value {0};
 	alignas(64) std::atomic_uint64_t m_wait_target {NoTarget};
-	std::atomic_uint32_t             m_wakeups {0};
+	std::atomic_uint32_t             m_wake {0};
 };
 
+// A bounded lock-free single-producer single-consumer ring. Push() waits while the ring is full
+// and Pop() waits while it is empty: they spin (SpinWait) and only then sleep.
+//
+// The producer constructs an element in its slot and then publishes it with a release store of
+// m_tail; the consumer acquires m_tail before it reads the slot. The consumer moves the element
+// out, destroys it and then releases the slot with a release store of m_head; the producer
+// acquires m_head before it reuses the slot. The indices live on separate cache lines, and each
+// side keeps a cached copy of the other side's index so it only reads the shared line when the
+// cached one says the ring is full or empty.
+//
+// A side that sleeps announces itself and then re-reads the index it waits on, seq_cst. The
+// producer looks for a sleeping consumer behind a seq_cst fence after every push. The consumer
+// does so every CheckInterval pops and before it sleeps itself: a producer only sleeps on a full
+// ring, so a consumer that keeps popping reaches a check soon, and one that stops popping is
+// about to sleep. Either way one side sees the other.
 template <typename T>
 class SpscQueue {
 public:
@@ -159,6 +201,7 @@ public:
 		Construct(tail, std::move(value));
 	}
 
+	// Returns false (and keeps `value`) when the ring is full.
 	bool TryPush(T& value) {
 		const auto tail = m_tail.load(std::memory_order_relaxed);
 		if (tail - m_producer_head >= m_capacity) {
@@ -171,6 +214,7 @@ public:
 		return true;
 	}
 
+	// Returns nothing once Stop() was called and the ring is empty.
 	[[nodiscard]] std::optional<T> Pop() {
 		const auto head = m_head.load(std::memory_order_relaxed);
 		if (m_consumer_tail == head) {
@@ -182,6 +226,7 @@ public:
 		return Take(head);
 	}
 
+	// Returns nothing when the ring is empty.
 	[[nodiscard]] std::optional<T> TryPop() {
 		const auto head = m_head.load(std::memory_order_relaxed);
 		if (m_consumer_tail == head) {
@@ -193,38 +238,42 @@ public:
 		return Take(head);
 	}
 
-	[[nodiscard]] const T* TryPeek() {
+	// Consumer side: the element `index` places after the front, without taking it (null: not published yet). The producer
+	// does not touch published places, so it stays valid until the consumer pops past it (project 15 N4).
+	[[nodiscard]] const T* PeekAt(size_t index) {
 		const auto head = m_head.load(std::memory_order_relaxed);
-		if (m_consumer_tail == head) {
+		if (m_consumer_tail - head <= index) {
 			m_consumer_tail = m_tail.load(std::memory_order_acquire);
-			if (m_consumer_tail == head) {
-				return nullptr;
-			}
+			if (m_consumer_tail - head <= index) return nullptr;
 		}
-		return Element(head);
+		return Element(head + index);
 	}
 
+	// Any thread: wakes the consumer, whose Pop() returns nothing once the ring is empty.
 	void Stop() {
 		m_stopped.store(true, std::memory_order_seq_cst);
 		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
 		m_consumer_signal.notify_all();
 	}
 
-	void Interrupt() {
-		m_interrupted.store(true, std::memory_order_seq_cst);
-		m_consumer_signal.fetch_add(1, std::memory_order_seq_cst);
-		m_consumer_signal.notify_all();
-	}
-
-	[[nodiscard]] bool IsStopped() const noexcept {
-		return m_stopped.load(std::memory_order_acquire);
-	}
-
 	[[nodiscard]] size_t Capacity() const noexcept { return m_capacity; }
+
+	// Any thread: about how many elements are in the ring (the two indices are read at different times).
+	[[nodiscard]] size_t SizeApprox() const noexcept {
+		const auto tail = m_tail.load(std::memory_order_relaxed);
+		const auto head = m_head.load(std::memory_order_relaxed);
+		return tail >= head ? static_cast<size_t>(tail - head) : 0;
+	}
+
+	// Consumer: nothing to pop now (for a consumer that waits for more than this ring).
+	[[nodiscard]] bool Empty() const noexcept {
+		return m_tail.load(std::memory_order_seq_cst) == m_head.load(std::memory_order_relaxed);
+	}
 
 private:
 	static constexpr uint32_t CheckInterval = 16;
 
+	// A slot per cache line at least: the producer writes one while the consumer reads another.
 	struct alignas(alignof(T) > 64 ? alignof(T) : 64) Slot {
 		std::byte storage[sizeof(T)];
 	};
@@ -283,7 +332,9 @@ private:
 		m_producer_sleeping.store(false, std::memory_order_relaxed);
 	}
 
+	// False when stopped with nothing left to pop.
 	bool WaitForElement(uint64_t head) {
+		// The producer may be asleep on a full ring the consumer drained without a check.
 		WakeProducer();
 		SpinWait spin;
 		while (spin.Spin()) {
@@ -291,8 +342,7 @@ private:
 			if (m_consumer_tail != head) {
 				return true;
 			}
-			if (m_stopped.load(std::memory_order_relaxed) ||
-			    m_interrupted.load(std::memory_order_relaxed)) {
+			if (m_stopped.load(std::memory_order_relaxed)) {
 				break;
 			}
 		}
@@ -305,16 +355,12 @@ private:
 				available = true;
 				break;
 			}
-			if (m_stopped.load(std::memory_order_seq_cst) ||
-			    m_interrupted.load(std::memory_order_seq_cst)) {
+			if (m_stopped.load(std::memory_order_seq_cst)) {
 				break;
 			}
 			m_consumer_signal.wait(signal, std::memory_order_seq_cst);
 		}
 		m_consumer_sleeping.store(false, std::memory_order_relaxed);
-		if (!available) {
-			m_interrupted.store(false, std::memory_order_relaxed);
-		}
 		return available;
 	}
 
@@ -322,20 +368,21 @@ private:
 	const uint64_t          m_mask;
 	std::unique_ptr<Slot[]> m_slots;
 
+	// Consumer side.
 	alignas(64) std::atomic_uint64_t m_head {0};
 	uint64_t             m_consumer_tail  = 0;
 	uint32_t             m_unchecked_pops = 0;
 	std::atomic_bool     m_consumer_sleeping {false};
 	std::atomic_uint32_t m_consumer_signal {0};
 	std::atomic_bool     m_stopped {false};
-	std::atomic_bool     m_interrupted {false};
 
+	// Producer side.
 	alignas(64) std::atomic_uint64_t m_tail {0};
 	uint64_t             m_producer_head = 0;
 	std::atomic_bool     m_producer_sleeping {false};
 	std::atomic_uint32_t m_producer_signal {0};
 };
 
-}
+} // namespace Common
 
-#endif
+#endif // KYTY_COMMON_SPSCQUEUE_H_

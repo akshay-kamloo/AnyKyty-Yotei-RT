@@ -1,10 +1,10 @@
-#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/performanceOverlay.h"
 
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/hostStats.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/presentation/brushStroke.h"
 #include "imgui.h"
 #include "kernel/memory.h"
 
@@ -12,14 +12,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <optional>
-#include <span>
 #include <stop_token>
-#include <string>
 #include <thread>
 
 namespace Libs::Graphics {
@@ -32,29 +32,14 @@ using Peak    = Common::DebugCounters::Peak;
 
 constexpr auto   REFRESH_INTERVAL  = std::chrono::seconds(1);
 constexpr size_t FRAME_HISTORY     = 120;
-constexpr float  FRAME_GRAPH_MS    = 50.0f;
+// The graph's top: 100 ms, so ~45 ms frames sit mid-height instead of pinning to the top.
+constexpr float  FRAME_GRAPH_MS    = 100.0f;
 constexpr float  FRAME_TIME_GOOD   = 17.5f;
 constexpr float  FRAME_TIME_MEDIUM = 34.0f;
 constexpr size_t COUNTER_COUNT     = static_cast<size_t>(Counter::Count);
-constexpr auto   HITCH_WINDOW      = std::chrono::seconds(10);
-constexpr size_t HITCH_HISTORY     = 256;
 
-using CounterTotals = std::array<uint64_t, COUNTER_COUNT>;
-
-CounterTotals ReadCounters() {
-	CounterTotals totals {};
-	for (size_t i = 0; i < totals.size(); i++) {
-		totals[i] = Common::DebugCounters::Get(static_cast<Counter>(i));
-	}
-	return totals;
-}
-
-struct Hitch {
-	Clock::time_point time {};
-	float             ms = 0.0f;
-	CounterTotals     deltas {};
-};
-
+// Tables as wide as their columns; the default fills the window, which an auto-resizing
+// window then never shrinks.
 constexpr ImGuiTableFlags TABLE_FLAGS =
     ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_NoHostExtendX;
 
@@ -63,69 +48,46 @@ constexpr ImU32 MEDIUM  = IM_COL32(230, 195, 60, 255);
 constexpr ImU32 BAD     = IM_COL32(235, 80, 70, 255);
 constexpr ImU32 NEUTRAL = IM_COL32(160, 160, 160, 255);
 
+// The panel's look (design mockup, style 2 "Narożniki"): ink background (--bg #171513, at the
+// panel's own opacity), gold brush strokes in two corners, frame times as short brush strokes.
+constexpr ImU32 PANEL_INK   = IM_COL32(0x17, 0x15, 0x13, 255);
+constexpr ImU32 GRAPH_RULE  = IM_COL32(236, 232, 224, 41);  // rgba(236,232,224,.16)
+constexpr ImU32 GRAPH_LABEL = IM_COL32(236, 232, 224, 115); // rgba(236,232,224,.45)
+
+struct FrameReference {
+	float       ms;
+	const char* label;
+};
+constexpr std::array<FrameReference, 3> FRAME_REFERENCES {{
+    {1000.0f / 60.0f, "60"},
+    {1000.0f / 30.0f, "30"},
+    {1000.0f / 20.0f, "20"},
+}};
+
 struct FrameWindow {
 	std::array<float, FRAME_HISTORY> intervals_ms {};
 	size_t                           next         = 0;
 	size_t                           count        = 0;
+	uint64_t                         recorded     = 0; // intervals ever recorded: each one's id for the graph
 	uint32_t                         flips        = 0;
 	float                            max_ms       = 0.0f;
 	uint32_t                         guest_width  = 0;
 	uint32_t                         guest_height = 0;
 	Clock::time_point                last_flip    = {};
 	Clock::time_point                window_start = {};
-	CounterTotals                    flip_totals {};
-	float                            average_ms = 0.0f;
-	std::array<Hitch, HITCH_HISTORY> hitches {};
-	size_t                           next_hitch = 0;
-
-	void Record(Clock::time_point now, const CounterTotals& totals) {
-		if (window_start == Clock::time_point {}) {
-			window_start = now;
-		}
-		if (last_flip != Clock::time_point {}) {
-			const float ms     = std::chrono::duration<float, std::milli>(now - last_flip).count();
-			intervals_ms[next] = ms;
-			next               = (next + 1) % FRAME_HISTORY;
-			count              = std::min(count + 1, FRAME_HISTORY);
-			max_ms             = std::max(max_ms, ms);
-			if (average_ms > 0.0f && ms > 50.0f && ms >= 2.0f * average_ms) {
-				auto& hitch = hitches[next_hitch];
-				hitch.time  = now;
-				hitch.ms    = ms;
-				for (size_t i = 0; i < totals.size(); i++) {
-					hitch.deltas[i] = totals[i] - flip_totals[i];
-				}
-				next_hitch = (next_hitch + 1) % HITCH_HISTORY;
-			}
-			average_ms = average_ms > 0.0f ? average_ms * 0.95f + ms * 0.05f : ms;
-		}
-		flip_totals = totals;
-		last_flip   = now;
-		flips++;
-	}
-
-	size_t RecentHitches(Clock::time_point now) const {
-		return std::count_if(hitches.begin(), hitches.end(), [now](const Hitch& hitch) {
-			return hitch.ms > 0.0f && hitch.time <= now && now - hitch.time < HITCH_WINDOW;
-		});
-	}
 };
 
+// Shown values, recomputed once per refresh interval.
 struct Snapshot {
 	double                              fps          = 0.0;
 	double                              frame_ms     = 0.0;
 	double                              max_frame_ms = 0.0;
-	double                              low_fps      = 0.0;
+	double                              low_fps      = 0.0; // From the 99th percentile.
 	double                              stalled_s    = 0.0;
 	uint32_t                            guest_width  = 0;
 	uint32_t                            guest_height = 0;
 	std::array<double, COUNTER_COUNT>   rates {};
 	std::array<uint64_t, COUNTER_COUNT> totals {};
-	CounterTotals                       deltas {};
-	uint32_t                            frame_count = 0;
-	size_t                              recent_hitches = 0;
-	Hitch                               last_hitch;
-	std::string                         hitch_activity;
 	uint64_t                            shader_compile_peak_ns  = 0;
 	uint64_t                            pipeline_create_peak_ns = 0;
 	Common::HostStats                   host;
@@ -135,6 +97,7 @@ struct Snapshot {
 	uint32_t                                                   heap_count = 0;
 	std::array<float, FRAME_HISTORY>                           history {};
 	size_t                                                     history_count = 0;
+	uint64_t                                                   history_first = 0; // id of history[0]
 	Clock::time_point                                          sample_time {};
 	LibKernel::Memory::DebugStats                              guest_memory;
 };
@@ -144,7 +107,6 @@ FrameWindow           g_frames;
 std::atomic<uint64_t> g_generation {0};
 std::atomic<bool>     g_details {false};
 std::atomic<uint64_t> g_revision {0};
-std::atomic<uint64_t> g_guest_flips {0};
 
 std::mutex                  g_host_mutex;
 Common::HostStats           g_host_stats;
@@ -170,6 +132,9 @@ bool GuestStalled(Clock::time_point now) {
 	return now - g_frames.last_flip >= REFRESH_INTERVAL;
 }
 
+// Host statistics can block for milliseconds (IOKit, thread enumeration), so sample them off
+// the present path. While the guest stops flipping (loading screens), ask for one repaint per
+// interval.
 void SamplerThread(const std::stop_token& stop) {
 	std::optional<Common::HostStatsSampler> sampler;
 	uint64_t                                sampled_generation = 0;
@@ -205,17 +170,12 @@ void EnsureSampler() {
 }
 
 ImU32 FrameTimeColor(double ms) {
-	if (ms <= FRAME_TIME_GOOD) {
-		return GOOD;
-	}
-	return ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
+	return ms <= FRAME_TIME_GOOD ? GOOD : ms <= FRAME_TIME_MEDIUM ? MEDIUM : BAD;
 }
 
+// Green below `warn`, yellow below `bad`, red above.
 ImU32 LevelColor(double value, double warn, double bad) {
-	if (value < warn) {
-		return GOOD;
-	}
-	return value < bad ? MEDIUM : BAD;
+	return value < warn ? GOOD : value < bad ? MEDIUM : BAD;
 }
 
 ImVec4 Color(ImU32 color) {
@@ -279,25 +239,51 @@ bool BeginSection(const char* title) {
 	return ImGui::BeginTable(title, 2, TABLE_FLAGS);
 }
 
-void DrawFrameGraph(const std::array<float, FRAME_HISTORY>& history, size_t count, float width,
-                    float height) {
+// The frame-time graph, "ticks" (style style 2): each frame a short brush stroke from the bottom up
+// to its time (0..100 ms), coloured as before; dashed 60 / 30 / 20 FPS lines labelled in a 16 px strip at the right.
+// `first_id` numbers history[0], so a stroke keeps its width, lean and opacity as the graph scrolls.
+void DrawFrameGraph(const std::array<float, FRAME_HISTORY>& history, size_t count, uint64_t first_id,
+                    float width, float height, float scale) {
 	const ImVec2 origin = ImGui::GetCursorScreenPos();
 	auto*        draw   = ImGui::GetWindowDrawList();
-	draw->AddRectFilled(origin, {origin.x + width, origin.y + height}, IM_COL32(0, 0, 0, 90));
-	const auto y_of = [&](float ms) {
-		return origin.y + height - std::min(ms, FRAME_GRAPH_MS) / FRAME_GRAPH_MS * height;
+	const float  plot_w = width - 16.0f * scale;
+	const float  top    = origin.y + 3.0f * scale;
+	const float  bottom = origin.y + height - 2.0f * scale;
+	const auto   y_of   = [&](float ms) {
+		return bottom - std::min(ms, FRAME_GRAPH_MS) / FRAME_GRAPH_MS * (bottom - top);
 	};
-	for (const float reference: {1000.0f / 60.0f, 1000.0f / 30.0f}) {
-		draw->AddLine({origin.x, y_of(reference)}, {origin.x + width, y_of(reference)},
-		              IM_COL32(255, 255, 255, 45));
+	// Reference lines: 2 px dashes 3 px apart, one pixel row, up to 18 px from the right edge.
+	ImFont*     font       = ImGui::GetFont();
+	const float label_size = 8.5f * scale;
+	const float dash       = 2.0f * scale;
+	const float period     = 5.0f * scale;
+	const float rule_end   = origin.x + width - 18.0f * scale;
+	const int   dashes     = std::max(0, static_cast<int>((rule_end - origin.x) / period) + 1);
+	for (const auto& reference: FRAME_REFERENCES) {
+		const float y = std::floor(y_of(reference.ms));
+		draw->PrimReserve(dashes * 6, dashes * 4);
+		for (int i = 0; i < dashes; i++) {
+			const float x = origin.x + static_cast<float>(i) * period;
+			draw->PrimRect({x, y}, {std::min(x + dash, rule_end), y + 1.0f}, GRAPH_RULE);
+		}
+		const ImVec2 dim =
+		    font->CalcTextSizeA(label_size, std::numeric_limits<float>::max(), 0.0f, reference.label);
+		draw->AddText(font, label_size, {origin.x + width - dim.x, y + 0.5f - dim.y * 0.5f}, GRAPH_LABEL,
+		              reference.label);
 	}
-	const float bar = width / static_cast<float>(FRAME_HISTORY);
+	// The strokes, newest at the right; the label strip clips them.
+	draw->PushClipRect(origin, {origin.x + plot_w, origin.y + height}, true);
+	const float step = plot_w / static_cast<float>(FRAME_HISTORY);
 	for (size_t i = 0; i < count; i++) {
-		const float ms = history[i];
-		const float x  = origin.x + width - static_cast<float>(count - i) * bar;
-		draw->AddRectFilled({x, y_of(ms)}, {x + std::max(bar - 1.0f, 1.0f), origin.y + height},
-		                    FrameTimeColor(ms));
+		const float ms   = history[i];
+		const float j    = Brush::Hash01(static_cast<uint32_t>(first_id + i));
+		const float x    = origin.x + plot_w - (static_cast<float>(count - 1 - i) + 0.5f) * step;
+		const float lean = j - 0.5f;
+		draw->AddLine({x + lean * scale, bottom}, {x, y_of(ms) + lean * 3.0f * scale},
+		              Brush::WithAlpha(FrameTimeColor(ms), 0.55f + 0.4f * j),
+		              std::max(1.2f * scale, step * (0.55f + 0.3f * j)));
 	}
+	draw->PopClipRect();
 	ImGui::Dummy({width, height});
 }
 
@@ -368,6 +354,7 @@ void TransferRow(const Snapshot& shown, const char* label, Counter upload, Count
 void GpuActivityRows(const Snapshot& shown) {
 	const auto draws = Rate(shown, Counter::Draws);
 	Row("Draw calls", Fmt("%.0f/frame  %.0f/s", draws / std::max(shown.fps, 1.0), draws));
+	// Includes present pacing waits, so a high value alone is not a stall.
 	Row("CPU waiting on GPU",
 	    Fmt("%.0f ms/s  (%.0f waits/s)", Rate(shown, Counter::GpuWaitNs) / 1e6,
 	        Rate(shown, Counter::GpuWaits)));
@@ -395,65 +382,6 @@ void CompilationRows(const Snapshot& shown) {
 	    shown.pipeline_create_peak_ns);
 }
 
-void FrameTimingRows(const Snapshot& shown) {
-	const auto ms = [&](Counter counter) {
-		return static_cast<double>(shown.deltas[static_cast<size_t>(counter)]) / 1e6;
-	};
-	const auto row = [&](const char* label, double first, double second) {
-		Row(label, shown.frame_count > 0
-		               ? Fmt("%.1f / %.1f", first / shown.frame_count, second / shown.frame_count)
-					   : std::string("n/a"));
-	};
-	row("Guest GPU / compile", ms(Counter::GpuThreadBusyNs),
-	    ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs));
-	row("GPU wait / present", ms(Counter::GpuWaitNs), ms(Counter::PresentNs));
-	row("Acquire / overlay", ms(Counter::PresentAcquireNs), ms(Counter::OverlayNs));
-}
-
-std::string HitchActivity(const Hitch& hitch) {
-	const auto delta = [&](Counter counter) {
-		return static_cast<double>(hitch.deltas[static_cast<size_t>(counter)]);
-	};
-	const auto ms = [&](Counter counter) { return delta(counter) / 1e6; };
-	struct Activity {
-		const char* name;
-		double      ms;
-	};
-	std::array activity {
-	    Activity {"compile", ms(Counter::ShaderCompileNs) + ms(Counter::PipelineCreateNs)},
-	    Activity {"GPU wait", ms(Counter::GpuWaitNs)},
-	    Activity {"readback", ms(Counter::ColorMetadataReadbackNs)},
-	    Activity {"acquire", ms(Counter::PresentAcquireNs)},
-	    Activity {"overlay", ms(Counter::OverlayNs)},
-	    Activity {"other present",
-		          std::max(0.0, ms(Counter::PresentNs) - ms(Counter::PresentAcquireNs) -
-		                            ms(Counter::OverlayNs))}};
-	std::partial_sort(activity.begin(), activity.begin() + 2, activity.end(),
-	                  [](const Activity& a, const Activity& b) { return a.ms > b.ms; });
-	std::string text;
-	size_t      count = 0;
-	const auto  add   = [&](bool include, const std::string& hint) {
-		if (include && count < 2) {
-			text += (count++ == 0 ? "" : ", ") + hint;
-		}
-	};
-	for (const auto& item: std::span(activity).first<2>()) {
-		add(item.ms >= std::max(1.0, hitch.ms * 0.1), Fmt("%s %.0f ms", item.name, item.ms));
-	}
-	const double uploads =
-	    (delta(Counter::TextureUploadBytes) + delta(Counter::BufferUploadBytes)) /
-	    (1024.0 * 1024.0);
-	const double reads = delta(Counter::GuestFileReadBytes) / (1024.0 * 1024.0);
-	add(delta(Counter::SwapchainRecreations) > 0, "swapchain rebuild");
-	add(uploads >= 8.0, Fmt("uploads %.0f MB", uploads));
-	add(reads >= 1.0, Fmt("file reads %.0f MB", reads));
-	if (text.empty()) {
-		add(ms(Counter::GpuThreadBusyNs) >= std::max(1.0, hitch.ms * 0.1),
-		    Fmt("guest GPU %.0f ms", ms(Counter::GpuThreadBusyNs)));
-	}
-	return text.empty() ? "no clear activity" : text;
-}
-
 void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point now,
              uint64_t generation) {
 	const double seconds = shown.sample_time == Clock::time_point {}
@@ -461,13 +389,9 @@ void Refresh(Snapshot& shown, const GraphicContext& graphics, Clock::time_point 
 	                           : std::chrono::duration<double>(now - shown.sample_time).count();
 	for (size_t i = 0; i < COUNTER_COUNT; i++) {
 		const auto value = Common::DebugCounters::Get(static_cast<Counter>(i));
-		shown.deltas[i] = seconds > 0.0 ? value - shown.totals[i] : 0;
 		shown.rates[i] =
-		    seconds > 0.0 ? static_cast<double>(shown.deltas[i]) / seconds : 0.0;
+		    seconds > 0.0 ? static_cast<double>(value - shown.totals[i]) / seconds : 0.0;
 		shown.totals[i] = value;
-	}
-	if (seconds <= 0.0) {
-		shown.frame_count = 0;
 	}
 	shown.shader_compile_peak_ns  = Common::DebugCounters::Get(Peak::ShaderCompileNs);
 	shown.pipeline_create_peak_ns = Common::DebugCounters::Get(Peak::PipelineCreateNs);
@@ -532,14 +456,6 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("1% low", Fmt("%.1f FPS", shown.low_fps), FrameTimeColor(1000.0 / shown.low_fps));
 		}
 		Row("Worst frame", Fmt("%.1f ms", shown.max_frame_ms), FrameTimeColor(shown.max_frame_ms));
-		Row("Hitches (10 s)", Fmt("%zu", shown.recent_hitches),
-		    shown.recent_hitches > 0 ? MEDIUM : GOOD);
-		if (shown.last_hitch.ms > 0.0f) {
-			Row("Last hitch", Fmt("%.0f ms, %.0f s ago", shown.last_hitch.ms,
-			                     std::chrono::duration<double>(shown.sample_time -
-			                                                   shown.last_hitch.time).count()));
-			Row("  Activity", shown.hitch_activity);
-		}
 		Row("Guest output", shown.guest_width != 0
 		                        ? Fmt("%ux%u", shown.guest_width, shown.guest_height)
 		                        : std::string("n/a"));
@@ -569,11 +485,7 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 			Row("Host threads", Fmt("%u", *host.thread_count));
 		}
 		for (const auto& thread: host.busiest_threads) {
-			Row(Fmt("  %.24s", thread.name.c_str()).c_str(),
-			    shown.frame_count > 0 && shown.fps > 0.0
-			        ? Fmt("%.0f%%  ~%.1f ms/frame", thread.cpu_percent,
-			              thread.cpu_percent * 10.0 / shown.fps)
-			        : Fmt("%.0f%%  n/a ms/frame", thread.cpu_percent),
+			Row(Fmt("  %.24s", thread.name.c_str()).c_str(), Fmt("%.0f%%", thread.cpu_percent),
 			    LevelColor(thread.cpu_percent, 70, 95));
 		}
 		if (host.context_switches_per_s) {
@@ -595,18 +507,14 @@ void DrawFramesAndCpu(const Snapshot& shown, vk::Extent2D extent) {
 	}
 }
 
-std::string GpuName(const Common::HostStats& host, const GraphicContext& graphics) {
-	if (host.gpu_model.empty()) {
-		return graphics.GetPhysicalDeviceProperties().deviceName.data();
-	}
-	return host.gpu_cores ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
-	                      : host.gpu_model;
-}
-
 void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 	const auto& host = shown.host;
 	if (BeginSection("GPU")) {
-		Row("Device", GpuName(host, graphics));
+		Row("Device", host.gpu_model.empty()
+		                  ? std::string(graphics.GetPhysicalDeviceProperties().deviceName.data())
+		              : host.gpu_cores
+		                  ? Fmt("%s (%u cores)", host.gpu_model.c_str(), *host.gpu_cores)
+		                  : host.gpu_model);
 		Row("Utilization", Percent(host.gpu_percent),
 		    host.gpu_percent ? std::optional(LevelColor(*host.gpu_percent, 80, 95)) : std::nullopt);
 		if (host.gpu_renderer_percent || host.gpu_tiler_percent) {
@@ -633,11 +541,6 @@ void DrawGpu(const Snapshot& shown, const GraphicContext& graphics) {
 		CompilationRows(shown);
 		ImGui::EndTable();
 	}
-	if (BeginSection("Frame activity (ms/frame)")) {
-		FrameTimingRows(shown);
-		ImGui::EndTable();
-	}
-	ImGui::TextDisabled("Host time; scopes overlap");
 	if (BeginSection("GPU memory")) {
 		if (shown.device_memory) {
 			const double share = shown.device_budget != 0
@@ -678,14 +581,15 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 		    Bytes(guest.pooled_allocated) + " (" + Bytes(guest.pool_committed) + " committed)");
 		Row("Flexible", Bytes(guest.flexible_used) + " / " + Bytes(guest.flexible_total));
 		Row("Extended", Bytes(guest.automatic_allocated));
-		const auto percent = std::max(guest.cpu_page_entries * 100 / guest.cpu_page_entries_total,
-		                              guest.gpu_page_entries * 100 / guest.gpu_page_entries_total);
+		// Past its total a side sees no page-table entries available.
+		const auto percent = std::max(guest.cpu_page_entries * 100 / guest.page_entries_total,
+		                              guest.gpu_page_entries * 100 / guest.page_entries_total);
 		Row("Page table (2 MB)",
 		    Fmt("CPU %llu / %llu  GPU %llu / %llu",
 		        static_cast<unsigned long long>(guest.cpu_page_entries),
-		        static_cast<unsigned long long>(guest.cpu_page_entries_total),
+		        static_cast<unsigned long long>(guest.page_entries_total),
 		        static_cast<unsigned long long>(guest.gpu_page_entries),
-		        static_cast<unsigned long long>(guest.gpu_page_entries_total)),
+		        static_cast<unsigned long long>(guest.page_entries_total)),
 		    LevelColor(static_cast<double>(percent), 90, 100));
 		ImGui::EndTable();
 	}
@@ -734,21 +638,30 @@ void DrawMemoryAndIo(const Snapshot& shown) {
 	}
 }
 
-}
+} // namespace
 
 void PerformanceOverlayRecordFlip(uint32_t guest_width, uint32_t guest_height) noexcept {
-	g_guest_flips.fetch_add(1, std::memory_order_relaxed);
 	if (!Common::DebugCounters::Enabled()) {
 		return;
 	}
 	std::scoped_lock lock(g_frame_mutex);
-	g_frames.Record(Clock::now(), ReadCounters());
-	g_frames.guest_width  = guest_width;
-	g_frames.guest_height = guest_height;
-}
-
-uint64_t PerformanceOverlayGuestFlips() noexcept {
-	return g_guest_flips.load(std::memory_order_relaxed);
+	const auto       now = Clock::now();
+	if (g_frames.window_start == Clock::time_point {}) {
+		g_frames.window_start = now;
+	}
+	auto& frames = g_frames;
+	if (frames.last_flip != Clock::time_point {}) {
+		const float ms = std::chrono::duration<float, std::milli>(now - frames.last_flip).count();
+		frames.intervals_ms[frames.next] = ms;
+		frames.next                      = (frames.next + 1) % FRAME_HISTORY;
+		frames.count                     = std::min(frames.count + 1, FRAME_HISTORY);
+		frames.recorded++;
+		frames.max_ms                    = std::max(frames.max_ms, ms);
+	}
+	frames.last_flip    = now;
+	frames.guest_width  = guest_width;
+	frames.guest_height = guest_height;
+	frames.flips++;
 }
 
 bool PerformanceOverlayEnabled() noexcept {
@@ -796,6 +709,7 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			std::scoped_lock lock(g_frame_mutex);
 			auto&            frames = g_frames;
 			shown.history_count     = frames.count;
+			shown.history_first     = frames.recorded - frames.count;
 			for (size_t i = 0; i < frames.count; i++) {
 				shown.history[i] =
 				    frames.intervals_ms[(frames.next + FRAME_HISTORY - frames.count + i) %
@@ -808,9 +722,6 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			shown.fps            = seconds > 0.0 ? frames.flips / seconds : 0.0;
 			shown.frame_ms       = frames.flips > 0 ? seconds * 1000.0 / frames.flips : 0.0;
 			shown.max_frame_ms   = frames.max_ms;
-			shown.frame_count    = frames.flips;
-			shown.recent_hitches = frames.RecentHitches(now);
-			shown.last_hitch = frames.hitches[(frames.next_hitch + HITCH_HISTORY - 1) % HITCH_HISTORY];
 			shown.stalled_s   = frames.last_flip == Clock::time_point {}
 			                        ? 0.0
 			                        : std::chrono::duration<double>(now - frames.last_flip).count();
@@ -820,7 +731,6 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 			frames.max_ms       = 0.0f;
 			frames.window_start = now;
 		}
-		shown.hitch_activity = HitchActivity(shown.last_hitch);
 		shown_details = details;
 		if (shown.history_count > 0) {
 			auto       sorted     = shown.history;
@@ -844,7 +754,10 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 	    ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus |
 	    ImGuiWindowFlags_AlwaysAutoResize;
 	ImGui::PushFont(nullptr, (details ? 13.0f : 15.0f) * scale);
-	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * scale);
+	// "Narożniki": ink background, small rounding, no border line (the brush corners are the frame).
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, PANEL_INK);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f * scale);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0f * scale, 8.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f * scale, 2.0f * scale});
 	ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, {4.0f * scale, 1.0f * scale});
@@ -857,9 +770,10 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 		} else {
 			ImGui::TextDisabled("Waiting for frames");
 		}
-		DrawFrameGraph(shown.history, shown.history_count, (details ? 330.0f : 260.0f) * scale,
-		               46.0f * scale);
+		DrawFrameGraph(shown.history, shown.history_count, shown.history_first,
+		               (details ? 330.0f : 260.0f) * scale, (details ? 62.0f : 54.0f) * scale, scale);
 		if (details) {
+			// Three columns keep the detailed panel within a 720p window.
 			if (ImGui::BeginTable("##details", 3, TABLE_FLAGS)) {
 				ImGui::TableNextRow();
 				ImGui::TableNextColumn();
@@ -879,13 +793,18 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 #else
 		ImGui::TextDisabled(details ? "Shift+F2 compact   F2 hide" : "Shift+F2 details   F2 hide");
 #endif
+		// The frame: gold brush strokes along the top-left and bottom-right corners, over the panel's edges.
+		const ImVec2 window_pos  = ImGui::GetWindowPos();
+		const ImVec2 window_size = ImGui::GetWindowSize();
+		Brush::DrawCornerFrame(ImGui::GetWindowDrawList(), window_pos,
+		                       {window_pos.x + window_size.x, window_pos.y + window_size.y}, scale);
 	}
 	const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
 	ImGui::End();
-	ImGui::PopStyleVar(4);
+	ImGui::PopStyleVar(5);
+	ImGui::PopStyleColor();
 	ImGui::PopFont();
 	return bottom;
 }
 
-}
-#endif
+} // namespace Libs::Graphics

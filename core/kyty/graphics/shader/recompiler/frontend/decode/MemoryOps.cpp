@@ -13,7 +13,7 @@ struct MemoryOpcodeInfo {
 	bool     data_signed     = false;
 	bool     typed           = false;
 	bool     formatted       = false;
-	uint32_t data_components = 0;
+	uint32_t data_components = 0; // D16 formats pack two components per dword
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -178,7 +178,7 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 	inst.data_components = info->data_components;
 }
 
-}
+} // namespace
 
 bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -269,7 +269,7 @@ bool IsFlatStoreOpcode(Opcode opcode) {
 	}
 }
 
-}
+} // namespace
 
 void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
@@ -301,6 +301,8 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.src_count = 0;
 		return;
 	}
+	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
+	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
 	DecodeScalarSource(soffset, pc, inst.src1);
 	inst.src_count = 2;
@@ -338,16 +340,15 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 
 	DecodeVectorGpr(vdata, inst.dst);
 	switch (inst.opcode) {
+		// D16 loads write one half of the destination and preserve the other.
 		case Opcode::BUFFER_LOAD_UBYTE_D16:
 		case Opcode::BUFFER_LOAD_SBYTE_D16:
-		case Opcode::BUFFER_LOAD_SHORT_D16: inst.dst.sdwa_sel = 4u; break;
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X: inst.dst.sdwa_sel = 4u; break;
 		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
-		case Opcode::BUFFER_STORE_SHORT_D16_HI:
-		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X: inst.dst.sdwa_sel = 5u; break;
-		case Opcode::BUFFER_STORE_BYTE_D16_HI: inst.dst.sdwa_sel = 2u; break;
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X: inst.dst.sdwa_sel = 5u; break;
 		default: break;
 	}
 	DecodeVectorGpr(vaddr, inst.src0);
@@ -432,6 +433,7 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
 	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI) {
+		// D16 loads reuse partial destinations to preserve the untouched half.
 		inst.dst.sdwa_sel = inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI ? 5u : 4u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
@@ -469,6 +471,7 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 		SetUnsupported(inst, Family::DS, opcode, "DS opcode is not implemented");
 	}
 	if (inst.opcode == Opcode::DS_ORDERED_COUNT) {
+		// Keep OFFSET1's wave type as well as its add/swap selector for GDS addressing.
 		inst.offset           = offset0 & 0xfcu;
 		inst.secondary_offset = offset1;
 		if (!inst.gds || ((offset1 >> 4u) & 3u) > 1u || ((offset1 >> 6u) & 3u) != 0u) {
@@ -522,6 +525,8 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	DecodeVectorGpr(vdst, inst.dst);
 	if (inst.opcode == Opcode::DS_READ_U16_D16 ||
 	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
+		// Native D16 reads update only the selected destination half. Reuse the partial
+		// destination representation so typed IR translation preserves the other half.
 		inst.dst.sdwa_sel = inst.opcode == Opcode::DS_READ_U16_D16 ? 4u : 5u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
@@ -535,4 +540,4 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	inst.src_count = DsSourceCount(inst.opcode);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

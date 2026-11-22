@@ -154,6 +154,6 @@ void                    ClampText(std::u16string* text, uint32_t limit);
 [[nodiscard]] bool      ApplyKeyboardFilterOutput(ExternalInput* input, uint16_t keycode,
                                                   uint32_t status, bool multiline);
 
-}
+} // namespace Libs::ImeCommon
 
-#endif
+#endif // EMULATOR_INCLUDE_EMULATOR_LIBS_IMECOMMON_H_

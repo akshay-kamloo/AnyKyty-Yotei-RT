@@ -24,7 +24,7 @@ int  AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq,
 int  DeleteEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id);
 void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_size);
 
-}
-}
+} // namespace Sync
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_SYNC_H_

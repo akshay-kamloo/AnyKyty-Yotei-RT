@@ -76,7 +76,6 @@ int KYTY_SYSV_ABI KernelTriggerUserEventForAll(int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec,
                                       void* udata);
-int KYTY_SYSV_ABI KernelDeleteTimerEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata);
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id);
@@ -92,6 +91,6 @@ uintptr_t KYTY_SYSV_ABI KernelGetEventId(const KernelEvent* ev);
 void* KYTY_SYSV_ABI     KernelGetEventUserData(const KernelEvent* ev);
 int KYTY_SYSV_ABI       KernelGetEventError(const KernelEvent* ev);
 
-}
+} // namespace Libs::LibKernel::EventQueue
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_EVENTQUEUE_H_ */

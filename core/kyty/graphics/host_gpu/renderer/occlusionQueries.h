@@ -4,223 +4,114 @@
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <algorithm>
-#include <atomic>
+#include <array>
 #include <cstdint>
-#include <deque>
-#include <memory>
-#include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
 
-class Buffer;
-class CommandRecorder;
-class CommandScheduler;
+class CommandBuffer;
 class RenderContext;
 
-namespace OcclusionCounters {
+// KYTY_FIX_OCCLUSION_QUERIES=1 (default off; read once, logged once as FIX_OCCLUSION_QUERIES): the guest's
+// occlusion counters (EVENT_WRITE PIXEL_PIPE_STAT_DUMP) are backed by host Vulkan occlusion queries and written into
+// guest memory by the GPU, at the point of the command stream where the guest dumped them. Without it every dump
+// publishes a synthetic count that always reads "visible" (Ghost of Yotei: the sun/moon flares of
+// Frame>Postprocessing>Bloom shine through walls and mountains, because the CS that turns 4 visible/total query
+// pairs into flare visibility reads 16/16 = 1.0 every frame).
+[[nodiscard]] bool OcclusionQueriesRequested();
 
-constexpr uint32_t DbCount  = 16;
-constexpr uint64_t DbStride = 16;
-constexpr uint64_t DumpSize  = (DbCount - 1u) * DbStride + sizeof(uint64_t);
-constexpr uint64_t ReadyBit  = uint64_t {1} << 63u;
-constexpr uint64_t ValueMask = ReadyBit - 1u;
-constexpr uint64_t UncountedSamples = uint64_t {1} << 24u;
-
-constexpr float ProxyBiasUnits = 64.0f;
-constexpr float ProxyBiasSlope = 1.0f;
-
-[[nodiscard]] constexpr uint64_t DbValue(uint32_t db, uint64_t total) {
-	return ReadyBit | (db == 0 ? (total & ValueMask) : 0u);
-}
-
-class Segments {
-public:
-	struct Dump {
-		uint64_t address    = 0;
-		uint64_t first_slot = 0;
-		uint64_t end_slot   = 0;
-		bool     uncounted  = false;
-	};
-
-	explicit Segments(uint32_t capacity, uint32_t max_open_frames = 8)
-	    : m_capacity(capacity), m_max_open_frames(max_open_frames) {}
-
-	[[nodiscard]] Dump OnDump(uint64_t address) {
-		Dump dump {.address    = address,
-		           .first_slot = m_segment_first,
-		           .end_slot   = m_next_slot,
-		           .uncounted  = m_uncounted};
-		m_segment_first  = m_next_slot;
-		m_uncounted      = false;
-		const auto begin = std::find_if(m_open.begin(), m_open.end(), [&](const Open& open) {
-			return open.address + sizeof(uint64_t) == address;
-		});
-		if (begin != m_open.end()) {
-			m_open.erase(begin);
-		} else {
-			m_open.push_back({address, m_frame});
-		}
-		return dump;
-	}
-
-	[[nodiscard]] bool Counting() const noexcept { return !m_open.empty(); }
-
-	void MarkUncounted() noexcept { m_uncounted = true; }
-
-	[[nodiscard]] bool AllocateSlot(uint32_t& slot) {
-		if (m_next_slot - m_released >= m_capacity) {
-			m_uncounted = true;
-			return false;
-		}
-		slot = static_cast<uint32_t>(m_next_slot % m_capacity);
-		m_next_slot++;
-		return true;
-	}
-
-	void Release(uint64_t end_slot) { m_released = std::max(m_released, end_slot); }
-
-	void OnFrame() {
-		m_frame++;
-		std::erase_if(
-		    m_open, [this](const Open& open) { return open.frame + m_max_open_frames < m_frame; });
-	}
-
-	[[nodiscard]] uint32_t Capacity() const noexcept { return m_capacity; }
-	[[nodiscard]] size_t   OpenQueries() const noexcept { return m_open.size(); }
-
-private:
-	struct Open {
-		uint64_t address = 0;
-		uint64_t frame   = 0;
-	};
-
-	uint32_t          m_capacity        = 0;
-	uint32_t          m_max_open_frames = 0;
-	uint64_t          m_next_slot       = 0;
-	uint64_t          m_released        = 0;
-	uint64_t          m_segment_first   = 0;
-	uint64_t          m_frame           = 0;
-	bool              m_uncounted       = false;
-	std::vector<Open> m_open;
-};
-
-}
-
+// The guest's occlusion queries. Everything runs on the GPU thread, in command order.
+//
+// Guest layout (PS5, GFX10 DBs): a dump at A writes the 64-bit sample counter of each of the 16 DBs to
+// A + db * 16 and sets bit 63 once the value is there; a query is a begin dump at A and an end dump at A + 8, and
+// its result is the sum over the DBs of (end - begin). The PS5 counts the samples that pass the depth/stencil
+// tests of every draw between the two dumps, also of draws that write no color, depth or stencil (a "total" pass
+// with the depth test off draws nothing at all but still counts).
+//
+// Host side: while a guest query is open, every render pass instance in which a guest draw is recorded is counted
+// by one host query (begun lazily right before the first guest draw of the instance, ended before the instance
+// ends or at the next dump), so the emulator's own blits and copies are never counted. Host queries are numbered
+// in one sequence, so the samples of any guest query (also nested or interleaved ones) are exactly the host
+// queries numbered between its begin and its end dump. A begin dump writes {0, ready} to the 16 begin slots; an end
+// dump writes {0, ready} to the 16 end slots and then copies the host results (32-bit, the low dword of each slot)
+// into the end slots of DB 1..15 with vkCmdCopyQueryPoolResults; DB 0 holds the samples of host queries that had to
+// be summed on the CPU when a guest query spanned more than 15 of them (rare: a submit and wait). The guest's sum
+// over the DBs is then the exact sample count, written on the GPU timeline before any later command reads it.
 class OcclusionQueries {
 public:
+	static constexpr uint32_t DbCount  = 16;
+	static constexpr uint64_t DbStride = 16;
+	// Bytes a dump writes, from its address: the 16 slots of one half (begin or end) of the 256-byte record.
+	static constexpr uint64_t DumpBytes = (DbCount - 1u) * DbStride + sizeof(uint64_t);
+	// Bit 63 of a slot (ready), in its high dword.
+	static constexpr uint32_t ReadyHigh = 0x80000000u;
+	// Host query slots (a ring) and the slots kept reset ahead of the next allocation.
+	static constexpr uint32_t Capacity   = 8192;
+	static constexpr uint32_t ResetBatch = 256;
+	static constexpr uint32_t ResetLow   = 16;
+	// Host results an end dump copies into DB 1..15 (DB 0: the CPU-summed part).
+	static constexpr uint32_t MaxCopied = DbCount - 1u;
+	// A begin dump without its end is forgotten after this many presented frames.
+	static constexpr uint32_t MaxOpenFrames = 8;
+
 	explicit OcclusionQueries(RenderContext& context);
 	~OcclusionQueries();
 	KYTY_CLASS_NO_COPY(OcclusionQueries);
 
+	// Host queries back the counters (KYTY_FIX_OCCLUSION_QUERIES=1 and the query pool exists).
 	[[nodiscard]] bool Enabled() const noexcept { return m_pool != nullptr; }
+	// A guest query is open: the samples of draws count on the PS5, also those of draws without any output.
+	[[nodiscard]] bool Counting() const noexcept { return !m_open.empty(); }
 
-	void Dump(CommandScheduler& scheduler, uint64_t address);
-	void OnBeginRendering(const CommandRecorder& recorder);
-	void OnEndRendering(const CommandRecorder& recorder);
-	void OnFrame();
-	void PublishCompleted(bool refresh);
-	void OnUnmap(uint64_t address, uint64_t size);
-	[[nodiscard]] bool HasPendingDumps() const {
-		std::lock_guard lock(m_mutex);
-		return !m_pending.empty();
-	}
-#if defined(ANYPS5_KYTY)
-	[[nodiscard]] uint64_t LastPendingDumpTick() const {
-		std::lock_guard lock(m_mutex);
-		return m_pending.empty() ? 0 : m_pending.back().tick;
-	}
-#endif
-	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
-#if defined(ANYPS5_KYTY)
-	void CountSkippedDraw();
-#endif
-
-	[[nodiscard]] bool PrepareRead(uint64_t address, uint64_t size);
-	[[nodiscard]] bool MayPrepareRead(uint64_t address, uint64_t size) const;
-	void               NoteReadTarget(uint64_t address, uint64_t size, const Buffer& buffer,
-	                                  uint64_t offset);
-	void               WriteForReaders();
-	void DropReadTargets() noexcept {
-		m_read_targets.clear();
-		m_read_dumps.clear();
-	}
-	void WaitForCounters(uint64_t address, uint64_t size);
+	// KYTY_FIX_OCCLUSION_QUERIES: PIXEL_PIPE_STAT_DUMP to `address` (8-byte aligned) at this point of the command
+	// stream. False when the host queries are not available (the caller then publishes the synthetic count).
+	[[nodiscard]] bool Dump(CommandBuffer& buffer, uint64_t address);
+	// Without host queries: the dump the caller published synthetically, only to know which guest queries are open
+	// (draw-drop diagnostics).
+	void NoteSyntheticDump(uint64_t address);
+	// Right before a guest draw command is recorded inside a render pass instance.
+	void BeforeDraw(vk::CommandBuffer recorder);
+	// CommandBuffer::EndRendering: before vkCmdEndRendering (ends the active host query in the instance) and after
+	// it (resets slots ahead; outside any render pass instance).
+	void BeforeEndRendering(vk::CommandBuffer recorder);
+	void AfterEndRendering(vk::CommandBuffer recorder);
 
 private:
-	void BeginQuery(const CommandRecorder& recorder);
-	void EndQuery(const CommandRecorder& recorder);
-	struct PendingDump {
-		OcclusionCounters::Segments::Dump dump;
-		uint64_t                          tick  = 0;
-		uint64_t                          frame = 0;
-		uint64_t                          seq   = 0;
-		bool                              write = true;
-	};
-	struct PendingPage {
-		uint64_t page     = UINT64_MAX;
-		uint64_t last_seq = 0;
-		uint64_t chunks   = 0;
-	};
-	static constexpr size_t PendingPageCount = 4096;
-	struct ReadDump {
-		uint64_t address = 0;
-		uint64_t seq     = 0;
-	};
-	struct ReadTarget {
-		uint64_t address        = 0;
-		uint64_t size           = 0;
-		uint64_t device_address = 0;
-		size_t   first_dump     = 0;
-		size_t   end_dump       = 0;
+	struct Open {
+		uint64_t address    = 0; // begin dump
+		uint64_t first_slot = 0; // first host query of the guest query
+		uint32_t frame      = 0; // DebugPresentCount() at the begin dump
+		bool     uncounted  = false;
 	};
 
-	void                   PublishFront(size_t count);
-	[[nodiscard]] bool     ReadResults(uint64_t first_slot, uint64_t end_slot);
-	void                   WriteCounters(uint64_t address);
-	void                   ResetSlots(uint64_t first_slot, uint64_t end_slot);
-	void                   ReleaseSlots(uint64_t end_slot);
-	void                   NotePendingPages(uint64_t address, uint64_t seq);
-	[[nodiscard]] bool     MayReadPendingDump(uint64_t address, uint64_t size) const;
-	void                   WaitAndPublish(uint64_t tick);
-	void                   CreateCounterPipeline();
+	// Pairs a dump with the open guest queries: the open entry it ends (end dump at begin + 8), or m_open.end() for
+	// a begin dump. Forgets begin dumps older than MaxOpenFrames.
+	std::vector<Open>::iterator Pair(uint64_t address);
+	[[nodiscard]] bool          CreatePool(vk::CommandBuffer recorder);
+	[[nodiscard]] uint64_t      OldestNeeded() const;
+	void                        ResetAhead(vk::CommandBuffer recorder);
+	// Submits, waits and sums the host results of [first, end) on the CPU.
+	[[nodiscard]] uint64_t      SumOnCpu(uint64_t first, uint64_t end);
+	// Records the guest writes of a dump: the 16 slots at `address` get {low, ready} from `low_dwords`, then
+	// (end dumps) the results of host queries [first, end) go to the low dwords of DB 1..
+	void                        WriteSlots(CommandBuffer& buffer, uint64_t address,
+	                                       const std::array<uint32_t, DbCount>& low_dwords, uint64_t first,
+	                                       uint64_t end);
 
-	RenderContext&              m_context;
-	vk::Device                  m_device = nullptr;
-	vk::QueryPool               m_pool   = nullptr;
-	vk::QueryControlFlags       m_control;
-	bool                        m_rendering    = false;
-	bool                        m_query_active = false;
-	uint32_t                    m_active_slot  = 0;
-	uint64_t                    m_frame        = 0;
-	mutable std::mutex          m_mutex;
-	OcclusionCounters::Segments m_segments;
-	uint64_t                    m_total = 0;
-	uint64_t                    m_completion_tick = 0;
-	std::deque<PendingDump>     m_pending;
-	std::vector<uint64_t>       m_results;
-	struct SlotHold {
-		uint64_t tick = 0;
-		uint64_t slot = 0;
-	};
-	uint64_t                    m_published_slot = 0;
-	uint64_t                    m_reset_slot     = 0;
-	std::deque<SlotHold>        m_holds;
-	uint64_t                    m_dump_seq = 0;
-	std::atomic<uint64_t>       m_published_seq {0};
-	std::vector<PendingPage>    m_pending_pages;
-	uint64_t                    m_evicted_seq = 0;
-	uint64_t                    m_pending_low  = 0;
-	uint64_t                    m_pending_high = 0;
-	std::vector<ReadTarget>     m_read_targets;
-	std::vector<ReadDump>       m_read_dumps;
-	std::unique_ptr<Buffer>     m_slot_results;
-	std::unique_ptr<Buffer>     m_totals;
-	vk::PipelineLayout          m_counter_layout   = nullptr;
-	vk::Pipeline                m_counter_pipeline = nullptr;
+	RenderContext&        m_context;
+	vk::Device            m_device = nullptr;
+	vk::QueryPool         m_pool   = nullptr;
+	vk::QueryControlFlags m_control;
+	bool                  m_failed      = false;
+	bool                  m_active      = false;
+	uint32_t              m_active_slot = 0;
+	uint64_t              m_next_slot   = 0; // next host query (sequence number; ring index = number % Capacity)
+	uint64_t              m_reset_end   = 0; // host queries before this number are reset for their current use
+	std::vector<Open>     m_open;
+	uint64_t              m_dumps = 0;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_OCCLUSIONQUERIES_H_

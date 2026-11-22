@@ -428,13 +428,7 @@ void FlushOracleCounts(EmitterState& s) {
 		});
 		if (!s.ray_stats || s.fault_buffer_variable == 0) return;
 		const auto marked = Binary(s, spv::OpINotEqual, b, Or(s, Or(s, rays, guest), proposed), U32(s, 0));
-		EmitIfCondition(s, LogicalAnd(s, elected, marked), [&] {
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RETURNED, guest);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RAYS, rays);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_CANDIDATES, proposed);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_ROUNDS, rounds);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_WAVES, waves);
-		});
+		(void)marked;
 	});
 }
 

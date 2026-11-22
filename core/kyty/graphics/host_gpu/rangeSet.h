@@ -4,7 +4,7 @@
 #include "common/assert.h"
 
 #include <algorithm>
-#include <cstddef>
+#include <array>
 #include <cstdint>
 #include <iterator>
 #include <utility>
@@ -12,262 +12,343 @@
 
 namespace Libs::Graphics {
 
+// 2-level chunked sorted interval set (B-tree leaves of up to 64 disjoint, non-adjacent ranges).
+// Keeps block max-ends in a compact parallel array for L1-resident binary search while capping
+// middle-insert / erase shifts to <= 63 elements instead of O(N).
 class RangeSet final {
 public:
-	bool Add(uint64_t address, uint64_t size) {
+	static constexpr uint32_t BlockCap = 64;
+	static constexpr uint32_t HalfCap  = BlockCap / 2;
+
+	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
-		auto first = LowerBound(address);
-		if (first != Pos {} && At(Prev(first)).end >= address) {
-			first = Prev(first);
-			if (At(first).begin <= address && At(first).end >= end) {
-				return false;
+		if (m_blocks.empty()) {
+			Block blk;
+			blk.count    = 1;
+			blk.items[0] = {address, end};
+			m_blocks.push_back(blk);
+			m_block_max_end.push_back(end);
+			return;
+		}
+		if (address > m_block_max_end.back()) {
+			auto& last = m_blocks.back();
+			if (last.count < BlockCap) {
+				last.items[last.count++] = {address, end};
+				m_block_max_end.back()   = end;
+			} else {
+				Block blk;
+				blk.count    = 1;
+				blk.items[0] = {address, end};
+				m_blocks.push_back(blk);
+				m_block_max_end.push_back(end);
 			}
-		} else if (first != EndPos() && At(first).begin == address && At(first).end >= end) {
-			return false;
+			return;
 		}
-		++m_version;
-		uint64_t begin = address;
-		uint64_t last  = end;
-		auto     it    = first;
-		for (; it != EndPos() && At(it).begin <= last; it = Next(it)) {
-			begin = std::min(begin, At(it).begin);
-			last  = std::max(last, At(it).end);
+		if (auto& last = m_blocks.back(); address >= last.items[last.count - 1].first) {
+			if (end > last.items[last.count - 1].second) {
+				last.items[last.count - 1].second = end;
+				m_block_max_end.back()            = end;
+			}
+			return;
 		}
-		const Interval merged {begin, last};
-		Replace(first, it, &merged, 1);
-		return true;
+
+		// First block whose max_end >= address (guaranteed < m_blocks.size()).
+		const size_t b = static_cast<size_t>(
+		    std::lower_bound(m_block_max_end.begin(), m_block_max_end.end(), address) - m_block_max_end.begin());
+		auto& blk = m_blocks[b];
+		auto* const begin_it = blk.items.data();
+		auto* const end_it   = begin_it + blk.count;
+		auto* it = std::lower_bound(begin_it, end_it, address,
+		                            [](const auto& r, uint64_t key) { return r.first < key; });
+		if (it != begin_it && (it - 1)->second >= address) {
+			--it;
+		}
+		uint32_t pos = static_cast<uint32_t>(it - begin_it);
+
+		if (pos == blk.count || blk.items[pos].first > address) {
+			if (pos < blk.count && blk.items[pos].first <= end) {
+				blk.items[pos].first = address;
+				if (end > blk.items[pos].second) {
+					blk.items[pos].second = end;
+				}
+			} else {
+				// Pure disjoint insert at `pos` inside block `b` (no overlap with neighbors).
+				InsertInBlock(b, pos, {address, end});
+				return;
+			}
+		} else {
+			if (blk.items[pos].second >= end) {
+				return;
+			}
+			blk.items[pos].second = end;
+		}
+
+		// Merge any subsequent overlapping or adjacent intervals inside block `b`.
+		uint32_t next      = pos + 1;
+		uint32_t merge_end = next;
+		while (merge_end < blk.count && blk.items[merge_end].first <= blk.items[pos].second) {
+			if (blk.items[merge_end].second > blk.items[pos].second) {
+				blk.items[pos].second = blk.items[merge_end].second;
+			}
+			++merge_end;
+		}
+		if (merge_end != next) {
+			const uint32_t tail = blk.count - merge_end;
+			if (tail > 0) {
+				std::move(blk.items.begin() + merge_end, blk.items.begin() + blk.count, blk.items.begin() + next);
+			}
+			blk.count -= (merge_end - next);
+		}
+
+		// If the merged interval is now at the end of block `b`, absorb overlapping/adjacent subsequent blocks.
+		if (pos + 1 == blk.count) {
+			uint64_t     cur_end    = blk.items[pos].second;
+			const size_t erase_from = b + 1;
+			size_t       nb         = b + 1;
+			while (nb < m_blocks.size() && m_blocks[nb].First() <= cur_end) {
+				if (m_block_max_end[nb] <= cur_end) {
+					++nb;
+				} else {
+					auto&    next_blk = m_blocks[nb];
+					uint32_t k        = 0;
+					while (k < next_blk.count && next_blk.items[k].first <= cur_end) {
+						if (next_blk.items[k].second > cur_end) {
+							cur_end = next_blk.items[k].second;
+						}
+						++k;
+					}
+					if (k == next_blk.count) {
+						++nb;
+					} else {
+						const uint32_t rem = next_blk.count - k;
+						std::move(next_blk.items.begin() + k, next_blk.items.begin() + next_blk.count,
+						          next_blk.items.begin());
+						next_blk.count      = rem;
+						m_block_max_end[nb] = next_blk.Last();
+						break;
+					}
+				}
+			}
+			blk.items[pos].second = cur_end;
+			m_block_max_end[b]    = cur_end;
+			if (nb > erase_from) {
+				m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(erase_from),
+				               m_blocks.begin() + static_cast<ptrdiff_t>(nb));
+				m_block_max_end.erase(m_block_max_end.begin() + static_cast<ptrdiff_t>(erase_from),
+				                      m_block_max_end.begin() + static_cast<ptrdiff_t>(nb));
+			}
+		} else {
+			m_block_max_end[b] = blk.Last();
+		}
 	}
 
-	bool Subtract(uint64_t address, uint64_t size) {
-		const auto end   = End(address, size);
-		auto       first = LowerBound(address);
-		if (first != Pos {} && At(Prev(first)).end > address) {
-			first = Prev(first);
+	void Subtract(uint64_t address, uint64_t size) {
+		const auto end = End(address, size);
+		if (m_blocks.empty() || address >= m_block_max_end.back() || end <= m_blocks.front().First()) {
+			return;
 		}
-		auto last = first;
-		while (last != EndPos() && At(last).begin < end) {
-			last = Next(last);
+		size_t b = static_cast<size_t>(
+		    std::upper_bound(m_block_max_end.begin(), m_block_max_end.end(), address) - m_block_max_end.begin());
+		while (b < m_blocks.size() && m_blocks[b].First() < end) {
+			if (m_blocks[b].First() >= address && m_block_max_end[b] <= end) {
+				size_t eb = b + 1;
+				while (eb < m_blocks.size() && m_block_max_end[eb] <= end) {
+					++eb;
+				}
+				m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(b),
+				               m_blocks.begin() + static_cast<ptrdiff_t>(eb));
+				m_block_max_end.erase(m_block_max_end.begin() + static_cast<ptrdiff_t>(b),
+				                      m_block_max_end.begin() + static_cast<ptrdiff_t>(eb));
+				continue;
+			}
+			auto& blk = m_blocks[b];
+			auto* const begin_it = blk.items.data();
+			auto* const end_it   = begin_it + blk.count;
+			auto* it = std::lower_bound(begin_it, end_it, address,
+			                            [](const auto& r, uint64_t key) { return r.first < key; });
+			if (it != begin_it && (it - 1)->second > address) {
+				--it;
+			}
+			uint32_t pos = static_cast<uint32_t>(it - begin_it);
+			if (pos == blk.count || blk.items[pos].first >= end) {
+				break;
+			}
+			if (blk.items[pos].first < address && blk.items[pos].second > end) {
+				const auto tail       = blk.items[pos].second;
+				blk.items[pos].second = address;
+				InsertInBlock(b, pos + 1, {end, tail});
+				return;
+			}
+			if (blk.items[pos].first < address) {
+				blk.items[pos].second = address;
+				++pos;
+			}
+			uint32_t del = pos;
+			while (del < blk.count && blk.items[del].second <= end) {
+				++del;
+			}
+			if (del < blk.count && blk.items[del].first < end) {
+				blk.items[del].first = end;
+			}
+			if (del != pos) {
+				const uint32_t tail = blk.count - del;
+				if (tail > 0) {
+					std::move(blk.items.begin() + del, blk.items.begin() + blk.count, blk.items.begin() + pos);
+				}
+				blk.count -= (del - pos);
+			}
+			if (blk.count == 0) {
+				m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(b));
+				m_block_max_end.erase(m_block_max_end.begin() + static_cast<ptrdiff_t>(b));
+			} else {
+				m_block_max_end[b] = blk.Last();
+				++b;
+			}
 		}
-		if (first == last) {
-			return false;
-		}
-		++m_version;
-		Interval parts[2];
-		size_t   count = 0;
-		if (At(first).begin < address) {
-			parts[count++] = {At(first).begin, address};
-		}
-		if (const auto tail = At(Prev(last)).end; tail > end) {
-			parts[count++] = {end, tail};
-		}
-		Replace(first, last, parts, count);
-		return true;
 	}
 
 	void Clear() {
-		++m_version;
 		m_blocks.clear();
-		m_heads.clear();
-		m_count = 0;
+		m_block_max_end.clear();
 	}
-
-	[[nodiscard]] uint64_t Version() const noexcept { return m_version; }
 
 	template <typename Func>
 	void ForEach(Func&& func) const {
-		for (const auto& block: m_blocks) {
-			for (const auto& range: block) {
-				func(range.begin, range.end);
+		for (const auto& blk: m_blocks) {
+			for (uint32_t i = 0; i < blk.count; ++i) {
+				func(blk.items[i].first, blk.items[i].second);
 			}
 		}
 	}
 
 	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		const auto it  = LowerBound(address);
-		if (it != Pos {} && At(Prev(it)).end > address) {
+		if (m_blocks.empty() || address >= m_block_max_end.back() || end <= m_blocks.front().First()) {
+			return false;
+		}
+		const size_t b = static_cast<size_t>(
+		    std::upper_bound(m_block_max_end.begin(), m_block_max_end.end(), address) - m_block_max_end.begin());
+		if (b >= m_blocks.size()) {
+			return false;
+		}
+		const auto& blk = m_blocks[b];
+		if (blk.First() >= end) {
+			return false;
+		}
+		const auto* const begin_it = blk.items.data();
+		const auto* const end_it   = begin_it + blk.count;
+		const auto* const it       = std::lower_bound(begin_it, end_it, address,
+		                                              [](const auto& r, uint64_t key) { return r.first < key; });
+		if (it != begin_it && (it - 1)->second > address) {
 			return true;
 		}
-		return it != EndPos() && At(it).begin < end;
-	}
-
-	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size, uint64_t& gap_begin,
-	                              uint64_t& gap_end) const {
-		const auto end = End(address, size);
-		const auto it  = LowerBound(address);
-		gap_begin      = 0;
-		if (it != Pos {}) {
-			const auto previous = At(Prev(it)).end;
-			if (previous > address) {
-				return true;
-			}
-			gap_begin = previous;
-		}
-		if (it != EndPos() && At(it).begin < end) {
-			return true;
-		}
-		gap_end = it != EndPos() ? At(it).begin : UINT64_MAX;
-		return false;
+		return it != end_it && it->first < end;
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
 		const auto end = End(address, size);
-		const auto it  = UpperBound(address);
-		if (it == Pos {}) {
+		if (m_blocks.empty() || address < m_blocks.front().First() || end > m_block_max_end.back()) {
 			return false;
 		}
-		const auto& range = At(Prev(it));
-		return range.begin <= address && range.end >= end;
+		const size_t b = static_cast<size_t>(
+		    std::upper_bound(m_block_max_end.begin(), m_block_max_end.end(), address) - m_block_max_end.begin());
+		if (b >= m_blocks.size()) {
+			return false;
+		}
+		const auto& blk = m_blocks[b];
+		if (blk.First() > address) {
+			return false;
+		}
+		const auto* const begin_it = blk.items.data();
+		const auto* const end_it   = begin_it + blk.count;
+		const auto* it             = std::upper_bound(begin_it, end_it, address,
+		                                              [](uint64_t key, const auto& r) { return key < r.first; });
+		if (it == begin_it) {
+			return false;
+		}
+		--it;
+		return it->first <= address && it->second >= end;
 	}
 
 	template <typename Func>
 	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
 		const auto end = End(address, size);
-		auto       it  = UpperBound(address);
-		if (it != Pos {}) {
-			it = Prev(it);
+		if (m_blocks.empty() || address >= m_block_max_end.back() || end <= m_blocks.front().First()) {
+			return;
 		}
-		for (; it != EndPos() && At(it).begin < end; it = Next(it)) {
-			const auto begin = std::max(address, At(it).begin);
-			const auto last  = std::min(end, At(it).end);
-			if (begin < last) {
-				func(begin, last);
+		size_t b = static_cast<size_t>(
+		    std::upper_bound(m_block_max_end.begin(), m_block_max_end.end(), address) - m_block_max_end.begin());
+		for (bool first_block = true; b < m_blocks.size() && m_blocks[b].First() < end; ++b, first_block = false) {
+			const auto&       blk      = m_blocks[b];
+			const auto* const begin_it = blk.items.data();
+			const auto* const end_it   = begin_it + blk.count;
+			const auto*       it       = begin_it;
+			if (first_block) {
+				it = std::upper_bound(begin_it, end_it, address,
+				                      [](uint64_t key, const auto& r) { return key < r.first; });
+				if (it != begin_it) {
+					--it;
+				}
+			}
+			for (; it != end_it && it->first < end; ++it) {
+				const auto begin = std::max(address, it->first);
+				const auto last  = std::min(end, it->second);
+				if (begin < last) {
+					func(begin, last);
+				}
 			}
 		}
 	}
 
-	[[nodiscard]] bool Empty() const { return m_count == 0; }
+	[[nodiscard]] bool Empty() const { return m_blocks.empty(); }
 
 private:
-	struct Interval {
-		uint64_t begin = 0;
-		uint64_t end   = 0;
+	struct Block {
+		uint32_t                                             count = 0;
+		std::array<std::pair<uint64_t, uint64_t>, BlockCap> items {};
+
+		[[nodiscard]] uint64_t First() const noexcept { return items[0].first; }
+		[[nodiscard]] uint64_t Last() const noexcept { return items[count - 1].second; }
 	};
-	using Intervals                 = std::vector<Interval>;
-	static constexpr size_t BlockMax = 128;
 
-	struct Pos {
-		size_t block = 0;
-		size_t index = 0;
-		bool   operator==(const Pos& other) const = default;
-	};
-	[[nodiscard]] Pos             EndPos() const { return {m_blocks.size(), 0}; }
-	[[nodiscard]] const Interval& At(Pos pos) const { return m_blocks[pos.block][pos.index]; }
-	[[nodiscard]] Pos             Next(Pos pos) const {
-        return ++pos.index < m_blocks[pos.block].size() ? pos : Pos {pos.block + 1, 0};
-	}
-	[[nodiscard]] Pos Prev(Pos pos) const {
-		return pos.index != 0 ? Pos {pos.block, pos.index - 1}
-		                      : Pos {pos.block - 1, m_blocks[pos.block - 1].size() - 1};
-	}
-	[[nodiscard]] Pos LowerBound(uint64_t address) const {
-		const auto block = static_cast<size_t>(
-		    std::lower_bound(m_heads.begin(), m_heads.end(), address) - m_heads.begin());
-		if (block == 0) {
-			return {};
-		}
-		const auto& ranges = m_blocks[block - 1];
-		const auto  index  = static_cast<size_t>(
-            std::lower_bound(ranges.begin(), ranges.end(), address,
-                             [](const Interval& range, uint64_t value) { return range.begin < value; }) -
-            ranges.begin());
-		return index < ranges.size() ? Pos {block - 1, index} : Pos {block, 0};
-	}
-	[[nodiscard]] Pos UpperBound(uint64_t address) const {
-		const auto block = static_cast<size_t>(
-		    std::upper_bound(m_heads.begin(), m_heads.end(), address) - m_heads.begin());
-		if (block == 0) {
-			return {};
-		}
-		const auto& ranges = m_blocks[block - 1];
-		const auto  index  = static_cast<size_t>(
-            std::upper_bound(ranges.begin(), ranges.end(), address,
-                             [](uint64_t value, const Interval& range) { return value < range.begin; }) -
-            ranges.begin());
-		return index < ranges.size() ? Pos {block - 1, index} : Pos {block, 0};
-	}
-
-	void Replace(Pos first, Pos last, const Interval* items, size_t count) {
-		if (m_blocks.empty()) {
-			if (count == 0) {
-				return;
+	void InsertInBlock(size_t b, uint32_t pos, std::pair<uint64_t, uint64_t> item) {
+		if (m_blocks[b].count < BlockCap) {
+			auto& blk = m_blocks[b];
+			if (pos < blk.count) {
+				std::move_backward(blk.items.begin() + pos, blk.items.begin() + blk.count,
+				                   blk.items.begin() + blk.count + 1);
 			}
-			m_blocks.emplace_back(items, items + count);
-			m_heads.push_back(items[0].begin);
-			m_count = count;
-			Fix(0);
+			blk.items[pos] = item;
+			++blk.count;
+			m_block_max_end[b] = blk.Last();
 			return;
 		}
-		const auto at_end = [&](Pos& pos) {
-			if (pos.block == m_blocks.size()) {
-				pos = {pos.block - 1, m_blocks[pos.block - 1].size()};
+		// Split full block into two blocks of HalfCap before inserting.
+		Block right;
+		right.count = BlockCap - HalfCap;
+		std::copy(m_blocks[b].items.begin() + HalfCap, m_blocks[b].items.begin() + BlockCap, right.items.begin());
+		m_blocks[b].count = HalfCap;
+		if (pos <= HalfCap) {
+			auto& left = m_blocks[b];
+			if (pos < left.count) {
+				std::move_backward(left.items.begin() + pos, left.items.begin() + left.count,
+				                   left.items.begin() + left.count + 1);
 			}
-		};
-		at_end(first);
-		at_end(last);
-		if (last.index == 0 && last.block > first.block) {
-			last = {last.block - 1, m_blocks[last.block - 1].size()};
-		}
-		if (first.block == last.block) {
-			auto& block = m_blocks[first.block];
-			m_count     = m_count - (last.index - first.index) + count;
-			if (count == last.index - first.index) {
-				std::copy(items, items + count, block.begin() + static_cast<ptrdiff_t>(first.index));
-			} else {
-				block.erase(block.begin() + static_cast<ptrdiff_t>(first.index),
-				            block.begin() + static_cast<ptrdiff_t>(last.index));
-				block.insert(block.begin() + static_cast<ptrdiff_t>(first.index), items, items + count);
+			left.items[pos] = item;
+			++left.count;
+		} else {
+			const uint32_t rpos = pos - HalfCap;
+			if (rpos < right.count) {
+				std::move_backward(right.items.begin() + rpos, right.items.begin() + right.count,
+				                   right.items.begin() + right.count + 1);
 			}
-			Fix(first.block);
-			return;
+			right.items[rpos] = item;
+			++right.count;
 		}
-		auto&  head_block = m_blocks[first.block];
-		auto&  tail_block = m_blocks[last.block];
-		size_t removed    = (head_block.size() - first.index) + last.index;
-		for (auto b = first.block + 1; b < last.block; ++b) {
-			removed += m_blocks[b].size();
-		}
-		m_count = m_count - removed + count;
-		tail_block.erase(tail_block.begin(), tail_block.begin() + static_cast<ptrdiff_t>(last.index));
-		head_block.erase(head_block.begin() + static_cast<ptrdiff_t>(first.index), head_block.end());
-		head_block.insert(head_block.end(), items, items + count);
-		m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(first.block + 1),
-		               m_blocks.begin() + static_cast<ptrdiff_t>(last.block));
-		m_heads.erase(m_heads.begin() + static_cast<ptrdiff_t>(first.block + 1),
-		              m_heads.begin() + static_cast<ptrdiff_t>(last.block));
-		Fix(first.block + 1);
-		Fix(first.block);
-	}
-
-	void Fix(size_t b) {
-		if (m_blocks[b].empty()) {
-			m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(b));
-			m_heads.erase(m_heads.begin() + static_cast<ptrdiff_t>(b));
-			return;
-		}
-		if (m_blocks[b].size() > BlockMax) {
-			std::vector<Intervals> pieces;
-			auto&                  block = m_blocks[b];
-			for (size_t at = BlockMax / 2; at < block.size(); at += BlockMax / 2) {
-				pieces.emplace_back(
-				    block.begin() + static_cast<ptrdiff_t>(at),
-				    block.begin() + static_cast<ptrdiff_t>(std::min(block.size(), at + BlockMax / 2)));
-			}
-			block.resize(BlockMax / 2);
-			for (size_t i = 0; i < pieces.size(); ++i) {
-				m_heads.insert(m_heads.begin() + static_cast<ptrdiff_t>(b + 1 + i),
-				               pieces[i].front().begin);
-				m_blocks.insert(m_blocks.begin() + static_cast<ptrdiff_t>(b + 1 + i),
-				                std::move(pieces[i]));
-			}
-		} else if (b + 1 < m_blocks.size() &&
-		           m_blocks[b].size() + m_blocks[b + 1].size() <= BlockMax / 2) {
-			auto& next = m_blocks[b + 1];
-			m_blocks[b].insert(m_blocks[b].end(), next.begin(), next.end());
-			m_blocks.erase(m_blocks.begin() + static_cast<ptrdiff_t>(b + 1));
-			m_heads.erase(m_heads.begin() + static_cast<ptrdiff_t>(b + 1));
-		}
-		m_heads[b] = m_blocks[b].front().begin;
+		m_block_max_end[b] = m_blocks[b].Last();
+		const uint64_t right_max = right.Last();
+		m_blocks.insert(m_blocks.begin() + static_cast<ptrdiff_t>(b + 1), right);
+		m_block_max_end.insert(m_block_max_end.begin() + static_cast<ptrdiff_t>(b + 1), right_max);
 	}
 
 	static uint64_t End(uint64_t address, uint64_t size) {
@@ -277,12 +358,10 @@ private:
 		return address + size;
 	}
 
-	std::vector<Intervals> m_blocks;
-	std::vector<uint64_t>  m_heads;
-	size_t                 m_count   = 0;
-	uint64_t               m_version = 0;
+	std::vector<uint64_t> m_block_max_end;
+	std::vector<Block>    m_blocks;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RANGESET_H_

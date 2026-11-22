@@ -2,16 +2,12 @@
 
 #include "MemoryShim.hpp"
 #include "graphics/guest_gpu/graphicsRun.h"
-#include "graphics/guest_gpu/scout.h"
+#include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <cinttypes>
-#include <cstdlib>
 #include <cstring>
-#include <string_view>
-#include <utility>
-#include <vector>
 
 namespace Libs::LibKernel::Memory {
 
@@ -36,35 +32,97 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	g_gpu_resources->UnmapMemory(vaddr, size);
 }
 
+static bool OrdinaryReadHookImpl(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) return false;
+	bool cp_overlay = false;
+	if (IsGpuAddressRange(vaddr, size)) {
+		auto& buffers = g_gpu_resources->GetBufferCache();
+		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			Graphics::PerfReasonScope reason(Graphics::PerfReason::SrtWalker);
+			buffers.ReadMemory(vaddr, size);
+		}
+		cp_overlay = buffers.WaitPendingReadbacks(vaddr, size);
+	}
+	if (!TryReadBacking(vaddr, data, size)) return false;
+	if (cp_overlay) {
+		g_gpu_resources->GetBufferCache().ApplyDirectCpWrites(vaddr, data, size);
+	}
+	return true;
+}
+
+static Graphics::ShaderRecompiler::IR::AheadReadStatus AheadReadHookImpl(uint64_t vaddr, void* data, uint64_t size) {
+	using Status = Graphics::ShaderRecompiler::IR::AheadReadStatus;
+	if (g_gpu_resources == nullptr) return Status::Backing;
+	if (IsGpuAddressRange(vaddr, size)) {
+		auto& buffers = g_gpu_resources->GetBufferCache();
+		if (buffers.HasGpuDirtyBytesShared(vaddr, size)) return Status::GpuDirty;
+	}
+	return TryReadBacking(vaddr, data, size) ? Status::Ok : Status::Backing;
+}
+
+static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
+    const Graphics::ShaderRecompiler::IR::ReadLog& log, size_t begin, size_t& stop,
+    Graphics::ShaderRecompiler::IR::FastAdoptStats& stats) {
+	using Result = Graphics::ShaderRecompiler::IR::FastVerifyResult;
+	if (g_gpu_resources == nullptr || !Graphics::GuestGpu::IsGpuThread()) {
+		stop = begin;
+		return Result::NeedsReader;
+	}
+	auto&    buffers           = g_gpu_resources->GetBufferCache();
+	uint64_t cached_clean_page = ~uint64_t {0};
+	for (size_t i = begin; i < log.entries.size(); ++i) {
+		const auto& entry = log.entries[i];
+		if (!entry.ok || entry.size == 0 || !IsGpuAddressRange(entry.address, entry.size)) {
+			stop = i;
+			return Result::NeedsReader;
+		}
+		const uint64_t first_page = entry.address & ~uint64_t {0xfff};
+		const uint64_t last_page  = (entry.address + entry.size - 1u) & ~uint64_t {0xfff};
+		if (first_page != cached_clean_page || last_page != cached_clean_page) {
+			if (first_page == last_page && IsGpuAddressRange(first_page, 0x1000) &&
+			    !buffers.IsRegionGpuModified(first_page, 0x1000) &&
+			    !buffers.HasPendingReadback(first_page, 0x1000)) {
+				cached_clean_page = first_page;
+			} else if (buffers.HasGpuDirtyBytes(entry.address, entry.size) ||
+			           buffers.HasPendingReadback(entry.address, entry.size)) {
+				stop = i;
+				return Result::NeedsReader;
+			}
+		}
+		for (uint64_t offset = 0; offset < entry.size; offset += 4) {
+			if (!buffers.DirectWordQuiet(entry.address + offset)) {
+				stop = i;
+				return Result::NeedsReader;
+			}
+		}
+		const int cmp = CompareBacking(entry.address, log.bytes.data() + entry.first, entry.size);
+		if (cmp == 1) {
+			stop = i;
+			return Result::Changed;
+		}
+		if (cmp != 0) {
+			stop = i;
+			return Result::NeedsReader;
+		}
+		stats.entries_fast++;
+		stats.runs++;
+	}
+	stop = log.entries.size();
+	return Result::Unchanged;
+}
+
 bool TryPrepareHostWrite(uint64_t vaddr, uint64_t size) {
 	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateMemory(vaddr, size);
 }
 
 bool TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size) {
-	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->InvalidateMemoryForWrite(vaddr, size);
-}
-
-bool TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size) {
 	return TryPrepareHostWrite(vaddr, size);
 }
 
-void NoteGameFree(uint64_t vaddr, uint64_t size) {
-	uint64_t first = 0;
-	uint64_t end = 0;
-	if (g_gpu_resources != nullptr && size != 0 && IsGpuAddressRange(vaddr, size) && g_gpu_resources->WatchedSpan(vaddr, size, &first, &end)) {
-		g_gpu_resources->FreedByGame(vaddr, size);
-	}
-}
-
-void DropHotReadsBacking(uint64_t, uint64_t) {}
-
 void NoteEmulatorWrite(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources != nullptr) {
-		g_gpu_resources->GetBufferCache().NoteHostWrite(vaddr, size);
-		g_gpu_resources->GetTextureCache().NoteMetadataWrite(vaddr, size);
-		g_gpu_resources->GetStrictWatch().InvalidateMemory(vaddr, size);
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		(void)g_gpu_resources->InvalidateMemory(vaddr, size);
 	}
-	Graphics::Scout::NoteHostWriteIfOn(vaddr, size);
 }
 
 bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
@@ -73,149 +131,38 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return written;
 }
 
-bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride) {
-	const bool written = Shim::TryWriteBackedQwords(vaddr, values, count, stride);
-	if (written && count != 0) NoteEmulatorWrite(vaddr, uint64_t {count - 1u} * stride + sizeof(uint64_t));
-	return written;
-}
-
-static bool IsGpuCleanBacking(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		auto& buffers = GetGpuResources().GetBufferCache();
-		if (!Graphics::GuestGpu::IsGpuThread() || (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size)) ||
-		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
-			return false;
-		}
-	}
-	return true;
-}
-
-bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
-	return IsGpuCleanBacking(vaddr, size) && TryReadBacking(vaddr, data, size);
-}
-
-bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size, bool (*equal)(const void*, const void*, uint64_t)) {
-	if (!IsGpuCleanBacking(vaddr, size)) return false;
-	if (const void* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
-		return equal != nullptr ? equal(backing, expected, size) : std::memcmp(backing, expected, size) == 0;
-	}
-	thread_local std::vector<uint8_t> bytes;
-	bytes.resize(size);
-	return TryReadBacking(vaddr, bytes.data(), size) && std::memcmp(bytes.data(), expected, size) == 0;
-}
-
-uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size) {
-	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) ? GetGpuResources().GetStrictWatch().Watch(vaddr, size) : 0;
-}
-
-bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version, bool (*equal)(const void*, const void*, uint64_t)) {
-	const auto* backing = static_cast<const uint8_t*>(FindBackingPointer(vaddr, size));
-	if (version == 0 || backing == nullptr || g_gpu_resources == nullptr) return GpuCleanBackingEquals(vaddr, expected, size, equal);
-	if (!IsGpuCleanBacking(vaddr, size)) return false;
-	thread_local std::vector<std::pair<uint64_t, uint64_t>> runs;
-	GetGpuResources().GetStrictWatch().Changed(vaddr, size, version, runs);
-	const auto* recorded = static_cast<const uint8_t*>(expected);
-	for (const auto& [offset, bytes] : runs) {
-		if (equal != nullptr ? !equal(backing + offset, recorded + offset, bytes) : std::memcmp(backing + offset, recorded + offset, bytes) != 0) {
-			return false;
-		}
-	}
-	return true;
-}
-
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	bool cp_overlay = false;
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
-		if (!Graphics::GuestGpu::IsGpuThread()) return false;
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
-			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) return true;
-			buffers.ReadMemory(vaddr, size);
+		if (Graphics::GuestGpu::IsGpuThread()) {
+			if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+				buffers.ReadMemory(vaddr, size);
+			}
+			cp_overlay = buffers.WaitPendingReadbacks(vaddr, size);
+		} else {
+			if (buffers.HasGpuDirtyBytesShared(vaddr, size)) return false;
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	if (!TryReadBacking(vaddr, data, size)) return false;
+	if (cp_overlay) {
+		GetGpuResources().GetBufferCache().ApplyDirectCpWrites(vaddr, data, size);
+	}
+	return true;
+}
+
+bool GuestImageReadArmed(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
+	return g_gpu_resources->GetPageManager().ImageReadArmedInRange(vaddr, size);
 }
 
 bool GuestRangeWatched(uint64_t vaddr, uint64_t size) {
-	uint64_t first = 0;
-	uint64_t end = 0;
-	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && g_gpu_resources->WatchedSpan(vaddr, size, &first, &end);
-}
-
-bool MayBeGpuWritten(uint64_t vaddr, uint64_t size) {
-	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size);
-}
-
-bool HasGpuWrittenBytes(uint64_t vaddr, uint64_t size) {
-	return g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && Graphics::GuestGpu::IsGpuThread() &&
-	       GetGpuResources().GetBufferCache().MayBeGpuModified(vaddr, size) && GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size);
-}
-
-bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
-	auto& buffers = GetGpuResources().GetBufferCache();
-	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
-}
-
-bool ReplayableGpuRead(uint64_t vaddr, uint64_t size) {
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
-	auto& buffers = GetGpuResources().GetBufferCache();
-	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size) && buffers.NoGpuBytesNow(vaddr, size) &&
-	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
-}
-
-void NoteReplayedGpuRead() {
-	Graphics::BufferCache::NoteReplayedRead();
-}
-
-bool TextureGpuModified(uint64_t vaddr, uint64_t size) {
-	return g_gpu_resources != nullptr && g_gpu_resources->GetTextureCache().IsRegionGpuModified(vaddr, size);
-}
-
-void AllowReplayAfterReadback() {
-	Graphics::BufferCache::AllowReplayAfterReadback();
-}
-
-bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) {
-	return Graphics::BufferCache::TakeReplayAfterReadback(begin, end);
-}
-
-void FinishReplayAfterReadback(bool replayed) {
-	Graphics::BufferCache::NoteReplayAfterReadback(replayed);
-	if (!replayed && g_gpu_resources != nullptr) {
-		g_gpu_resources->GetBufferCache().WaitReadbackRelease();
-	}
-}
-
-bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) || !Graphics::GuestGpu::IsGpuThread()) return false;
-	auto& buffers = GetGpuResources().GetBufferCache();
-	if (!buffers.MayBeGpuModified(vaddr, size) || !buffers.IsRegionGpuModified(vaddr, size) || GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
-		return false;
-	}
-	if (buffers.HasGpuDirtyBytes(vaddr, size)) return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
-	return TryReadBacking(vaddr, data, size);
-}
-
-const uint8_t* FindAroundBackingPage(uint64_t vaddr) {
-	constexpr uint64_t PageSize = 4096;
-	const auto page = vaddr & ~(PageSize - 1);
-	if (g_gpu_resources == nullptr || !IsGpuAddressRange(page, PageSize) || !Graphics::GuestGpu::IsGpuThread()) return nullptr;
-	auto& buffers = GetGpuResources().GetBufferCache();
-	if (!buffers.MayBeGpuModified(page, PageSize) || !buffers.IsRegionGpuModified(page, PageSize) || GetGpuResources().GetTextureCache().IsRegionGpuModified(page, PageSize)) {
-		return nullptr;
-	}
-	return static_cast<const uint8_t*>(FindBackingPointer(page, PageSize));
-}
-
-bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size, const uint8_t* page_backing) {
-	auto& buffers = GetGpuResources().GetBufferCache();
-	if (buffers.HasGpuDirtyBytes(vaddr, size)) return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
-	std::memcpy(data, page_backing + (vaddr & 0xfffu), size);
-	return true;
+	return g_gpu_resources->GetBufferCache().IsRegionGpuModified(vaddr, size);
 }
 
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
-	if (!TryWriteBacking(vaddr, data, size)) {
+	if (!Shim::TryWriteBackedRuns(vaddr, data, size)) {
 		Shim::Fail("KytyShim memory: required backing write failed, addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n", vaddr, size);
 	}
 }
@@ -225,50 +172,23 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
-#if defined(ANYPS5_KYTY)
-namespace {
-
-bool WalkerProbeEnabled() {
-	static const bool enabled = [] {
-		const char*            value = std::getenv("KYTY_SRT_WALKER_PROBE");
-		const std::string_view text {value == nullptr ? "" : value};
-		if (!text.empty() && text != "0" && text != "1") {
-			Shim::Fail("invalid KYTY_SRT_WALKER_PROBE: %s (0 or 1)\n", value);
-		}
-		return text != "0";
-	}();
-	return enabled;
-}
-
-Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, bool ahead, const uint8_t*& backing) {
-	constexpr uint64_t PageSize = 4096;
-	backing = nullptr;
-	if (!MayFaultOnGpuRead(address & ~(PageSize - 1), PageSize)) {
-		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
-	}
-	if (!Graphics::GuestGpu::IsGpuThread()) {
-		return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad : Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
-	}
-	return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct : Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
-}
-
-bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t*) {
-	return !ahead && MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
-}
-
-}
-#endif
-
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	if (resources != nullptr && g_gpu_resources != nullptr) Shim::Fail("KytyShim memory: InstallGpuResources called twice\n");
-	if (resources == nullptr) Shim::SetGpuRangeHooks(nullptr, nullptr);
-	g_gpu_resources = resources;
-	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
-#if defined(ANYPS5_KYTY)
-	if (resources != nullptr && WalkerProbeEnabled()) {
-		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead});
+	if (resources == nullptr) {
+		Graphics::ShaderRecompiler::IR::SetFastVerifyHook(nullptr);
+		Graphics::ShaderRecompiler::IR::SetAheadReadHook(nullptr);
+		Graphics::ShaderRecompiler::IR::SetOrdinaryReadHook(nullptr);
+		Graphics::ShaderRecompiler::IR::SetPlainReadHook(nullptr);
+		Shim::SetGpuRangeHooks(nullptr, nullptr);
 	}
-#endif
+	g_gpu_resources = resources;
+	if (resources != nullptr) {
+		Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
+		Graphics::ShaderRecompiler::IR::SetPlainReadHook(&ReadGuestPlain);
+		Graphics::ShaderRecompiler::IR::SetOrdinaryReadHook(&OrdinaryReadHookImpl);
+		Graphics::ShaderRecompiler::IR::SetAheadReadHook(&AheadReadHookImpl);
+		Graphics::ShaderRecompiler::IR::SetFastVerifyHook(&FastVerifyHookImpl);
+	}
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {

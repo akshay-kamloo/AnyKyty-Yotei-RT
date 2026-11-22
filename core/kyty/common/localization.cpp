@@ -22,7 +22,7 @@ size_t LanguageIndex(int console_language) {
 	           : 1;
 }
 
-}
+} // namespace
 
 std::string_view LocaleName(int console_language) {
 	return Locales[LanguageIndex(console_language)];
@@ -50,4 +50,4 @@ std::string_view Get(int console_language, std::string_view key) {
 	return key;
 }
 
-}
+} // namespace Common::Localization

@@ -5,9 +5,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input);
+// Resolves native descriptor sources, plans their scalar reads, and assigns dense resource bindings.
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCETRACKING_H_ */

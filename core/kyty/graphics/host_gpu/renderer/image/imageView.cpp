@@ -1,12 +1,32 @@
+#include "graphics/guest_gpu/stallWatch.h" // KYTY_DIAG_STALL_WATCH_DRIVER_MS
+#include "common/slowFrame.h" // KYTY_TRACE_SLOW_FRAMES (diagnostic)
 #include "graphics/host_gpu/renderer/image/imageView.h"
 
 #include "common/assert.h"
+#include "common/workaroundHits.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
 
 namespace Libs::Graphics {
 
 namespace {
+
+[[nodiscard]] bool IsComponentSwizzle(vk::ComponentSwizzle swizzle) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity:
+		case vk::ComponentSwizzle::eZero:
+		case vk::ComponentSwizzle::eOne:
+		case vk::ComponentSwizzle::eR:
+		case vk::ComponentSwizzle::eG:
+		case vk::ComponentSwizzle::eB:
+		case vk::ComponentSwizzle::eA: return true;
+		default: return false;
+	}
+}
 
 [[nodiscard]] bool IsStencilViewFormat(vk::Format format) {
 	switch (format) {
@@ -19,17 +39,36 @@ namespace {
 
 [[nodiscard]] bool IsValidViewType(const VulkanImage& image, const ImageViewInfo& info) {
 	switch (image.image_type) {
+		case vk::ImageType::e1D:
+			if (info.type != vk::ImageViewType::e1D && info.type != vk::ImageViewType::e1DArray) {
+				return false;
+			}
+			return info.type != vk::ImageViewType::e1D || info.layer_count == 1;
 		case vk::ImageType::e2D:
 			switch (info.type) {
 				case vk::ImageViewType::e2D: return info.layer_count == 1;
 				case vk::ImageViewType::e2DArray: return true;
+				case vk::ImageViewType::eCube:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
+					       info.base_layer % 6 == 0 && info.layer_count == 6;
+				case vk::ImageViewType::eCubeArray:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::eCubeCompatible) &&
+					       info.base_layer % 6 == 0 && info.layer_count % 6 == 0;
 				default: return false;
 			}
 		case vk::ImageType::e3D:
 			switch (info.type) {
 				case vk::ImageViewType::e3D: return info.base_layer == 0 && info.layer_count == 1;
-				case vk::ImageViewType::e2D: return info.level_count == 1 && info.layer_count == 1;
-				case vk::ImageViewType::e2DArray: return info.level_count == 1;
+				case vk::ImageViewType::e2D:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					       info.level_count == 1 && info.layer_count == 1;
+				case vk::ImageViewType::e2DArray:
+					return static_cast<bool>(image.flags &
+					                         vk::ImageCreateFlagBits::e2DArrayCompatible) &&
+					       info.level_count == 1;
 				default: return false;
 			}
 		default: return false;
@@ -45,7 +84,7 @@ namespace {
 	return static_cast<bool>(aspect) && !(aspect & ~supported);
 }
 
-}
+} // namespace
 
 namespace ImageViewOps {
 
@@ -249,7 +288,7 @@ enum CompatibilityClass : uint32_t {
 	}
 }
 
-}
+} // namespace
 
 vk::ImageAspectFlags DepthAspectMask(vk::Format format) {
 	switch (format) {
@@ -272,9 +311,9 @@ bool FormatsCompatible(vk::Format base, vk::Format view) noexcept {
 	return view_class != None && (base_class & view_class) == view_class;
 }
 
-}
+} // namespace ImageViewOps
 
-vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+ImageViewInfo Image::NormalizeView(const ImageViewInfo& view_info) const {
 	const auto& image      = backing;
 	auto        normalized = view_info;
 	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
@@ -290,6 +329,31 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// The host image stops at its 1x1 level (ImageInfo::HostLevels). The guest levels past it are 1x1 too; a view of
+	// them views the last host level, and a view that only extends past it is cut there (it differs only where the
+	// sampler selects such a level).
+	if (image.mip_levels < info.resources.levels && normalized.level_count != 0 &&
+	    (normalized.base_level >= image.mip_levels ||
+	     normalized.level_count > image.mip_levels - normalized.base_level)) {
+		normalized.base_level  = std::min(normalized.base_level, image.mip_levels - 1u);
+		normalized.level_count = std::min(normalized.level_count, image.mip_levels - normalized.base_level);
+		normalized.min_lod     = std::min(normalized.min_lod, (normalized.level_count - 1u) * 256u);
+	}
+	return normalized;
+}
+
+vk::ImageView Image::FindViewExisting(const ImageViewInfo& view_info) const {
+	const auto normalized = NormalizeView(view_info);
+	for (const auto& cached: views) {
+		if (cached.info == normalized) return cached.view;
+	}
+	return nullptr;
+}
+
+vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
+	const auto& image      = backing;
+	const auto  normalized = NormalizeView(view_info);
+	const bool  is_storage = static_cast<bool>(normalized.usage & vk::ImageUsageFlagBits::eStorage);
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
@@ -310,8 +374,11 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool ranges_valid = levels_valid && normalized.layer_count != 0 &&
 	                          normalized.base_layer < view_layers &&
 	                          normalized.layer_count <= view_layers - normalized.base_layer;
-	if (!format_compatible || !ranges_valid || !IsValidViewType(image, normalized) ||
-	    !IsValidAspect(image, normalized.aspect)) {
+	const bool mapping_valid =
+	    IsComponentSwizzle(normalized.mapping.r) && IsComponentSwizzle(normalized.mapping.g) &&
+	    IsComponentSwizzle(normalized.mapping.b) && IsComponentSwizzle(normalized.mapping.a);
+	if (image.image == nullptr || !format_compatible || !ranges_valid || !mapping_valid ||
+	    !IsValidViewType(image, normalized) || !IsValidAspect(image, normalized.aspect)) {
 		EXIT("invalid image view: image_format=%d view_format=%d type=%d aspect=0x%x "
 		     "mip=%u+%u layer=%u+%u usage=0x%x image_levels=%u image_layers=%u\n",
 		     static_cast<int>(image.format), static_cast<int>(normalized.format),
@@ -325,8 +392,9 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	vk::ImageViewUsageCreateInfo usage {};
 	usage.usage = is_storage ? vk::ImageUsageFlagBits::eStorage
 	                         : image.usage & ~vk::ImageUsageFlagBits::eStorage;
-	if (normalized.format == vk::Format::eR8Srgb || normalized.format == vk::Format::eR8G8Srgb) {
-		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	// An R8_SRGB read view of an R8_UNORM image (descriptors.cpp, 8_SRGB T#): the format only supports sampling.
+	if (normalized.format == vk::Format::eR8Srgb && image.format != vk::Format::eR8Srgb) {
+		usage.usage = vk::ImageUsageFlagBits::eSampled;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
@@ -347,7 +415,20 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
 	vk::ImageView view   = nullptr;
-	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
+	const uint64_t slow_t0 = Common::SlowFrame::NowNs(); // KYTY_TRACE_SLOW_FRAMES
+	vk::Result     result;
+	{
+		const Common::SlowFrame::Scope slow_view(Common::SlowFrame::CreateView); // KYTY_TRACE_SLOW_FRAMES
+		const StallWatch::DriverCallMark driver_mark(Common::SlowFrame::t_exec); // KYTY_DIAG_STALL_WATCH_DRIVER_MS
+		result = m_graphics.device.createImageView(&create, nullptr, &view);
+	}
+	if (Common::SlowFrame::Threshold() != 0u && Common::SlowFrame::NowNs() - slow_t0 >= 2'000'000u) {
+		std::fprintf(stderr, "SLOW_VIEW ms=%.1f image_format=%d view_format=%d type=%d usage=0x%x levels=%u layers=%u extent=%ux%ux%u views=%zu\n",
+		             static_cast<double>(Common::SlowFrame::NowNs() - slow_t0) / 1e6, static_cast<int>(image.format),
+		             static_cast<int>(normalized.format), static_cast<int>(normalized.type),
+		             static_cast<uint32_t>(static_cast<vk::ImageUsageFlags::MaskType>(usage.usage)), normalized.level_count,
+		             normalized.layer_count, image.extent.width, image.extent.height, image.extent.depth, views.size());
+	}
 	if (result != vk::Result::eSuccess || view == nullptr) {
 		EXIT("failed to create image view: result=%d image_format=%d view_format=%d type=%d "
 		     "aspect=0x%x mip=%u+%u layer=%u+%u usage=0x%x\n",
@@ -367,4 +448,4 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	return view;
 }
 
-}
+} // namespace Libs::Graphics

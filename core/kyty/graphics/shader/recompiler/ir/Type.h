@@ -46,4 +46,4 @@ constexpr bool TypesOverlap(Type lhs, Type rhs) {
 [[nodiscard]] bool        AreTypesCompatible(Type lhs, Type rhs);
 [[nodiscard]] std::string TypeName(Type type);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

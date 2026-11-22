@@ -4,63 +4,66 @@
 #include "common/common.h"
 #include "common/uniqueFunction.h"
 #include "graphics/host_gpu/renderer/dynamicState.h"
-#include "graphics/host_gpu/renderer/hostCopyQueue.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
-#include <memory>
+#include <functional>
 #include <mutex>
 #include <queue>
+#include <string>
 #include <thread>
-#include <utility>
 #include <vector>
-
-#if defined(ANYPS5_KYTY)
-#include <deque>
-#endif
 
 namespace Libs::Graphics {
 
 class CommandScheduler {
 public:
-	CommandScheduler(RenderContext& context, GraphicContext& graphics,
-	                 bool deferred_recording = false);
+	CommandScheduler(RenderContext& context, GraphicContext& graphics);
 	~CommandScheduler();
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
-	void           Begin(const HW::Context& registers, const HW::UserConfig& user_config,
-	                     const HW::Shader& shaders);
-	void           EndRendering() { m_command.EndRendering(); }
+	// D4b step 1 (BufferCache::AppendCloseWindows): called at the start of every Submit, on the submitting thread,
+	// while the command buffer can still take commands.
+	void SetPreSubmitHook(std::function<void()> hook) { m_pre_submit_hook = std::move(hook); }
+
+	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
+	void           BeginRendering(const RenderState& state);
+	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	void           FlushAndWait();
+	// Before a draw or dispatch, the open command buffer is submitted (no wait) once 128 draws/dispatches were recorded
+	// into it, so the GPU starts on them while the CPU records the next ones.
+	void           NoteGpuCommand();
+	// An end-of-pipe interrupt was queued for the open command buffer's tick, which must be submitted for
+	// it to fire (RELEASE_MEM): at once only when the GPU is idle (submission batching, commandScheduler.cpp).
+	void           FlushForInterrupt();
+	// An interrupt's submission is deferred; the command processor then calls
+	// NoteDeferredPacket after each packet, which submits once the GPU is idle or at the bound.
+	[[nodiscard]] bool SubmitDeferred() const noexcept { return m_batch_interrupt_pending.load(std::memory_order_relaxed); }
+	void               NoteDeferredPacket();
+	// KYTY_TRACE_PERF=1: one "PERF submit" line with this scheduler's submissions by reason since the last one.
+	void               ReportSubmitPerf();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
+	// Deferred callbacks can observe an externally owned drain, but cannot initiate shutdown:
+	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
-	[[nodiscard]] bool HasPendingGuestOperations(uint64_t address, uint64_t size);
-	void               WaitPriorityOperations(uint64_t tick);
-	void DeferOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
-	                    uint64_t size = UINT64_MAX);
-	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint64_t address = 0,
-	                            uint64_t size = UINT64_MAX);
-	void DeferPriorityOperation(Common::UniqueFunction<void>&&                     operation,
-	                            const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
-#if defined(ANYPS5_KYTY)
-	void DeferPriorityOperationAfter(uint64_t tick, Common::UniqueFunction<void>&& operation,
-	                                 uint64_t address, uint64_t size);
-	[[nodiscard]] uint64_t NewestPendingGuestOperation(uint64_t address, uint64_t size,
-	                                                   uint64_t after);
-#endif
-	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
-#if defined(ANYPS5_KYTY)
-	void DeferFlipCompletion(Common::UniqueFunction<void>&& complete);
-#endif
-	[[nodiscard]] bool HasPendingPriorityOperations();
+	void                      WaitPriorityOperations(uint64_t tick);
+	// True when WaitPriorityOperations(tick) would return at once: no priority completion queued at or
+	// before tick is still waiting or running.
+	[[nodiscard]] bool        PriorityOperationsDone(uint64_t tick);
+	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
+	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
+	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
+	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -70,25 +73,45 @@ public:
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
-	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
-		return m_submitted_tick.load(std::memory_order_acquire);
-	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
-	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
-	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
-	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
-		m_submit_hook      = hook;
-		m_submit_hook_data = userdata;
-	}
 
 private:
-	void QueueOperation(Common::UniqueFunction<void>&& operation);
-	void QueuePriorityOperation(Common::UniqueFunction<void>&& operation);
-	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&& operation,
-	                                                 uint64_t address, uint64_t size);
-	Common::UniqueFunction<void> TrackGuestOperation(Common::UniqueFunction<void>&&                     operation,
-	                                                 const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
+	std::function<void()> m_pre_submit_hook;
+	bool                  m_in_pre_submit_hook = false;
+	uint32_t m_commands_since_submit = 0;
+
+	// Why the next Submit happens (FlushFor), for the PERF submit line and the batching's idle arming.
+	enum class SubmitReason : uint32_t {
+		Other,          // slice end, flip, wait, readback, suspend point, ...
+		Periodic,       // SubmitEvery boundary (the GPU was idle there)
+		PeriodicLate,   // a deferred boundary, once the GPU was idle
+		PeriodicBound,  // a deferred boundary at its bound (GPU still busy)
+		Interrupt,      // RELEASE_MEM interrupt (the GPU was idle)
+		InterruptLate,  // a deferred interrupt, once the GPU was idle
+		InterruptBound, // a deferred interrupt at its packet/time bound (GPU still busy)
+		IdleEarly,      // the GPU ran dry while this buffer was being recorded
+		Count
+	};
+	void               FlushFor(SubmitReason reason);
+	void               NoteGpuCommandBatched();
+	// Every submitted tick is complete (the semaphore is re-read at most every 100 us).
+	[[nodiscard]] bool GpuIdle();
+
+	SubmitReason m_submit_reason      = SubmitReason::Other;
+	SubmitReason m_last_submit_reason = SubmitReason::Other;
+	// The batching's state, all reset by Submit.
+	std::atomic_bool m_batch_interrupt_pending {false};
+	uint32_t                              m_batch_interrupt_packets = 0;
+	std::chrono::steady_clock::time_point m_batch_interrupt_since {};
+	bool                                  m_batch_idle_armed = false;
+	// KYTY_TRACE_PERF counters (ReportSubmitPerf).
+	std::atomic<uint64_t> m_perf_submits[static_cast<uint32_t>(SubmitReason::Count)] {};
+	std::atomic<uint64_t> m_perf_deferred_periodic {0};
+	std::atomic<uint64_t> m_perf_deferred_interrupts {0};
+	std::atomic<uint64_t> m_perf_interrupt_delay_us {0};
+	std::atomic<uint64_t> m_perf_interrupt_delay_max_us {0};
+	std::atomic<uint64_t> m_perf_interrupt_delays {0};
 
 	class CommandPool {
 	public:
@@ -97,14 +120,11 @@ private:
 		KYTY_CLASS_NO_COPY(CommandPool);
 
 		vk::CommandBuffer Commit();
-		[[nodiscard]] std::pair<vk::CommandBuffer, size_t> CommitDeferred();
-		void                                               Retire(size_t index, uint64_t tick);
 
 	private:
 		static constexpr size_t GrowStep = 4;
 
 		size_t Grow();
-		size_t Acquire(uint64_t busy_until);
 
 		GraphicContext&                m_graphics;
 		MasterSemaphore&               m_master;
@@ -121,72 +141,27 @@ private:
 		uint64_t                     tick = 0;
 	};
 
-	struct RecordedSubmit {
-		SubmitInfo info;
-		uint64_t   tick            = 0;
-		uint64_t   host_copies     = 0;
-	};
-
 	void BeginNext();
-	void RecordingThread();
-	void SubmitRecorded(vk::CommandBuffer& buffer, size_t buffer_index,
-	                    const RecordedSubmit& recorded);
-	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick);
 	void PriorityOperationsThread(std::stop_token stop);
+	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
-#if defined(ANYPS5_KYTY)
-	struct FlipCompletion {
-		Common::UniqueFunction<void> complete;
-		uint64_t                     submitted_tick = 0;
-		uint64_t                     previous_tick  = 0;
-	};
-	void FlipCompletionThread(std::stop_token stop);
-	void DrainFlipCompletions();
-#endif
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
 	CommandPool                  m_command_pool;
-	const bool                   m_deferred;
-	CommandChunkQueue            m_chunk_queue;
-	CommandStream                m_stream;
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
-	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
-	std::atomic<uint64_t>        m_submitted_tick {0};
-	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
-	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
-	struct GuestWrite {
-		uint64_t id    = 0;
-		uint64_t begin = 0;
-		uint64_t end   = 0;
-	};
-	std::mutex                   m_guest_writes_mutex;
-	std::vector<GuestWrite>      m_guest_writes;
-	uint64_t                     m_next_guest_write     = 0;
-	std::unique_ptr<HostCopyQueue> m_host_copies;
-	SubmitHook                     m_submit_hook      = nullptr;
-	void*                          m_submit_hook_data = nullptr;
-#if defined(ANYPS5_KYTY)
-	std::mutex                  m_flip_mutex;
-	std::condition_variable_any m_flip_changed;
-	std::deque<FlipCompletion>  m_flip_completions;
-	std::atomic<bool>           m_flips_pending {false};
-	bool                        m_flip_running   = false;
-	uint64_t                    m_last_flip_tick = 0;
-	std::once_flag              m_flip_thread_once;
-	std::jthread                m_flip_thread;
-#endif
-	std::jthread m_recording_thread;
+	OperationState               m_operation_state      = OperationState::Open;
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_COMMANDSCHEDULER_H_

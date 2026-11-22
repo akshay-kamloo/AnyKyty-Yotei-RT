@@ -7,9 +7,9 @@
 
 namespace Libs::Graphics {
 
-inline constexpr uint16_t ILLEGAL_DIRECT_OFFSET = 0xffff;
+inline constexpr uint16_t AGC_ILLEGAL_DIRECT_OFFSET = 0xffff;
 
-enum class DirectResourceType : uint32_t {
+enum class AgcDirectResourceType : uint32_t {
 	GdsCounterRange          = 0,
 	ShaderResourceTable      = 1,
 	SubPtrFetchShader        = 2,
@@ -22,6 +22,13 @@ enum class DirectResourceType : uint32_t {
 	StereoXOffset            = 9,
 	PtrVertexAttribDescTable = 10,
 	Last                     = PtrVertexAttribDescTable,
+};
+
+enum class ResourceDescriptorType {
+	Texture,
+	Buffer,
+	Sampler,
+	Unused,
 };
 
 struct ShaderBufferResource {
@@ -38,6 +45,7 @@ struct ShaderBufferResource {
 	[[nodiscard]] bool     SwizzleEnabled() const { return ((fields[1] >> 31u) & 0x1u) == 1; }
 	[[nodiscard]] uint32_t NumRecords() const { return fields[2]; }
 	[[nodiscard]] uint64_t GetSize() const {
+		// The 14-bit stride and 32-bit record count require a 64-bit product.
 		return Stride() == 0 ? NumRecords() : static_cast<uint64_t>(Stride()) * NumRecords();
 	}
 	[[nodiscard]] uint8_t  DstSelX() const { return (fields[3] >> 0u) & 0x7u; }
@@ -187,6 +195,8 @@ enum class ShaderStorageUsage {
 	ReadWrite,
 };
 
-}
+ResourceDescriptorType ShaderClassifyResourceDescriptor(const uint32_t* desc);
 
-#endif
+} // namespace Libs::Graphics
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADERBINDINGS_H_ */

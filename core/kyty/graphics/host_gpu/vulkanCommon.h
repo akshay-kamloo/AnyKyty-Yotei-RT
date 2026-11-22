@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <span>
 #include <string>
@@ -27,8 +28,8 @@ namespace Libs::Graphics {
 vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
 void        RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
-vk::Pipeline     CreateComputePipeline(vk::Device device, std::span<const uint32_t> code,
-                                       vk::PipelineLayout layout, const char* operation);
+// CompileSPV for the background compiles (shaderPrecompile.h): null instead of an exit when the driver refuses it.
+vk::ShaderModule TryCompileSPV(std::span<const uint32_t> code, vk::Device device);
 
 [[nodiscard]] constexpr bool IsHdrSwapchainFormat(vk::Format format) {
 	switch (format) {
@@ -76,6 +77,6 @@ template <typename T, typename Enumerator>
 	}
 }
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_VULKANCOMMON_H_

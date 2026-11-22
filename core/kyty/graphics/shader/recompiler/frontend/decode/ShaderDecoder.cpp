@@ -82,6 +82,15 @@ std::string FormatMemory(const Instruction& inst) {
 	return text;
 }
 
+std::string WithUnsupportedReason(const Instruction& inst, const std::string& text) {
+	if (inst.unsupported_reason.empty()) {
+		return text;
+	}
+	return text + fmt::format(" ; family={} opcode=0x{:02x} raw=[{}] reason={}",
+	                          magic_enum::enum_name(inst.family), inst.opcode_id,
+	                          RawWordsToString(inst).c_str(), inst.unsupported_reason);
+}
+
 void AppendFlag(std::string* text, bool* first, uint32_t flags, uint32_t flag, const char* name) {
 	if ((flags & flag) == 0) {
 		return;
@@ -159,10 +168,11 @@ std::string FormatExp(const Instruction& inst) {
 	return text;
 }
 
-}
+} // namespace
 
 bool IsConditionalBranch(Opcode opcode) {
 	switch (opcode) {
+		// Conditional shader debugging is disabled.
 		case Opcode::S_CBRANCH_CDBGSYS:
 		case Opcode::S_CBRANCH_CDBGUSER:
 		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
@@ -385,28 +395,18 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program,
-                   std::span<const LongBranch> long_branches) {
+void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
 	program.has_swap_pc = false;
-	program.long_branches.assign(long_branches.begin(), long_branches.end());
 
 	std::vector<bool> branch_targets;
-	size_t last_target = 0;
-	bool tail        = false;
-	auto long_branch = long_branches.begin();
 	for (uint32_t word_index = 0; word_index < code.size();) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		auto& inst = program.instructions.back();
-		while (long_branch != long_branches.end() && long_branch->pc < inst.pc) ++long_branch;
-		if (long_branch != long_branches.end() && long_branch->pc == inst.pc) {
-			EXIT_IF(!IsDirectBranch(inst.opcode) || long_branch->target / sizeof(uint32_t) >= code.size());
-			inst.branch_target = long_branch->target;
-		}
+		const auto& inst = program.instructions.back();
 		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 
@@ -416,15 +416,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program,
 				branch_targets.resize(code.size());
 			}
 			branch_targets[target_index] = true;
-			last_target                  = std::max<size_t>(last_target, target_index);
 		}
-		const bool ends_path = inst.opcode == Opcode::S_ENDPGM || (tail && inst.opcode == Opcode::S_BRANCH);
-		if (ends_path &&
+		if (inst.opcode == Opcode::S_ENDPGM &&
 		    (word_index >= code.size() || branch_targets.empty() || !branch_targets[word_index])) {
-			if (word_index >= code.size() || last_target < word_index || last_target >= code.size()) {
-				return;
-			}
-			tail = true;
+			return;
 		}
 	}
 
@@ -493,21 +488,62 @@ std::string InstructionToString(const Instruction& inst) {
 		                   RawWordsToString(inst).c_str(), inst.unsupported_reason);
 	}
 	if (inst.family == Family::SOPC) {
-		return FormatSources(inst);
+		return WithUnsupportedReason(inst, FormatSources(inst));
 	}
 
 	switch (inst.opcode) {
+		case Opcode::S_MOV_B32:
+		case Opcode::S_MOV_B64:
+		case Opcode::S_CMOV_B64:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.dst).c_str(),
+			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_ABS_I32:
+		case Opcode::S_SEXT_I32_I8:
+		case Opcode::S_SEXT_I32_I16:
+		case Opcode::S_BREV_B32:
+		case Opcode::S_BREV_B64:
+		case Opcode::S_BCNT0_I32_B32:
+		case Opcode::S_BCNT0_I32_B64:
+		case Opcode::S_FF0_I32_B32:
+		case Opcode::S_FF0_I32_B64:
+		case Opcode::S_BCNT1_I32_B32:
+		case Opcode::S_FLBIT_I32_B32:
+		case Opcode::S_FF1_I32_B32:
+		case Opcode::S_FF1_I32_B64:
+		case Opcode::S_BITSET0_B64:
+		case Opcode::S_BITSET1_B64:
+		case Opcode::S_NOT_B64:
+		case Opcode::S_WQM_B32:
+		case Opcode::S_WQM_B64:
+		case Opcode::S_QUADMASK_B32:
+		case Opcode::S_QUADMASK_B64:
+		case Opcode::S_AND_SAVEEXEC_B32:
+		case Opcode::S_ORN2_SAVEEXEC_B32:
+		case Opcode::S_ANDN1_SAVEEXEC_B32:
+		case Opcode::S_AND_SAVEEXEC_B64:
+		case Opcode::S_ORN2_SAVEEXEC_B64:
+		case Opcode::S_ANDN1_SAVEEXEC_B64:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.dst).c_str(),
+			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_GETPC_B64:
-			return fmt::format("0x{:08x}: s_getpc_b64 {}", inst.pc,
-			                   OperandToString(inst.dst).c_str());
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_getpc_b64 {}", inst.pc,
+			                                               OperandToString(inst.dst).c_str()));
 		case Opcode::S_SETPC_B64:
-			return fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
-			                   OperandToString(inst.src0).c_str());
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setpc_b64 {}", inst.pc,
+			                                               OperandToString(inst.src0).c_str()));
 		case Opcode::S_SETREG_B32:
-			return fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
-			                   OperandToString(inst.src0).c_str(),
-			                   OperandToString(inst.src1).c_str());
-		case Opcode::S_WAITCNT_VSCNT: return FormatSources(inst);
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_setreg_b32 {}, {}", inst.pc,
+			                                               OperandToString(inst.src0).c_str(),
+			                                               OperandToString(inst.src1).c_str()));
+		case Opcode::S_WAITCNT_VSCNT:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}, {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.src0),
+			                                               OperandToString(inst.src1)));
 		case Opcode::S_NOP:
 		case Opcode::S_WAITCNT:
 		case Opcode::S_WAITCNT_DEPCTR:
@@ -518,15 +554,19 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_TTRACEDATA:
 		case Opcode::S_INST_PREFETCH:
 		case Opcode::S_CLAUSE:
-			return fmt::format("0x{:08x}: {} {}", inst.pc, magic_enum::enum_name(inst.opcode),
-			                   OperandToString(inst.src0).c_str());
-		case Opcode::S_BARRIER: return fmt::format("0x{:08x}: s_barrier", inst.pc);
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} {}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               OperandToString(inst.src0).c_str()));
+		case Opcode::S_BARRIER:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_barrier", inst.pc));
 		case Opcode::S_DCACHE_INV:
 		case Opcode::BUFFER_GL0_INV:
 		case Opcode::BUFFER_GL1_INV:
 			return fmt::format("0x{:08x}: {}", inst.pc, magic_enum::enum_name(inst.opcode));
-		case Opcode::V_NOP: return fmt::format("0x{:08x}: v_nop", inst.pc);
-		case Opcode::S_ENDPGM: return fmt::format("0x{:08x}: s_endpgm", inst.pc);
+		case Opcode::V_NOP:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: v_nop", inst.pc));
+		case Opcode::S_ENDPGM:
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: s_endpgm", inst.pc));
 		case Opcode::S_BRANCH:
 		case Opcode::S_CBRANCH_SCC0:
 		case Opcode::S_CBRANCH_SCC1:
@@ -538,14 +578,15 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::S_CBRANCH_CDBGUSER:
 		case Opcode::S_CBRANCH_CDBGSYS_OR_USER:
 		case Opcode::S_CBRANCH_CDBGSYS_AND_USER:
-			return fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
-			                   inst.branch_target);
+			return WithUnsupportedReason(inst, fmt::format("0x{:08x}: {} 0x{:08x}", inst.pc,
+			                                               magic_enum::enum_name(inst.opcode),
+			                                               inst.branch_target));
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:
-			return fmt::format("0x{:08x}: {} {}, 0x{:08x}", inst.pc,
-			                   magic_enum::enum_name(inst.opcode), OperandToString(inst.dst),
-			                   inst.branch_target);
-		case Opcode::EXP: return FormatExp(inst);
+			return WithUnsupportedReason(inst, fmt::format(
+			    "0x{:08x}: {} {}, 0x{:08x}", inst.pc, magic_enum::enum_name(inst.opcode),
+			    OperandToString(inst.dst), inst.branch_target));
+		case Opcode::EXP: return WithUnsupportedReason(inst, FormatExp(inst));
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_STORE:
 		case Opcode::IMAGE_STORE_MIP:
@@ -565,7 +606,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:
-		case Opcode::IMAGE_GATHER4: return FormatMimg(inst);
+		case Opcode::IMAGE_GATHER4: return WithUnsupportedReason(inst, FormatMimg(inst));
 		case Opcode::S_LOAD_DWORD:
 		case Opcode::S_LOAD_DWORDX2:
 		case Opcode::S_LOAD_DWORDX4:
@@ -580,34 +621,36 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
-		case Opcode::BUFFER_STORE_FORMAT_D16_X:
-		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
-		case Opcode::BUFFER_STORE_FORMAT_D16_XY:
-		case Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
-		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
-		case Opcode::BUFFER_LOAD_UBYTE_D16:
-		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_USHORT:
-		case Opcode::BUFFER_LOAD_SHORT_D16:
-		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:
 		case Opcode::BUFFER_LOAD_DWORDX2:
 		case Opcode::BUFFER_LOAD_DWORDX3:
 		case Opcode::BUFFER_LOAD_DWORDX4:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_STORE_BYTE:
 		case Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Opcode::BUFFER_STORE_SHORT:
 		case Opcode::BUFFER_STORE_SHORT_D16_HI:
+		case Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
+		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
 		case Opcode::BUFFER_STORE_DWORD:
 		case Opcode::BUFFER_STORE_DWORDX2:
 		case Opcode::BUFFER_STORE_DWORDX3:
@@ -639,8 +682,6 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_ATOMIC_FMIN:
 		case Opcode::BUFFER_ATOMIC_FMAX:
 		case Opcode::BUFFER_LOAD_SBYTE:
-		case Opcode::BUFFER_LOAD_SBYTE_D16:
-		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
 		case Opcode::BUFFER_LOAD_SSHORT:
 		case Opcode::FLAT_LOAD_UBYTE:
 		case Opcode::FLAT_LOAD_SBYTE:
@@ -718,8 +759,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_WRITE_B96:
 		case Opcode::DS_WRITE_B128:
 		case Opcode::DS_WRITE_ADDTID_B32:
-		case Opcode::DS_READ_ADDTID_B32: return FormatMemory(inst);
-		default: return FormatBinary(inst);
+		case Opcode::DS_READ_ADDTID_B32: return WithUnsupportedReason(inst, FormatMemory(inst));
+		default: return WithUnsupportedReason(inst, FormatBinary(inst));
 	}
 }
 
@@ -732,4 +773,4 @@ std::string ProgramToString(const Program& program) {
 	return text;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

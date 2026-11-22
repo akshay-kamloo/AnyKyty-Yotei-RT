@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer SrcBuf {
+    uint src_words[];
+};
+
+layout(std430, binding = 1) writeonly buffer DstBuf {
+    uint dst_words[];
+};
+
+layout(push_constant) uniform Params {
+    uint src_word_offset;
+    uint dst_word_offset;
+    uint local_x;
+    uint local_y;
+    uint local_z;
+} params;
+
+uint CeilDiv(uint threads, uint local_size) {
+    if (threads == 0u) return 0u;
+    return (threads - 1u) / local_size + 1u;
+}
+
+void main() {
+    const uint tx = src_words[params.src_word_offset + 0u];
+    const uint ty = src_words[params.src_word_offset + 1u];
+    const uint tz = src_words[params.src_word_offset + 2u];
+    dst_words[params.dst_word_offset + 0u] = CeilDiv(tx, params.local_x);
+    dst_words[params.dst_word_offset + 1u] = CeilDiv(ty, params.local_y);
+    dst_words[params.dst_word_offset + 2u] = CeilDiv(tz, params.local_z);
+}

@@ -1,3 +1,5 @@
+// Kept out of archive.cpp so the statically linked emulator does not pull in the writer and the
+// zstd compressor.
 #include "common/archive.h"
 
 #include "common/stringUtils.h"
@@ -14,6 +16,8 @@ bool PackArchive(const std::filesystem::path& directory, const std::filesystem::
 		File file;
 		bool ok = true;
 	} output;
+	// Create the archive before walking, so a re-run started while a cancelled pack is still
+	// walking sees it exists instead of losing its archive to that pack's cleanup.
 	if (!output.file.Create(archive)) {
 		return false;
 	}
@@ -25,6 +29,7 @@ bool PackArchive(const std::filesystem::path& directory, const std::filesystem::
 	std::vector<Entry> entries;
 	uint64_t           total = 0;
 	std::error_code    error;
+	// Follow directory links, as the emulator does when it runs the folder.
 	fs::recursive_directory_iterator it(directory, fs::directory_options::follow_directory_symlink,
 	                                    error);
 	for (; !error && it != fs::end(it); it.increment(error)) {
@@ -76,4 +81,4 @@ bool PackArchive(const std::filesystem::path& directory, const std::filesystem::
 	return output.ok;
 }
 
-}
+} // namespace Common

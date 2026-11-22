@@ -78,4 +78,4 @@ private:
 	Block* block = nullptr;
 };
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

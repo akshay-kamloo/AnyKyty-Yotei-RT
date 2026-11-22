@@ -17,6 +17,22 @@ Value::Value(uint64_t value): type(Type::U64), imm_u64(value) {}
 
 Value::Value(Type value_type, uint64_t bits): type(value_type), imm_u64(bits) {}
 
+uint64_t Value::ImmediateBits() const {
+	switch (type) {
+		case Type::Void:
+		case Type::Opaque: return 0;
+		case Type::ScalarReg: return static_cast<uint16_t>(scalar_reg);
+		case Type::VectorReg: return static_cast<uint16_t>(vector_reg);
+		case Type::U1: return imm_u1 ? 1u : 0u;
+		case Type::U8: return imm_u8;
+		case Type::U16:
+		case Type::F16: return imm_u16;
+		case Type::U32:
+		case Type::F32: return imm_u32;
+		default: return imm_u64;
+	}
+}
+
 Value Value::F16(uint16_t bits) {
 	return Value(Type::F16, bits);
 }
@@ -174,6 +190,7 @@ void Inst::AddPhiOperand(Block* predecessor, Value value) {
 }
 
 void Inst::ReplaceUsesWith(Value replacement, bool preserve) {
+	// Detach the arguments first (a phi can use itself), then move every use over in order.
 	Invalidate();
 	const auto old_uses = std::exchange(uses, {});
 	for (const auto& use: old_uses) {
@@ -227,4 +244,4 @@ void Inst::DropArgs() {
 	num_args = 0;
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

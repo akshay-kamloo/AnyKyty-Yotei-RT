@@ -80,27 +80,15 @@ static void InterruptEventTriggerFunc(LibKernel::EventQueue::KernelEqueueEvent* 
                                       void*                                     trigger_data) {
 	EXIT_IF(event == nullptr);
 
-	const auto data = reinterpret_cast<intptr_t>(trigger_data);
+	auto triggered_event = event->event;
+	triggered_event.fflags++;
+	triggered_event.data = reinterpret_cast<intptr_t>(trigger_data);
 	if (event->triggered) {
-		if (event->event.data == data) {
-			event->event.fflags++;
-			return;
-		}
-		for (auto& pending: event->pending_events) {
-			if (pending.data == data) {
-				pending.fflags++;
-				return;
-			}
-		}
-		auto triggered_event   = event->event;
-		triggered_event.fflags = 1;
-		triggered_event.data   = data;
 		event->pending_events.push_back(triggered_event);
-		return;
+	} else {
+		event->event     = triggered_event;
+		event->triggered = true;
 	}
-	event->event.fflags++;
-	event->event.data = data;
-	event->triggered  = true;
 }
 
 int AddEqEvent(RenderContext& renderer, LibKernel::EventQueue::KernelEqueue eq, int id,
@@ -140,7 +128,6 @@ void ReadGds(const Buffer& gds, uint32_t* dst, uint32_t dw_offset, uint32_t dw_s
 	EXIT_IF(dst == nullptr || offset > gds.Size() || size > gds.Size() - offset ||
 	        gds.Mapped().empty());
 	std::memcpy(dst, gds.Mapped().data() + offset, static_cast<size_t>(size));
-	LibKernel::Memory::NoteEmulatorWrite(reinterpret_cast<uint64_t>(dst), size);
 }
 
-}
+} // namespace Libs::Graphics::Sync

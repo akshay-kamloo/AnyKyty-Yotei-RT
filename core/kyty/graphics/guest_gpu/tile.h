@@ -13,8 +13,12 @@ struct TileSizeAlign {
 };
 
 struct TileSizeOffset {
-	uint32_t size   = 0;
-	uint32_t offset = 0;
+	uint32_t size       = 0;
+	uint32_t offset     = 0;
+	uint32_t src_size   = 0;
+	uint32_t src_offset = 0;
+	uint32_t x          = 0;
+	uint32_t y          = 0;
 };
 
 struct TilePaddedSize {
@@ -72,6 +76,7 @@ struct TileSurfaceDescription {
 	uint32_t               layers    = 1;
 };
 
+// Width/height fields are measured in addressable elements, not texture texels.
 struct TileMipLayout {
 	uint64_t offset        = 0;
 	uint64_t size          = 0;
@@ -81,6 +86,7 @@ struct TileMipLayout {
 	uint32_t padded_height = 0;
 	uint32_t tail_x        = 0;
 	uint32_t tail_y        = 0;
+	bool     operator==(const TileMipLayout&) const = default;
 };
 
 struct TileSurfaceLayout {
@@ -102,17 +108,22 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description,
 bool TileGetBlockOffset(const TileBlockLayout& layout, uint32_t x, uint32_t y, uint32_t z,
                         uint32_t& byte_offset);
 bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
+                     uint32_t& byte_offset);
+bool TileGetBlockXor(const TileBlockLayout& layout, uint32_t block_x, uint32_t block_y,
                      uint32_t block_z, uint32_t& byte_offset);
 
-bool     TileGetDepthSize(uint32_t width, uint32_t height, Prospero::DepthFormat z_format,
-                          Prospero::StencilFormat stencil_format, bool htile,
-                          TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
+bool     TileGetDepthSize(uint32_t width, uint32_t height, uint32_t pitch,
+                          Prospero::DepthFormat z_format, Prospero::StencilFormat stencil_format,
+                          bool htile, TileSizeAlign& stencil_size, TileSizeAlign& htile_size,
                           TileSizeAlign& depth_size, uint32_t num_fragments_log2 = 0);
 uint32_t TileGetRenderTargetPitch(uint32_t width, uint32_t bytes_per_element,
                                   uint32_t num_fragments_log2 = 0);
+uint32_t TileGetDepthPitch(uint32_t width, uint32_t bytes_per_element,
+                           uint32_t num_fragments_log2 = 0);
 bool     TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
                                  uint32_t bytes_per_element, TileSizeAlign& total_size,
                                  uint32_t num_fragments_log2 = 0);
+// mips, when given, receives the size and offset within a slice of each level that has metadata.
 bool     TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
                         uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
                         TileSizeAlign& total_size, uint32_t num_fragments_log2 = 0,
@@ -128,6 +139,6 @@ void     TileGetTextureTotalSize(Prospero::BufferFormat format, uint32_t width, 
 uint32_t TileGetTexturePitch(Prospero::BufferFormat format, uint32_t width,
                              Prospero::TileMode tile);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_TILE_H_ */

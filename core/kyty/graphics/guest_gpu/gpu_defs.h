@@ -96,6 +96,15 @@ enum class ChannelType : uint32_t {
 	kFloat = 7,
 };
 
+enum class NumberFormat : uint32_t {
+	kUNorm = 0,
+	kSNorm = 1,
+	kUInt  = 4,
+	kSInt  = 5,
+	kFloat = 7,
+	kSrgb  = 9,
+};
+
 enum class ChannelOrder : uint32_t {
 	kStandard    = 0,
 	kAlt         = 1,
@@ -103,6 +112,8 @@ enum class ChannelOrder : uint32_t {
 	kAltReversed = 3,
 };
 
+// Selects the logical shader component written to each physical color-attachment component.
+// Two bits per component keep this cheap to carry in shader and pipeline keys.
 struct ColorComponentMapping {
 	static constexpr uint8_t kIdentity = 0xe4u;
 
@@ -120,6 +131,7 @@ struct ColorComponentMapping {
 		return mapped;
 	}
 
+	// This mapping selects an intermediate component; next selects the final logical component.
 	[[nodiscard]] constexpr ColorComponentMapping Then(ColorComponentMapping next) const {
 		ColorComponentMapping result {0u};
 		for (uint32_t physical_component = 0; physical_component < 4u; physical_component++) {
@@ -137,15 +149,15 @@ struct ColorComponentMapping {
 static_assert(sizeof(ColorComponentMapping) == sizeof(uint8_t));
 
 inline constexpr ColorComponentMapping ColorMappingRgba {ColorComponentMapping::kIdentity};
-inline constexpr ColorComponentMapping ColorMappingGr {0xe1u};
-inline constexpr ColorComponentMapping ColorMappingRabg {0x6cu};
-inline constexpr ColorComponentMapping ColorMappingRgab {0xb4u};
-inline constexpr ColorComponentMapping ColorMappingBgra {0xc6u};
-inline constexpr ColorComponentMapping ColorMappingAbgr {0x1bu};
-inline constexpr ColorComponentMapping ColorMappingAgba {0x27u};
-inline constexpr ColorComponentMapping ColorMappingArbg {0x63u};
-inline constexpr ColorComponentMapping ColorMappingAgbr {0x87u};
-inline constexpr ColorComponentMapping ColorMappingArgb {0x93u};
+inline constexpr ColorComponentMapping ColorMappingGr {0xe1u};   // 1, 0, 2, 3
+inline constexpr ColorComponentMapping ColorMappingRabg {0x6cu}; // 0, 3, 2, 1
+inline constexpr ColorComponentMapping ColorMappingRgab {0xb4u}; // 0, 1, 3, 2
+inline constexpr ColorComponentMapping ColorMappingBgra {0xc6u}; // 2, 1, 0, 3
+inline constexpr ColorComponentMapping ColorMappingAbgr {0x1bu}; // 3, 2, 1, 0
+inline constexpr ColorComponentMapping ColorMappingAgba {0x27u}; // 3, 1, 2, 0
+inline constexpr ColorComponentMapping ColorMappingArbg {0x63u}; // 3, 0, 2, 1
+inline constexpr ColorComponentMapping ColorMappingAgbr {0x87u}; // 3, 1, 0, 2
+inline constexpr ColorComponentMapping ColorMappingArgb {0x93u}; // 3, 0, 1, 2
 
 enum class DepthFormat : uint32_t {
 	kInvalid = 0,
@@ -292,6 +304,23 @@ enum class ImageType : uint32_t {
 	kColor2DArray     = 13,
 	kColor2DMsaa      = 14,
 	kColor2DMsaaArray = 15,
+};
+
+enum class DescriptorKind : uint32_t {
+	kBuffer  = 1,
+	kSampler = 2,
+	kUnused  = 3,
+};
+
+enum class ShaderUsageType : uint32_t {
+	kReadOnlyResource  = 0x00,
+	kSampler           = 0x01,
+	kConstantBuffer    = 0x02,
+	kReadWriteResource = 0x04,
+	kGdsMemoryRange    = 0x07,
+	kFetchShader       = 0x12,
+	kVertexBufferTable = 0x17,
+	kExtendedUserData  = 0x1b,
 };
 
 enum class BufferFormat : uint32_t {
@@ -492,6 +521,6 @@ enum class VertexAttribFormat : uint32_t {
 	k32_32_32_32Float   = 311,
 };
 
-}
+} // namespace Libs::Graphics::Prospero
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GUEST_GPU_GPU_DEFS_H_ */

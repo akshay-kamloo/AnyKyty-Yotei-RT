@@ -15,6 +15,7 @@ bool     SystemContentIsTrinityMode();
 bool     SystemContentParamSfoGetInt(const char* name, int32_t* value);
 bool     SystemContentParamSfoGetString(const char* name, std::string* value);
 bool     SystemContentParamSfoGetString(const char* name, char* value, size_t value_size);
+// Memory sizes a game's param.json sets, in bytes; 0 where it sets none.
 struct MemoryParams {
 	uint64_t flexible_size    = 0;
 	uint64_t cpu_table_memory = 0;
@@ -27,6 +28,6 @@ MemoryParams SystemContentGetMemoryParams();
 bool     SystemContentGetIconPath(std::filesystem::path* path);
 bool     SystemContentGetChunksNum(uint32_t* num);
 
-}
+} // namespace Loader
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_LOADER_SYSTEMCONTENT_H_ */

@@ -7,6 +7,6 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
 void DecodeExp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_EXPORTOPS_H_ */

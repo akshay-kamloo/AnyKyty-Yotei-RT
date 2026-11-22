@@ -6,9 +6,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <span>
+#include <string>
 #include <string_view>
 
 namespace Config {
@@ -90,10 +93,6 @@ bool IsGuestUserId(int32_t user_id) {
 	return GetPlayerFromUserId(user_id) > 0;
 }
 
-bool PadHapticRumbleEnabled() {
-	return g_config->pad_haptic_rumble;
-}
-
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
@@ -124,22 +123,6 @@ bool VrEnabled() {
 
 bool Ps5ProEnabled() {
 	return g_config->pro_enabled;
-}
-
-PssrUpscaler GetPssrUpscaler() {
-	return g_config->pssr_upscaler;
-}
-
-const std::filesystem::path& GetDlssFolder() {
-	return g_config->dlss_folder;
-}
-
-uint32_t GetDlssPreset() {
-	return g_config->dlss_preset;
-}
-
-const std::filesystem::path& GetFsrFolder() {
-	return g_config->fsr_folder;
 }
 
 bool AmdCpuEnabled() {
@@ -178,20 +161,8 @@ bool ShaderCacheEnabled() {
 	return g_config->shader_cache_enabled;
 }
 
-bool PipelineManifestEnabled() {
-	return g_config->pipeline_manifest_enabled;
-}
-
-bool PipelineManifestRecord() {
-	return g_config->pipeline_manifest_record;
-}
-
-bool PipelineManifestStrict() {
-	return g_config->pipeline_manifest_strict;
-}
-
-PipelinePrecompile GetPipelinePrecompile() {
-	return g_config->pipeline_precompile;
+ShaderOptimizationType GetShaderOptimizationType() {
+	return g_config->shader_optimization_type;
 }
 
 LogDirection GetShaderLogDirection() {
@@ -222,10 +193,6 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
-std::filesystem::path GetSessionLogFile() {
-	return g_config->session_log_file;
-}
-
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }
@@ -243,23 +210,18 @@ bool RenderDocEnabled() {
 }
 
 bool ReadbackLinearImagesEnabled() {
-	return g_config->readback_linear_images;
+	// Always on (M118, whatever the launcher's setting says): GPU-written linear images are written back to guest memory,
+	// as on PS5 where the CPU sees what the GPU wrote. Ghost of Yotei's CPU occlusion test reads the hi-Z pyramid from
+	// memory; without it the test used a pyramid frozen around a cutscene and distant objects vanished every other frame.
+	return true;
 }
 
 bool ReadbackTiledImagesEnabled() {
 	return g_config->readback_tiled_images;
 }
 
-bool ReadbackStorageImagesEnabled() {
-	return g_config->readback_storage_images;
-}
-
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
-}
-
-uint32_t GetFlushDraws() {
-	return g_config->flush_draws;
 }
 
 bool TessellationEnabled() {
@@ -268,30 +230,6 @@ bool TessellationEnabled() {
 
 bool OcclusionQueriesEnabled() {
 	return g_config->occlusion_queries_enabled;
-}
-
-bool RelaxedShaderFloatEnabled() {
-	return g_config->relaxed_shader_float;
-}
-
-bool WaveSplitEnabled() {
-	return g_config->wave_split;
-}
-
-bool ImageTableHeapEnabled() {
-	return g_config->image_table_heap;
-}
-
-bool NativeRtEnabled() {
-	return g_config->native_rt;
-}
-
-bool AsyncPipelinesEnabled() {
-	return g_config->async_pipelines_enabled;
-}
-
-bool AsyncPipelinesSkipMore() {
-	return g_config->async_pipelines_skip_more;
 }
 
 bool NativeRayTracingEnabled() {
@@ -334,37 +272,41 @@ bool SkipNoticeScreen() {
 	return g_config->skip_notice_screen;
 }
 
-uint32_t ParseGpuPipelineStages(const char* value) {
-	char*      end    = nullptr;
-	const auto parsed = std::strtoul(value, &end, 0);
-	if (end == value || *end != '\0') {
-		EXIT("invalid GPU pipeline stages: %s\n", value);
-	}
-	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
+bool PrecompileOnly() {
+	return g_config->precompile_only;
 }
 
-bool ResolveHelperEnabled() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_RESOLVE_HELPER");
-		return value != nullptr && std::string_view(value) == "1";
-	}();
-	return enabled;
+uint32_t GetPrecompileThreads() {
+	return g_config->precompile_threads;
 }
 
+const std::filesystem::path& GetPrecompileExportHints() {
+	return g_config->precompile_export_hints;
+}
+
+const std::filesystem::path& GetPrecompileImportHints() {
+	return g_config->precompile_import_hints;
+}
+
+const std::filesystem::path& GetGameDir() {
+	return g_config->game_dir;
+}
+
+// Based on TheCruZ/KytyPS5-GTA 12ec19890 and dd7a6e008 (emulatorConfig.cpp), GPL-2.0. The choice of cores and the
+// priority rule are ours: four whole physical cores of the processor (Common::ChooseGpuStageCpus; on a 9800X3D physical
+// cores 1, 3, 4 and 2), away from the interrupt-heavy core 0; only the threads that own the stream get the higher
+// priority (the recording and resolve threads spin). KYTY_GPU_THREAD_CPUS=<e>,<r>,<v>,<c> or off: the user's choice.
 void ConfigureGpuStageThread(GpuStageThread stage) {
-	static const std::array<int, 6> cpus = [] {
-		std::array<int, 6> result {4, 6, 8, 10, 2, 0};
-		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+	static const std::array<int, 4> cpus = [] {
+		std::array<int, 4> result = Common::ChooseGpuStageCpus(Common::Thread::SystemLogicalCpus());
+		const char*        value  = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 6> {-1, -1, -1, -1, -1, -1};
+			return std::array<int, 4> {-1, -1, -1, -1};
 		}
 		for (auto& cpu: result) {
-			if (*value == '\0') {
-				break;
-			}
 			char* end = nullptr;
 			cpu       = static_cast<int>(std::strtol(value, &end, 10));
 			if (end == value) {
@@ -378,31 +320,46 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
 		return value == nullptr || std::string_view(value) != "0";
 	}();
-	if (high_priority) {
-		Common::Thread::RaiseCurrentPriority();
-	}
-#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-	static const bool listed = [] {
-		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
-		return value != nullptr && value[0] != '\0';
-	}();
-	if (!listed) {
-		Common::Thread::KeepCurrentOnLargestCache();
+	if (stage == GpuStageThread::ResolveHelper) {
+		Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(GpuStageThread::Resolve)]);
 		return;
 	}
-#endif
+	if (stage == GpuStageThread::ResolveHelper2) {
+		// Project 15 N5.3: not pinned (the walk 10.11: with the plans 19.23 fps and 333 frames over 60 ms, against 18.97 and
+		// 527 on the first helper's SMT sibling): the scheduler gives it a core of its own.
+		return;
+	}
+	if (stage == GpuStageThread::ResolveDispatcher) {
+		// The SMT sibling of the command processor's processor: the operations it writes are in that core's caches.
+		static const int sibling = [] {
+			const int cp = cpus[static_cast<uint32_t>(GpuStageThread::CommandProcessor)];
+			if (cp < 0) return -1;
+			const auto all  = Common::Thread::SystemLogicalCpus();
+			const auto self = std::find_if(all.begin(), all.end(), [&](const Common::LogicalCpu& c) { return c.logical == cp; });
+			if (self == all.end()) return -1;
+			for (const auto& c: all) {
+				if (c.core == self->core && c.logical != cp) return c.logical;
+			}
+			return -1;
+		}();
+		if (sibling >= 0) Common::Thread::PinCurrent(sibling);
+		return;
+	}
+	if (high_priority && (stage == GpuStageThread::Execution || stage == GpuStageThread::CommandProcessor)) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	// Other threads otherwise run on the SMT siblings of the pinned stages and slow them down: give the stages whole
+	// physical cores. KYTY_GPU_THREAD_MIN_CORES: the physical cores the rest of the process must keep (default 4: an
+	// 8-core processor reserves, a 6-core one does not).
 	static std::once_flag reserved;
 	std::call_once(reserved, [] {
-		Common::Thread::ReserveCores(std::span {cpus}.first(ResolveHelperEnabled() ? 6 : 5));
+		const char*  value     = std::getenv("KYTY_GPU_THREAD_MIN_CORES");
+		const size_t min_cores = value != nullptr ? std::strtoul(value, nullptr, 10) : 4u;
+		const auto   result    = Common::Thread::ReserveCores(cpus, min_cores);
+		std::fprintf(stderr, "GPU_THREAD_CPUS execution=%d recording=%d resolve=%d command_processor=%d: %s\n", cpus[0],
+		             cpus[1], cpus[2], cpus[3], result.c_str());
 	});
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
-}
-
-uint32_t GpuPipelineStages() {
-	if (const char* value = std::getenv("KYTY_GPU_PIPELINE"); value != nullptr) {
-		return ParseGpuPipelineStages(value);
-	}
-	return g_config != nullptr ? g_config->gpu_pipeline_stages : 0;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -419,4 +376,4 @@ const std::vector<std::string>& GetGuestArguments() {
 	return g_config->guest_arguments;
 }
 
-}
+} // namespace Config

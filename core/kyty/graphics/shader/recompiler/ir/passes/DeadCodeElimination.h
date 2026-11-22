@@ -8,6 +8,5 @@ struct Program;
 
 void RemoveIdentities(Program& program);
 void EliminateDeadCode(const BlockList& blocks);
-uint32_t EliminateMaskedSelects(const BlockList& blocks);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

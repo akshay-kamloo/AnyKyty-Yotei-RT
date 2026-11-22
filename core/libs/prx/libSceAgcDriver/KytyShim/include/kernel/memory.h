@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -12,26 +14,27 @@
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
-}
+} // namespace Libs::Graphics
 
 namespace Libs::LibKernel::Memory {
 
 void Initialize();
 void Shutdown();
 
+// Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
+// waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
 	uint64_t direct_total        = 0;
-	uint64_t direct_allocated    = 0;
-	uint64_t pooled_allocated    = 0;
-	uint64_t automatic_allocated = 0;
+	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t automatic_allocated = 0; // Extended memory.
 	uint64_t direct_mapped       = 0;
 	uint64_t flexible_total      = 0;
 	uint64_t flexible_used       = 0;
 	uint64_t pool_committed      = 0;
-	uint64_t cpu_page_entries       = 0;
-	uint64_t gpu_page_entries       = 0;
-	uint64_t cpu_page_entries_total = 0;
-	uint64_t gpu_page_entries_total = 0;
+	uint64_t cpu_page_entries    = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries    = 0;
+	uint64_t page_entries_total  = 0; // Per side.
 };
 [[nodiscard]] DebugStats GetDebugStats();
 
@@ -128,63 +131,72 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
-bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// The in-place check of a large bindless table (descriptors.cpp PrepareBindlessTable): 0 = the range lies in one
+// mapping and holds exactly `expected`, 1 = it holds other bytes, 2 = not a plain single-mapping range (TryReadBacking
+// decides).
+int                    CompareBacking(uint64_t vaddr, const void* expected, uint64_t size);
+// The BDA fallback: host view of the direct-memory backing; offset of a guest range held by one mapping.
+uint64_t               GuestBackingBase();
+uint64_t               GuestBackingSize();
+bool                   GuestBackingOffset(uint64_t vaddr, uint64_t size, uint64_t* offset);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
-[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
-bool TryGetBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
-bool TryGetSparseBackingPieces(uint64_t vaddr, uint64_t size, std::vector<std::pair<const uint8_t*, uint64_t>>& pieces);
-bool DiscardBacking(uint64_t address, uint64_t size);
-bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
-[[nodiscard]] bool     GuestRangeWatched(uint64_t vaddr, uint64_t size);
-void                   NoteGameFree(uint64_t vaddr, uint64_t size);
-void                   DropHotReadsBacking(uint64_t backing, uint64_t size);
-[[nodiscard]] bool GpuCleanBackingEquals(uint64_t vaddr, const void* expected, uint64_t size,
-                                         bool (*equal)(const void*, const void*, uint64_t) = nullptr);
-[[nodiscard]] uint64_t WatchStrictRead(uint64_t vaddr, uint64_t size);
-[[nodiscard]] bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
-                                              bool (*equal)(const void*, const void*, uint64_t) = nullptr);
-bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
-[[nodiscard]] bool ReplayableGpuRead(uint64_t vaddr, uint64_t size);
-void                   NoteReplayedGpuRead();
-void                   AllowReplayAfterReadback();
-[[nodiscard]] bool     TextureGpuModified(uint64_t vaddr, uint64_t size);
-[[nodiscard]] bool     TakeReplayAfterReadback(uint64_t* begin, uint64_t* end);
-void                   FinishReplayAfterReadback(bool replayed);
-bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
-bool                   HasGpuWrittenBytes(uint64_t vaddr, uint64_t size);
-bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);
-[[nodiscard]] const uint8_t* FindAroundBackingPage(uint64_t vaddr);
-bool TryReadAroundGpuWritesOnPage(uint64_t vaddr, void* data, uint64_t size,
-                                  const uint8_t* page_backing);
+// Diagnostics: guest virtual ranges (address, size) mapping the same direct memory as the range.
+std::vector<std::pair<uint64_t, uint64_t>> FindDirectMemoryAliases(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
-bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
-[[nodiscard]] uint64_t BackingEpoch() noexcept;
-[[nodiscard]] bool BackingChangesSince(uint64_t epoch,
-                                       std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-[[nodiscard]] uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size);
-[[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
-bool                   TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
-bool                   TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
-bool                   TryPrepareHostImageWrite(uint64_t vaddr, uint64_t size);
-void                   NoteEmulatorWrite(uint64_t vaddr, uint64_t size);
-inline bool TryReadBackingToHost(uint64_t vaddr, void* data, uint64_t size) { return TryReadBacking(vaddr, data, size); }
-inline bool TryReadGpuCleanBackingToHost(uint64_t vaddr, void* data, uint64_t size) {
-	return TryReadGpuCleanBacking(vaddr, data, size);
-}
+// M109 crash report: what the caller binds when ClampRangeSize exits on an invalid address (shader, resource, V#), printed
+// with the recent unmaps of that range before the exit. One scope per call; nothing is printed unless the range is invalid.
+struct ClampContext {
+	uint64_t        shader_hash = 0;
+	uint32_t        resource    = 0;
+	bool            written     = false;
+	const uint32_t* vsharp      = nullptr; // 4 dwords
+};
+class ClampContextScope {
+public:
+	explicit ClampContextScope(const ClampContext& context);
+	~ClampContextScope();
+	ClampContextScope(const ClampContextScope&)            = delete;
+	ClampContextScope& operator=(const ClampContextScope&) = delete;
+
+private:
+	const ClampContext* m_previous;
+};
+// The part of [vaddr, vaddr + size) covered by contiguous reserved or committed virtual ranges; 0 when vaddr is
+// not in one. Never exits.
+[[nodiscard]] uint64_t TryClampReservedRangeSize(uint64_t vaddr, uint64_t size);
+// The resolve thread's lookups (any thread; never exits or logs): ClampRangeSize's answer (0 where ClampRangeSize exits),
+// and in *generation the generation of the virtual ranges it was computed at; while RangesGeneration() still returns
+// that value, ClampRangeSize gives the same answer.
+[[nodiscard]] uint64_t ClampRangeSizeAhead(uint64_t vaddr, uint64_t size, uint64_t* generation);
+[[nodiscard]] uint64_t RangesGeneration();
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
-[[nodiscard]] uint64_t WaitForTransientUnmap(uint64_t fault_vaddr) noexcept;
-[[nodiscard]] bool RetryTransientUnmapFault(uint64_t fault_vaddr, uint64_t window) noexcept;
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+// The fatal report of an access no handler took (runtimeLinker.cpp): the page as the host, the guest kernel and the
+// renderer see it, the replacement in progress (KYTY_FIX_REPLACE_GAP) and the recent unmaps over it. Crash path only.
+void ReportUnhandledFaultPage(uint64_t vaddr) noexcept;
+// The one reader for the emulator's own ordinary reads of guest memory. Bytes of a page under the image read watch come from
+// the backing mapping (no fault, no wait): what a plain read gives without the watch. A page the buffer cache also watches is
+// read plainly, so that its fault runs as without the watch. Any thread.
+void ReadGuestPlain(void* dst, uint64_t vaddr, uint64_t size);
+// Whether a page of the range is under the image read watch (a stale answer is possible).
+[[nodiscard]] bool GuestImageReadArmed(uint64_t vaddr, uint64_t size);
+// A guest buffer for a host call that reads it in kernel mode, where a page under the image read watch fails the call instead
+// of faulting. Such a buffer is copied to scratch on the calling (guest) thread first, which faults and is served as the
+// guest's own read; otherwise it comes back unchanged.
+[[nodiscard]] const void* GuestBytesForKernelRead(const void* guest, size_t size, std::vector<uint8_t>& scratch);
+// A copy from guest memory that survives an access violation (false: it faulted, or the ranges overlap).
+[[nodiscard]] bool GuardedGuestCopy(void* dst, const void* src, size_t size);
 
 int KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                                                const char* name);
@@ -242,8 +254,6 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
-void ChargeFlexibleMemory(uint64_t size);
-void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
@@ -252,26 +262,35 @@ uint64_t AllocateGuestStackMemory(uint64_t search_addr, uint64_t size,
                                   Common::VirtualMemory::Mode mode, const char* name);
 bool     ProtectGuestMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode,
                             Common::VirtualMemory::Mode* old_mode = nullptr);
+// Transient PageManager watch state; does not change the guest mapping's semantic protection.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
-[[nodiscard]] bool IsGuestExecutable(uint64_t vaddr);
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
+void     TestFailNextPhysicalMemoryUnmap();
+void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
+void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
+void     TestFailNextFixedReserveRangeRegistration();
+void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
-uint64_t TestFlexibleBackingHighWater();
-uint64_t TestGuestFreeRangeVisits();
-uint64_t TestDirectMappingCount();
-uint64_t TestFlexibleMappingCount();
-uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
 #endif
 
-}
 
-#endif
+// AnyKyty shim helpers (implemented in KytyShim/src/MemoryBacking.cpp and MemoryGpu.cpp):
+[[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool        GuestRangeWatched(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool        IsFullyMapped(uint64_t vaddr, uint64_t size);
+bool                      TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
+bool                      TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);
+void                      NoteEmulatorWrite(uint64_t vaddr, uint64_t size);
+
+} // namespace Libs::LibKernel::Memory
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_MEMORY_H_ */

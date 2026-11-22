@@ -257,7 +257,7 @@ constexpr vk::BufferUsageFlags AsFlags =
 constexpr vk::PipelineStageFlags2 AsBuildStage =
     vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR;
 
-void MemoryBarrier(const CommandRecorder& command, vk::PipelineStageFlags2 src_stages,
+void MemoryBarrier(vk::CommandBuffer command, vk::PipelineStageFlags2 src_stages,
                    vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst_stages,
                    vk::AccessFlags2 dst_access) {
 	vk::MemoryBarrier2 barrier {};
@@ -271,7 +271,7 @@ void MemoryBarrier(const CommandRecorder& command, vk::PipelineStageFlags2 src_s
 	command.pipelineBarrier2(dependency);
 }
 
-void UpdateBuffer(const CommandRecorder& command, StreamBuffer& upload, vk::Buffer buffer, uint64_t offset,
+void UpdateBuffer(vk::CommandBuffer command, StreamBuffer& upload, vk::Buffer buffer, uint64_t offset,
                   const void* data, uint32_t size) {
 	EXIT_IF(size == 0 || size > 65536 || (size & 3u) != 0 || (offset & 3u) != 0);
 	const vk::BufferCopy region {upload.Copy(data, size, 4), offset, size};
@@ -1236,7 +1236,7 @@ void RayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
 	m_walks_announced = true;
 }
 
-bool RayTracing::RecordBuilds(const CommandRecorder& command) {
+bool RayTracing::RecordBuilds(vk::CommandBuffer command) {
 	bool gathered = false;
 	for (uint32_t batch = 0; batch < MaxBuildBatches; batch++) {
 		if (batch != 0) {
@@ -1263,7 +1263,7 @@ bool RayTracing::Slot::CanGather(uint64_t sequence) const {
 	       (built_refit_seq + 1 == sequence || (built_refit_seq == sequence && dynamic_until != 0));
 }
 
-bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered_out) {
+bool RayTracing::RecordBuildBatch(vk::CommandBuffer command, bool urgent_only, bool& gathered_out) {
 	auto&                 readback  = m_readbacks[m_readback_index];
 	const uint32_t        first_job = readback.build_count;
 	std::vector<Job>      jobs, gather_jobs;
@@ -1446,14 +1446,18 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1, fast ? 1u : 0u});
 		scratch_offset += (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
 	}
-	const auto* copy  = command.CopyArray(records.data(), records.size());
-	const auto  count = static_cast<uint32_t>(records.size());
-	command.Custom([copy, count](vk::CommandBuffer c) {
-		std::vector<vk::AccelerationStructureGeometryKHR>              geometries(count * 2);
-		std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos(count);
-		std::vector<vk::AccelerationStructureBuildRangeInfoKHR>        ranges(count * 2);
-		std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers(count);
-		for (uint32_t i = 0; i < count; i++) {
+	const auto count = static_cast<uint32_t>(records.size());
+	using RecordType = std::decay_t<decltype(records[0])>;
+	struct BlasBuildPacket {
+		vk::CommandBuffer cmd;
+		uint32_t          count;
+	};
+	auto run_blas = [](vk::CommandBuffer c, const RecordType* copy, uint32_t n) {
+		std::vector<vk::AccelerationStructureGeometryKHR>              geometries(n * 2);
+		std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos(n);
+		std::vector<vk::AccelerationStructureBuildRangeInfoKHR>        ranges(n * 2);
+		std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers(n);
+		for (uint32_t i = 0; i < n; i++) {
 			geometries[i * 2]     = TriangleGeometry(copy[i].vertices0, copy[i].capacity0, true);
 			geometries[i * 2 + 1] = TriangleGeometry(copy[i].vertices1, copy[i].capacity1, false);
 			auto& info                     = infos[i];
@@ -1468,8 +1472,42 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 			ranges[i * 2 + 1].primitiveCount = copy[i].capacity1;
 			range_pointers[i]                = &ranges[i * 2];
 		}
-		c.buildAccelerationStructuresKHR(count, infos.data(), range_pointers.data());
-	});
+		c.buildAccelerationStructuresKHR(n, infos.data(), range_pointers.data());
+	};
+	if (auto* out = CommandRecorder::ReserveCall(command, sizeof(BlasBuildPacket) + count * sizeof(RecordType));
+	    out != nullptr) {
+		auto* hdr = static_cast<BlasBuildPacket*>(out);
+		hdr->cmd   = command;
+		hdr->count = count;
+		std::memcpy(hdr + 1, records.data(), count * sizeof(RecordType));
+		CommandRecorder::CommitCall([](const void* blob) {
+			const auto* hdr  = static_cast<const BlasBuildPacket*>(blob);
+			const auto* copy = reinterpret_cast<const RecordType*>(hdr + 1);
+			const uint32_t n = hdr->count;
+			std::vector<vk::AccelerationStructureGeometryKHR>              geometries(n * 2);
+			std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos(n);
+			std::vector<vk::AccelerationStructureBuildRangeInfoKHR>        ranges(n * 2);
+			std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers(n);
+			for (uint32_t i = 0; i < n; i++) {
+				geometries[i * 2]     = TriangleGeometry(copy[i].vertices0, copy[i].capacity0, true);
+				geometries[i * 2 + 1] = TriangleGeometry(copy[i].vertices1, copy[i].capacity1, false);
+				auto& info                     = infos[i];
+				info.type                      = vk::AccelerationStructureTypeKHR::eBottomLevel;
+				info.flags                     = copy[i].fast != 0 ? FastBlasFlags : BlasFlags;
+				info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
+				info.dstAccelerationStructure  = copy[i].handle;
+				info.geometryCount             = 2;
+				info.pGeometries               = &geometries[i * 2];
+				info.scratchData.deviceAddress = copy[i].scratch;
+				ranges[i * 2].primitiveCount     = copy[i].capacity0;
+				ranges[i * 2 + 1].primitiveCount = copy[i].capacity1;
+				range_pointers[i]                = &ranges[i * 2];
+			}
+			hdr->cmd.buildAccelerationStructuresKHR(n, infos.data(), range_pointers.data());
+		});
+	} else {
+		run_blas(command, records.data(), count);
+	}
 	MemoryBarrier(command, AsBuildStage, vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
 	              AsBuildStage | vk::PipelineStageFlagBits2::eComputeShader |
 	                  vk::PipelineStageFlagBits2::eTransfer,
@@ -1489,7 +1527,7 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	return true;
 }
 
-void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
+void RayTracing::Prepare(vk::CommandBuffer command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
                                uint64_t frame, uint64_t shader_hash, bool count_rays, bool per_lane) {
 	if (!m_enabled) {
@@ -1610,7 +1648,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		}
 		const auto last = std::max(m_last_instance_counts[source_key], counted);
 		tlas_count      = std::min(m_tlas_capacity,
-		                           std::max({m_cpu_counted_sources.contains(source_key) ? 1024u : 4096u,
+		                           std::max({m_cpu_counted_sources.contains(source_key) ? 1024u : 8192u,
 		                                     m_instance_floors[source_key], (last + last / 4 + 255u) & ~255u}));
 	}
 	m_prepare_id++;
@@ -1689,12 +1727,11 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		                  vk::AccessFlagBits2::eTransferWrite);
 	}
 
-	m_buffer_cache.PrepareFaultBuffer();
 	auto*       page_table   = m_buffer_cache.GetBdaPageTableBuffer();
 	const auto* fault_buffer = m_buffer_cache.GetFaultBuffer();
 	const std::array<vk::DescriptorBufferInfo, WalkBindings> infos {{
 	    {page_table->Handle(), 0, page_table->Size()},
-	    {fault_buffer->Handle(), 0, BufferCache::WRITE_BITMAP_OFFSET},
+	    {fault_buffer->Handle(), 0, BufferCache::FAULT_BITMAP_BYTES},
 	}};
 	std::array<vk::WriteDescriptorSet, WalkBindings> writes {};
 	for (uint32_t i = 0; i < WalkBindings; i++) {
@@ -1783,26 +1820,41 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		const auto handle    = m_tlas;
 		const auto instances = m_instances->BufferDeviceAddress();
 		const auto scratch   = m_build_scratch->BufferDeviceAddress();
-		command.Custom([handle, instances, scratch, tlas_count](vk::CommandBuffer c) {
+		struct TlasBuildPacket {
+			vk::CommandBuffer            cmd;
+			vk::AccelerationStructureKHR handle;
+			vk::DeviceAddress            instances;
+			vk::DeviceAddress            scratch;
+			uint32_t                     tlas_count;
+		};
+		auto run_tlas = [](const void* blob) {
+			const auto& pkt = *static_cast<const TlasBuildPacket*>(blob);
 			vk::AccelerationStructureGeometryKHR geometry {};
 			geometry.geometryType = vk::GeometryTypeKHR::eInstances;
 			geometry.geometry.instances.sType =
 			    vk::StructureType::eAccelerationStructureGeometryInstancesDataKHR;
 			geometry.geometry.instances.arrayOfPointers    = VK_FALSE;
-			geometry.geometry.instances.data.deviceAddress = instances;
+			geometry.geometry.instances.data.deviceAddress = pkt.instances;
 			vk::AccelerationStructureBuildGeometryInfoKHR info {};
 			info.type                      = vk::AccelerationStructureTypeKHR::eTopLevel;
 			info.flags                     = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
 			info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
-			info.dstAccelerationStructure  = handle;
+			info.dstAccelerationStructure  = pkt.handle;
 			info.geometryCount             = 1;
 			info.pGeometries               = &geometry;
-			info.scratchData.deviceAddress = scratch;
+			info.scratchData.deviceAddress = pkt.scratch;
 			vk::AccelerationStructureBuildRangeInfoKHR range {};
-			range.primitiveCount      = tlas_count;
+			range.primitiveCount      = pkt.tlas_count;
 			const auto* range_pointer = &range;
-			c.buildAccelerationStructuresKHR(1, &info, &range_pointer);
-		});
+			pkt.cmd.buildAccelerationStructuresKHR(1, &info, &range_pointer);
+		};
+		TlasBuildPacket pkt {command, handle, instances, scratch, tlas_count};
+		if (auto* out = CommandRecorder::ReserveCall(command, sizeof(TlasBuildPacket)); out != nullptr) {
+			std::memcpy(out, &pkt, sizeof(TlasBuildPacket));
+			CommandRecorder::CommitCall(run_tlas);
+		} else {
+			run_tlas(&pkt);
+		}
 	}
 	MemoryBarrier(command, AsBuildStage | vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eAccelerationStructureWriteKHR | vk::AccessFlagBits2::eShaderWrite,
@@ -1829,7 +1881,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	readback.capacity    = tlas_count;
 	readback.preparation = m_preparations.load(std::memory_order_relaxed) + 1;
 	m_preparations.store(readback.preparation, std::memory_order_release);
-	m_scheduler.DeferHostOperation([this, &readback] { ProcessReadback(readback); });
+	m_scheduler.DeferOperation([this, &readback] { ProcessReadback(readback); });
 	m_readback_index = (m_readback_index + 1) % m_readbacks.size();
 }
 
@@ -2003,7 +2055,7 @@ uint32_t RayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
 	return header[4];
 }
 
-void RayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
+void RayTracing::RecordHleTlas(vk::CommandBuffer command, uint64_t input_va,
                                      uint32_t count, uint32_t stride, uint64_t header_va,
                                      HleTlasFormat format) {
 	NoteGuestOperation();
@@ -2212,7 +2264,7 @@ std::vector<std::pair<uint64_t, uint32_t>> RayTracing::DropHleRefitOutsideGuest(
 	return dropped;
 }
 
-void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+void RayTracing::RecordHleRefit(vk::CommandBuffer command, std::span<const uint64_t> blases,
                                       std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
                                       bool arguments) {
 	NoteGuestOperation();

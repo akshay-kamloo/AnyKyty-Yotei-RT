@@ -6,4 +6,4 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 void RewriteToSsa(const BlockList& blocks);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

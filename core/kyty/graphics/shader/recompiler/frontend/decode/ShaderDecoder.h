@@ -2,9 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_
 
 #include "common/common.h"
-#include "graphics/shader/recompiler/frontend/decode/RecordReach.h"
 
-#include <array>
 #include <magic_enum.hpp>
 #include <span>
 #include <string_view>
@@ -12,6 +10,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
 constexpr uint32_t SharedApertureHigh = 0x80000000u;
 
@@ -278,7 +277,6 @@ enum class Opcode {
 	V_BFI_B32,
 	V_ALIGNBIT_B32,
 	V_ALIGNBYTE_B32,
-	V_PERM_B32,
 	V_MIN3_F32,
 	V_MIN3_I32,
 	V_MIN3_U32,
@@ -298,7 +296,6 @@ enum class Opcode {
 	V_MED3_I16,
 	V_MED3_U16,
 	V_SAD_U32,
-	V_MSAD_U8,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
 	V_ADD_LSHL_U32,
@@ -468,7 +465,6 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
-	V_CMP_U_F16,
 	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
@@ -506,6 +502,7 @@ enum class Opcode {
 	V_CMP_NE_U32,
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
+	// Keep V_CMP_F_I64 to V_CMPX_T_U64 contiguous: VectorAluOps.cpp tests this range.
 	V_CMP_F_I64,
 	V_CMP_LT_I64,
 	V_CMP_EQ_I64,
@@ -561,34 +558,34 @@ enum class Opcode {
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
-	BUFFER_LOAD_FORMAT_D16_X,
-	BUFFER_LOAD_FORMAT_D16_HI_X,
-	BUFFER_LOAD_FORMAT_D16_XY,
-	BUFFER_LOAD_FORMAT_D16_XYZ,
-	BUFFER_LOAD_FORMAT_D16_XYZW,
 	BUFFER_STORE_FORMAT_X,
 	BUFFER_STORE_FORMAT_XY,
 	BUFFER_STORE_FORMAT_XYZ,
 	BUFFER_STORE_FORMAT_XYZW,
-	BUFFER_STORE_FORMAT_D16_X,
-	BUFFER_STORE_FORMAT_D16_HI_X,
-	BUFFER_STORE_FORMAT_D16_XY,
-	BUFFER_STORE_FORMAT_D16_XYZ,
-	BUFFER_STORE_FORMAT_D16_XYZW,
 	BUFFER_LOAD_UBYTE,
-	BUFFER_LOAD_UBYTE_D16,
-	BUFFER_LOAD_UBYTE_D16_HI,
 	BUFFER_LOAD_SBYTE,
-	BUFFER_LOAD_SBYTE_D16,
-	BUFFER_LOAD_SBYTE_D16_HI,
 	BUFFER_LOAD_USHORT,
 	BUFFER_LOAD_SSHORT,
-	BUFFER_LOAD_SHORT_D16,
-	BUFFER_LOAD_SHORT_D16_HI,
 	BUFFER_LOAD_DWORD,
 	BUFFER_LOAD_DWORDX2,
 	BUFFER_LOAD_DWORDX3,
 	BUFFER_LOAD_DWORDX4,
+	BUFFER_LOAD_FORMAT_D16_X,
+	BUFFER_LOAD_FORMAT_D16_XY,
+	BUFFER_LOAD_FORMAT_D16_XYZ,
+	BUFFER_LOAD_FORMAT_D16_XYZW,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
+	BUFFER_STORE_FORMAT_D16_X,
+	BUFFER_STORE_FORMAT_D16_XY,
+	BUFFER_STORE_FORMAT_D16_XYZ,
+	BUFFER_STORE_FORMAT_D16_XYZW,
+	BUFFER_STORE_FORMAT_D16_HI_X,
+	BUFFER_LOAD_UBYTE_D16,
+	BUFFER_LOAD_UBYTE_D16_HI,
+	BUFFER_LOAD_SBYTE_D16,
+	BUFFER_LOAD_SBYTE_D16_HI,
+	BUFFER_LOAD_SHORT_D16,
+	BUFFER_LOAD_SHORT_D16_HI,
 	BUFFER_STORE_BYTE,
 	BUFFER_STORE_BYTE_D16_HI,
 	BUFFER_STORE_SHORT,
@@ -814,7 +811,7 @@ enum class ImageDimension : uint32_t {
 };
 
 constexpr uint32_t MaxInstructionRawWords       = 5u;
-constexpr uint32_t MaxImageNsaAddressComponents = 16u;
+constexpr uint32_t MaxImageNsaAddressComponents = 12u;
 
 struct Operand {
 	OperandKind kind       = OperandKind::Unknown;
@@ -822,6 +819,8 @@ struct Operand {
 	int32_t     signed_val = 0;
 	uint32_t    reg        = 0;
 	uint32_t    sdwa_sel   = 6;
+	// Native 16-bit destinations use the same selector fields internally but preserve the
+	// untouched half. Real SDWA encodings overwrite this with their decoded DST_U value.
 	uint32_t sdwa_dst_unused    = 2;
 	uint32_t omod               = 0;
 	uint32_t dpp_ctrl           = 0;
@@ -879,7 +878,6 @@ struct Instruction {
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
 	bool           image_r128                                   = false;
-	bool           image_cube                                   = false;
 	uint32_t       branch_target                                = 0;
 	struct {
 		uint32_t target = 0;
@@ -891,51 +889,27 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
-struct InlinedCallBody {
-	uint32_t begin   = 0;
-	uint32_t end     = 0;
-	uint64_t address = 0;
-	std::vector<uint64_t> aliases;
-};
-
-struct RuntimeLiteral {
-	uint32_t pc   = 0;
-	uint32_t word = 0;
-
-	bool operator==(const RuntimeLiteral&) const = default;
-};
-
-struct LongBranch {
-	uint32_t pc     = 0;
-	uint32_t target = 0;
-
-	bool operator==(const LongBranch&) const = default;
-};
-
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_swap_pc = false;
-	std::vector<InlinedCallBody> call_bodies;
-	std::vector<LongBranch>      long_branches;
-	std::vector<RuntimeLiteral>  runtime_literals;
 	struct RayTracingSource {
-		uint32_t                user_sgpr     = 0;
-		uint32_t                header_offset = 0;
-		uint32_t                header_vsharp = 0xffffffffu;
-		uint32_t                root          = 0;
+		uint32_t user_sgpr = 0;
+		uint32_t header_offset = 0;
+		uint32_t header_vsharp = 0xffffffffu;
+		uint32_t root = 0;
 		std::array<uint32_t, 4> layout {};
-		bool                    valid         = false;
+		bool valid = false;
 	} ray_tracing_source;
-	std::vector<uint32_t> ray_tracing_reach;
-	RecordReach record_reach;
+	std::vector<std::pair<uint32_t, uint32_t>> ray_tracing_reach;
 };
 
+// Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
+// The output object must be freshly initialized.
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program,
-                   std::span<const LongBranch> long_branches = {});
+void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
 bool IsDsWriteOpcode(Opcode opcode);
@@ -952,7 +926,7 @@ const char* ImageDimensionToString(ImageDimension dimension);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder
 
 template <>
 struct magic_enum::customize::enum_range<Libs::Graphics::ShaderRecompiler::Decoder::Opcode> {
@@ -962,4 +936,4 @@ struct magic_enum::customize::enum_range<Libs::Graphics::ShaderRecompiler::Decod
 	    static_cast<int>(Libs::Graphics::ShaderRecompiler::Decoder::Opcode::COUNT) - 1;
 };
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERDECODER_H_ */

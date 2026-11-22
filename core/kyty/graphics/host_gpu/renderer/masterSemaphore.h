@@ -5,9 +5,6 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <atomic>
-#if defined(ANYPS5_KYTY)
-#include <array>
-#endif
 
 namespace Libs::Graphics {
 
@@ -31,34 +28,27 @@ public:
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
 
+	// Refresh queries the timeline semaphore (a kernel call) at most once per 100 microseconds; in between it keeps the
+	// last known GPU tick, which only makes IsFree conservative for that long. RefreshNow and Wait always query.
 	void Refresh();
+	void RefreshNow();
 	void Wait(uint64_t tick);
-#if defined(ANYPS5_KYTY)
-	void NoteWork(uint64_t tick, uint64_t shader) noexcept {
-		const auto next = m_work_next.load(std::memory_order_relaxed);
-		const auto at   = next % m_work.size();
-		m_work_next.store(next + 1, std::memory_order_relaxed);
-		m_work[at].tick.store(tick, std::memory_order_relaxed);
-		m_work[at].shader.store(shader, std::memory_order_relaxed);
-	}
-#endif
+
+	// KYTY_TRACE_PERF (PERF semaphore): semaphore queries (calls/ns) by caller: 0 Refresh, 1 Wait before blocking, 2 Wait
+	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats.
+	struct Stats {
+		std::atomic<uint64_t> queries[4] {}, query_ns[4] {}, blocks {0}, block_ns {0};
+	};
+	static Stats& GetStats();
 
 private:
 	GraphicContext&       m_graphics;
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
-#if defined(ANYPS5_KYTY)
-	struct Work {
-		std::atomic<uint64_t> tick {0};
-		std::atomic<uint64_t> shader {0};
-	};
-	std::array<Work, 512> m_work {};
-	std::atomic<uint32_t> m_work_next {0};
-	void ReportStall(uint64_t tick);
-#endif
+	std::atomic<int64_t>  m_last_refresh_ns {0};
 };
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_MASTERSEMAPHORE_H_

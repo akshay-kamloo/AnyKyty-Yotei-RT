@@ -32,12 +32,14 @@ IR::ExportTargetKind ExportTargetKindFromTarget(uint32_t target, uint32_t& index
 	return IR::ExportTargetKind::Unknown;
 }
 
-}
+} // namespace
 
 IR::ExportFlags Translator::AddExportInfo(const Decoder::Instruction& inst) {
 	IR::ExportInfo info;
 	info.kind        = ExportTargetKindFromTarget(inst.exp.target, info.index);
+	info.target      = inst.exp.target;
 	info.en          = inst.exp.en;
+	info.done        = inst.exp.done;
 	info.compr       = inst.exp.compr;
 	info.vm          = inst.exp.vm;
 	const auto index = static_cast<uint32_t>(program.export_info.size());
@@ -111,6 +113,7 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 
 void Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		// P2 interpolates the whole attribute, so the P1 halves have nothing to compute.
 		case Decoder::Opcode::V_INTERP_P1_F32:
 		case Decoder::Opcode::V_INTERP_P1LL_F16: return;
 		case Decoder::Opcode::V_INTERP_P2_F32: V_INTERP_P2_F32(inst); return;
@@ -120,4 +123,4 @@ void Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

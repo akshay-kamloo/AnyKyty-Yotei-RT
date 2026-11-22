@@ -15,4 +15,4 @@ SystemInfo GetSystemInfo() {
 	return {package->name};
 }
 
-}
+} // namespace Common

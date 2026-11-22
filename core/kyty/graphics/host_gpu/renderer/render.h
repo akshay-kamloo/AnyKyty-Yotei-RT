@@ -4,23 +4,20 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
-#include "graphics/host_gpu/renderer/drawTemplates.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
-#include "graphics/host_gpu/regionDefinitions.h"
-#include "graphics/host_gpu/renderer/upscaler/upscaler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <unordered_set>
 #include <array>
-#include <deque>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <span>
-#include <string>
 #include <unordered_map>
-#include <utility>
+#include <tuple>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -29,35 +26,61 @@ namespace HW {
 class Context;
 class UserConfig;
 class Shader;
-}
+} // namespace HW
+
+// While set on a thread (an operation's execution, a draw's translation), the register accessors of every
+// CommandBuffer return this draw's copy of the registers instead of the live state the PM4 handlers write.
+struct DrawRegsOverride {
+	HW::Context*    ctx  = nullptr;
+	HW::UserConfig* ucfg = nullptr;
+	HW::Shader*     sh   = nullptr;
+};
+inline thread_local DrawRegsOverride t_draw_regs;
+// The draw-state observer's answer for the draw being processed (graphicsRun.cpp, drawStateObserver.h; measurement only,
+// KYTY_TRACE_CLEAN_DRAWS' observer_clean column):
+// nothing but user data, index and instance state changed since the previous direct draw.
+inline thread_local bool t_draw_observer_clean = false;
+// KYTY_TRACE_CLEAN_DRAWS: the observer's first cause of dirt for that draw (DrawStateObserver::Cause; 0 when clean).
+inline thread_local uint32_t t_draw_observer_cause = 0;
+
+// Which register structures a PM4 packet may write (graphicsRun.cpp RegistersWrittenBy, for DrawStateObserver).
+inline constexpr uint32_t RegsWrittenCtx  = 1u;
+inline constexpr uint32_t RegsWrittenUcfg = 2u;
+inline constexpr uint32_t RegsWrittenSh   = 4u;
+inline constexpr uint32_t RegsWrittenAll  = 7u;
+
+
 
 struct GraphicContext;
+struct TableRefreshBatch;
+struct ShaderBufferResource;
+struct ShaderComputeInputInfo;
+struct RenderDepthInfo;
+struct RenderColorInfo;
+struct RenderDepthInfo;
+// D6 step K5: a draw's color and depth target descriptions, for the scalar-read check (RenderExecutor::m_commit_targets).
+struct CommitTargets {
+	const RenderColorInfo* colors      = nullptr;
+	uint32_t               color_count = 0;
+	const RenderDepthInfo* depth       = nullptr;
+};
 struct DrawCallInfo;
 struct DrawEmitInfo;
 struct DrawIndexBufferSource;
-struct DynamicState;
+struct DrawIndirectSource;
+struct DrawPlan;
+struct DrawSlot;
+struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
-struct IndirectThreadPass;
-class RayTracingCheck;
 
-struct TextureDescDerivation {
-	TextureCache::ImageDesc desc;
-	bool                    shader_conversion = false;
-	vk::Format              pixel_format      = vk::Format::eUndefined;
-	vk::Format              view_format       = vk::Format::eUndefined;
-	uint64_t                size              = 0;
-	std::string unsupported;
-	struct Found {
-		ImageId                 id;
-		TextureCache::ImageDesc desc;
-		vk::ImageView           view            = nullptr;
-		uint64_t                image_set_epoch = 0;
-		ImageLookupState        state;
-		bool                    valid = false;
-	};
-	Found found;
+enum class CommandBufferDebugOp : uint32_t {
+	DispatchDirect,
+	DrawIndex,
+	DrawIndexAuto,
+	DispatchIndirect = 9,
+	Unknown,
 };
 
 enum class DrawOffsetSource : uint8_t {
@@ -65,36 +88,48 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
 struct DrawIndirectArgs {
-	uint64_t              address = 0;
-	uint32_t              count   = 0;
-	uint32_t              stride  = 0;
-	ShaderIndirectOffsets offsets;
-	uint64_t              count_address = 0;
+	uint64_t address = 0;
+	uint32_t count   = 0;
+	uint32_t stride  = 0;
 };
 
 struct DrawIndexArgs {
-	uint32_t         index_count         = 0;
-	const void*      index_addr          = nullptr;
-	uint32_t         instance_count      = 0;
-	uint32_t         index_type_and_size = 0;
-	int32_t          base_vertex         = 0;
-	uint32_t         first_instance      = 0;
-	DrawOffsetSource offset_source       = DrawOffsetSource::DrawState;
+	uint32_t         index_count                = 0;
+	const void*      index_addr                 = nullptr;
+	uint32_t         instance_count             = 0;
+	uint32_t         index_type_and_size        = 0;
+	int32_t          base_vertex                = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
 	DrawIndirectArgs indirect;
 };
 
 struct DrawAutoArgs {
-	uint32_t         vertex_count   = 0;
-	uint32_t         instance_count = 0;
-	uint32_t         first_vertex   = 0;
-	uint32_t         first_instance = 0;
-	DrawOffsetSource offset_source  = DrawOffsetSource::DrawState;
+	uint32_t         vertex_count               = 0;
+	uint32_t         instance_count             = 0;
+	uint32_t         first_vertex               = 0;
+	uint32_t         first_instance             = 0;
+	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
+	uint32_t         render_target_slice_offset = 0;
 	DrawIndirectArgs indirect;
 };
 
-struct StateKeyCache {
-	uint64_t context_id = 0, user_config_id = 0, hash = 0;
+// GPU indirect draws: an indirect draw packet the GPU executes with the guest argument
+// records (PS5 layouts equal VkDraw[Indexed]IndirectCommand) and count as they are in memory.
+struct DrawIndirectGpuArgs {
+	uint64_t               args_addr           = 0;
+	uint64_t               count_addr          = 0; // 0: exactly max_count draws
+	uint32_t               max_count           = 0;
+	uint32_t               stride              = 0;
+	uint64_t               index_base_addr     = 0;
+	uint32_t               index_buffer_size   = 0; // in indices (INDEX_BUFFER_SIZE)
+	uint32_t               index_type_and_size = 0;
+	bool                   indexed             = false;
+	ShaderIndirectDrawInfo indirect_draw;
 };
 
 struct SubmitInfo {
@@ -123,39 +158,112 @@ struct SubmitInfo {
 	}
 };
 
+// The record packets (renderDraw.cpp): `buffer`'s GraphicsState was forgotten by the recording side; the recording
+// thread forgets its copy at this point of the stream (a packet), when its draws' dynamic state can be packets.
+void NoteGraphicsStateInvalidated(vk::CommandBuffer buffer) noexcept;
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const noexcept {
-		return m_stream != nullptr ? !m_open : m_buffer == nullptr;
-	}
+	[[nodiscard]] bool IsInvalid() const;
 
+	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
+	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
-	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
-	void DeferShaderWriteBarrier(vk::PipelineStageFlags source_stages) const noexcept {
-		m_pending_shader_writes |= source_stages;
-	}
-	[[nodiscard]] bool HasPendingShaderWrites() const noexcept {
-		return static_cast<bool>(m_pending_shader_writes);
+	[[nodiscard]] bool IsRendering() const {
+		return m_rendering;
 	}
 
-	[[nodiscard]] CommandRecorder Handle() const;
+	// KYTY_FIX_DRAW_STATE_FILTER: the graphics pipeline and dynamic state draws last recorded into
+	// this command buffer, so that a draw skips the commands that would set the same values again.
+	// Vulkan (Pipelines, "Dynamic State"): dynamic state "persists for the lifetime of the command
+	// buffer, or until modified by another dynamic state setting command or made invalid by binding
+	// a pipeline in which that state is statically specified"; a pipeline that declares the state
+	// dynamic leaves it undisturbed. BeginRendering/EndRendering and compute pipeline binds do not
+	// touch it. Every graphics pipeline a draw binds declares the same dynamic states, except color
+	// write enables when it has no color attachments (pipeline/shaders.cpp). Whatever else binds a
+	// graphics pipeline or records dynamic state into this command buffer (the MSAA depth blit, the
+	// present and its overlays) must call InvalidateGraphicsState; a new command buffer does.
+	struct GraphicsState {
+		static constexpr uint32_t ViewportSlots = 16;
+
+		enum Kind : uint32_t {
+			Viewports,
+			Scissors,
+			LineWidth,
+			BlendConstants,
+			DepthTest,
+			DepthWrite,
+			DepthCompare,
+			DepthBoundsTest,
+			DepthBounds,
+			DepthBiasEnable,
+			DepthBias,
+			StencilTest,
+			StencilFront,
+			StencilBack,
+			ColorWrite,
+			FeedbackLoop,
+			PipelineBind,
+			KindCount
+		};
+
+		[[nodiscard]] bool Has(Kind kind) const noexcept { return (known & (1u << kind)) != 0; }
+		void               Set(Kind kind) noexcept { known |= 1u << kind; }
+		void               Forget(Kind kind) noexcept { known &= ~(1u << kind); }
+
+		uint32_t                                known = 0; // One bit per Kind: the value below is held.
+		vk::Pipeline                            pipeline;  // With PipelineBind: the bound graphics pipeline.
+		uint32_t                                viewport_count = 0;
+		std::array<vk::Viewport, ViewportSlots> viewports {};
+		uint32_t                                scissor_count = 0;
+		std::array<vk::Rect2D, ViewportSlots>   scissors {};
+		float                                   line_width = 0.0f;
+		std::array<float, 4>                    blend_constants {};
+		vk::Bool32                              depth_test        = VK_FALSE;
+		vk::Bool32                              depth_write       = VK_FALSE;
+		vk::CompareOp                           depth_compare     = vk::CompareOp::eNever;
+		vk::Bool32                              depth_bounds_test = VK_FALSE;
+		std::array<float, 2>                    depth_bounds {};
+		vk::Bool32                              depth_bias_enable = VK_FALSE;
+		std::array<float, 3>                    depth_bias {};
+		vk::Bool32                              stencil_test = VK_FALSE;
+		std::array<vk::StencilOpState, 2>       stencil {};
+		uint32_t                                color_write_count = 0;
+		std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX> color_write {};
+		vk::ImageAspectFlags                    feedback;
+		// The record packets: which copy of this state the draws of the command buffer use (renderDraw.cpp): 0 none
+		// yet, 1 this one (the recording side's), 2 the recording thread's (the draws' dynamic-state packets). A draw that
+		// switches forgets both copies first.
+		uint8_t                                 keeper = 0;
+	};
+	[[nodiscard]] GraphicsState& GetGraphicsState() const noexcept { return m_graphics_state; }
+	// Forgets what the command buffer holds; with the record packets the recording thread's copy too (context.cpp).
+	void InvalidateGraphicsState() const noexcept;
+
+	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
-
-	void InvalidateDynamicState() const;
+	[[nodiscard]] HW::Context&      GetRegisters() const noexcept {
+		if (t_draw_regs.ctx != nullptr) return *t_draw_regs.ctx;
+		return *m_registers;
+	}
+	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept {
+		if (t_draw_regs.ucfg != nullptr) return *t_draw_regs.ucfg;
+		return *m_user_config;
+	}
+	[[nodiscard]] HW::Shader&       GetShaders() const noexcept {
+		if (t_draw_regs.sh != nullptr) return *t_draw_regs.sh;
+		return *m_shaders;
+	}
 
 private:
-	CommandBuffer(CommandScheduler& scheduler, CommandStream* stream);
-	void Bind(const HW::Context& registers, const HW::UserConfig& user_config,
-	          const HW::Shader& shaders) noexcept {
+	explicit CommandBuffer(CommandScheduler& scheduler);
+	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
@@ -164,585 +272,396 @@ private:
 	void Begin();
 	void End() const;
 
-	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
-	vk::CommandBuffer   m_buffer = nullptr;
-	CommandStream*      m_stream = nullptr;
-	bool                m_open   = false;
+	vk::CommandBuffer   m_buffer          = nullptr;
+	uint32_t            m_debug_op        = 0;
+	uint64_t            m_debug_submit_id = 0;
+	uint32_t            m_debug_arg0      = 0;
+	uint32_t            m_debug_arg1      = 0;
+	uint32_t            m_debug_arg2      = 0;
+	uint32_t            m_debug_arg3      = 0;
+	uint64_t            m_debug_arg4      = 0;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
-	mutable vk::PipelineStageFlags m_pending_shader_writes;
-	const HW::Context*    m_registers   = nullptr;
-	const HW::UserConfig* m_user_config = nullptr;
-	const HW::Shader*     m_shaders     = nullptr;
+	mutable GraphicsState m_graphics_state;
+	HW::Context*        m_registers   = nullptr;
+	HW::UserConfig*     m_user_config = nullptr;
+	HW::Shader*         m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
-
-namespace Pssr {
-struct Request;
-}
 
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
 	~RenderExecutor();
+	// The resolve thread, ahead of the operation's execution: the programs of its draw or dispatch, from its register
+	// snapshots, which stay valid until it executed; null when there is nothing to resolve. Based on
+	// TheCruZ/KytyPS5-GTA daaf45201 (render.h), GPL-2.0.
+	struct ResolvedDraw;
+	// Project 15 N2.1/N2.2: TakeResolvedSlot (the resolve thread, which keeps the stream order) gives the next slot of the
+	// ring, pending at once; ResolveDrawInto / ResolveDispatchInto fill it (the helper through ResolveTaskInto) and return
+	// false when there is nothing to resolve.
+	[[nodiscard]] ResolvedDraw& TakeResolvedSlot();
+	// Project 15 N2.2: a draw's or dispatch's resolution handed to the resolve helper: its slot, register snapshots (valid
+	// until the operation executed) and arguments. `fault`: KYTY_CHECK_RESOLVE_FAULT's error number (0: none).
+	struct ResolveTask {
+		ResolvedDraw*          slot        = nullptr;
+		const HW::Context*     context     = nullptr;
+		const HW::UserConfig*  user_config = nullptr;
+		const HW::Shader*      shaders     = nullptr;
+		ShaderIndirectDrawInfo indirect_draw {};
+		uint32_t               groups_x = 0, groups_y = 0, groups_z = 0, mode = 0;
+		bool                   dispatch = false, indirect = false, async_compute = false;
+		uint16_t               pass_id = 0;
+		uint32_t               fault   = 0;
+		// N5.1: a chunk-member draw's arguments for its plan (PeekAhead on the helper, N5.3)
+		bool                   member = false, indexed = false;
+		uint32_t               draw_count = 0, index_type = 0, slice_offset = 0;
+		uint64_t               draw_indirect = 0, index_address = 0;
+		// N5.3: the dispatcher's number of the task, and whether the helper builds the draw's plan (it has the lead)
+		uint64_t               seq = 0;
+		bool                   build_plan = false;
+		uint32_t               lead       = 0;
+		// N7.2: a GPU indirect packet (the SGPR layout made: indirect_draw.enabled) and its arguments
+		bool                   gpu_indirect = false;
+		DrawIndirectGpuArgs    indirect_args {};
+	};
+	// The helper (or, with KYTY_CHECK_RESOLVE=2, the resolve thread for the reference): resolves the task into `slot`
+	// (the draw's pre-check included) and marks it ready (empty when there was nothing to resolve).
+	bool ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task);
+	// The helper, taking a task: pending -> running; false when the execution thread stole it (the slot is freed then).
+	[[nodiscard]] static bool BeginResolveTask(ResolvedDraw* slot) noexcept;
+	// The execution thread: one look at a slot. Ready / Empty: resolved; Stolen: it was pending and is now the execution
+	// thread's to do itself (the helper frees the slot); Running: a helper resolves it now (or, with steal false, pending).
+	enum class ResolvedClaim : uint8_t { Ready, Empty, Stolen, Running };
+	[[nodiscard]] static ResolvedClaim TryClaimResolvedDraw(ResolvedDraw* resolved, bool steal) noexcept;
+	// KYTY_CHECK_RESOLVE=2: the helper's slot of the operation whose reference `resolved` is, and the comparison of the
+	// two (0 both empty, 1 refused, 2 reads differ, 3 compared and equal, 4 compared and different: `field` names it).
+	[[nodiscard]] static ResolvedDraw* ResolvedCheckSlot(ResolvedDraw* resolved) noexcept;
+	static void                        SetResolvedCheckSlot(ResolvedDraw* resolved, ResolvedDraw* check) noexcept;
+	[[nodiscard]] static int           CompareResolved(const ResolvedDraw& reference, const ResolvedDraw& helper, const char** field);
+	// KYTY_CHECK_RESOLVE_FAULT=N: error number `fault` (1...) put into a helper's result (never used); the error a result
+	// carries (0: none).
+	static void                        ResolveCheckFault(ResolvedDraw& slot, uint32_t fault);
+	[[nodiscard]] static uint32_t      ResolvedFault(const ResolvedDraw* slot) noexcept;
+	// KYTY_CHECK_RESOLVE=2, once at start: the resolutions keep what the comparison needs.
+	static void                        SetResolveCheckMode(bool on);
+	[[nodiscard]] bool ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
+	                                   const HW::Shader& shaders, const ShaderIndirectDrawInfo& indirect_draw);
+	[[nodiscard]] bool ResolveDispatchInto(ResolvedDraw& draw, const HW::Shader& shaders, uint32_t groups_x, uint32_t groups_y,
+	                                       uint32_t groups_z, uint32_t mode, bool indirect, bool async_compute);
+	// The execution thread, around the operation. Release gives the resolution back.
+	void        UseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): the chunk's opening peeks a draw ahead in the queue (programs, targets,
+	// pipeline, stage images) into its slot, without a write; distance from the opening draw.
+	void PeekAhead(ResolvedDraw* slot, const HW::Context& ctx, const HW::UserConfig& ucfg, const HW::Shader& shaders, bool indexed,
+	               uint32_t count, uint32_t instances, uint32_t index_type, uint32_t slice_offset, uint64_t indirect, uint32_t distance,
+	               uint64_t index_address = 0, const DrawIndirectGpuArgs* gpu_indirect = nullptr);
+	// N4.2b: hands the running draw's buffer plan entries to the buffer cache's check (null: none).
+	void PlanBuffersBegin();
+	// KYTY_DIAG_GPU_BURN_NS / KYTY_DIAG_GPU_BURN_AT (measurement only): GPU-thread spin at one of these places.
+	// InvalidateCaller: the guest thread whose write fault reads GPU-modified bytes back, not the GPU thread.
+	// Readback and Pm4 (measurement only): a GPU-thread guest read of GPU-written data, a PM4 packet of the GPU thread.
+	enum class GpuBurnSite : uint32_t { None, Indirect, Dispatch, DispatchAsync, DispatchGfx, Readback, Pm4, InvalidateCaller, DirectWait, Draw };
+	static void GpuBurnAt(GpuBurnSite site);
+	// The site KYTY_DIAG_GPU_BURN_AT selects (read once): lets a hot loop decide once whether to call GpuBurnAt at all.
+	[[nodiscard]] static GpuBurnSite GpuBurnSelected();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
-	void DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x, uint32_t thread_group_y,
-	                    uint32_t thread_group_z, uint32_t mode, bool async_compute);
-	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
-	                      bool async_compute);
-	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
-	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
-	                             bool async_compute);
-	RayTracingCheck& RtCheck();
-
-	struct ResolvedDraw;
-	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
-	                                             const HW::UserConfig& user_config,
-	                                             const HW::Shader&     shaders,
-	                                             const ShaderIndirectOffsets& indirect_offsets = {},
-	                                             bool indirect_draw = false, uint64_t context_id = 0,
-	                                             uint64_t user_config_id = 0);
-	[[nodiscard]] ResolvedDraw* ReserveResolvedDraw(const HW::Shader& shaders);
-	void ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
-	                     const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
-	                     bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
-	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
-	                                                 const HW::Shader& shaders,
-	                                                 const uint32_t (&groups)[3], uint32_t mode,
-	                                                 bool async_compute);
-	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
-	                                                         const HW::Shader&  shaders,
-	                                                         uint32_t           mode, uint64_t args_addr,
-	                                                         bool               async_compute);
-	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
-	void UseResolvedDraw(ResolvedDraw* resolved) noexcept {
-		m_resolved_draw = resolved != nullptr ? WaitResolvedDraw(resolved) : nullptr;
-	}
-	static ResolvedDraw* WaitResolvedDraw(ResolvedDraw* resolved) noexcept;
-	[[nodiscard]] static bool ResolvedDrawWritesBuffers(const ResolvedDraw& resolved);
-	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
-	void UseContextId(uint64_t context_id, uint64_t user_config_id = 0) noexcept {
-		m_context_id     = context_id;
-		m_user_config_id = user_config_id;
-	}
-	void BeginGuestOperation(uint32_t queue, bool dispatch, bool draw, bool guest_sync);
-	void FlushDeferredDispatchBarrier();
-	void InvalidateRenderTargetMemo() noexcept;
-	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
+	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode, bool async_compute);
+	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+	                      uint32_t mode, bool async_compute);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
-	void FindBuffers(std::span<PreparedBindings* const> stages, bool find_buffers = true);
+	void PrepareBindingsToday(const ShaderStageRuntime& runtime, PreparedBindings& prepared); // KYTY_DIAG_BIND_REPLAY
+	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            bool        table_candidate = false,
-	                                            GuestRange* examined        = nullptr);
-
-	[[nodiscard]] bool NativeXprTry(CommandBuffer& buffer, uint64_t args_addr, uint64_t index_base,
-	                                uint64_t index_bytes, vk::IndexType index_type);
-	[[nodiscard]] bool NativeXprTryDirect(CommandBuffer& buffer, const DrawIndexArgs& args);
-	void NativeXprEndDraw() noexcept {
-		m_native_xpr_store = false;
-		m_table_store      = false;
-	}
-	[[nodiscard]] bool TableStoreRequested() const noexcept { return m_table_store; }
-	[[nodiscard]] bool TableLikely(const HW::Shader& shaders) const noexcept;
-	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
-	[[nodiscard]] bool TableDrewDraws() const noexcept { return m_table_drew_draws.load(std::memory_order_relaxed); }
-	void SetTableTicket(const void* ticket) noexcept { m_table_ticket = ticket; }
-	[[nodiscard]] uint32_t TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept;
-	void               TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept;
-	[[nodiscard]] bool TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
-	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
-	                               const DrawIndexArgs* direct, bool clean,
-	                               const ShaderIndirectOffsets& offsets = {}, const uint32_t* run_offsets = nullptr);
-	[[nodiscard]] bool NativeXprLikely(const HW::Shader& shaders) const noexcept;
+	// KYTY_BINDLESS: register the draw's heaps, patch their regions, and once per frame resolve
+	// the keys shaders flagged as pending.
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void ResolveBindlessRequests();
+	bool ValidateBindlessHeap(BindlessTable::Heap& heap); // true when the guest rewrote entries
+	void PrefillBindlessHeap(BindlessTable::Heap& heap, uint32_t words);
+	void ReleaseUnusedBindlessSlots(uint64_t frame);
+	void RefreshBindlessDescriptor(BindlessTable::Heap& heap, const std::array<uint32_t, 8>& words,
+	                               BindlessTable::DescriptorSlot& cached);
+	// immediate: resolved while preparing a draw, not from feedback (the key trace names the origin).
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t entry, bool immediate = false);
+	// The bindless tables (bindlessTable.h): the heap of a draw as the table it is, translated before the draw;
+	// false only for an empty use (nothing to translate: the heap path takes it as before); a table it cannot take stops
+	// the emulator with the reason (bindless E2c).
+	[[nodiscard]] bool PrepareBindlessTable(uint64_t shader_hash, const ShaderRecompiler::IR::BindlessHeapUse& use,
+	                                        const ShaderRecompiler::IR::ImageResource& resource,
+	                                        PreparedBindings&                          prepared);
+	// Every field of every record of m_table_words (the table's first `covered` bytes) into the table's values and
+	// region; false when the arena has no room. shader_hash: the reader, for the BINDLESS_TABLE layout log.
+	[[nodiscard]] bool TranslateBindlessTable(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
+	                                          uint64_t frame, uint64_t shader_hash);
+	// The entry-by-entry translation (a table's first one, small tables, and when the difference does not apply).
+	[[nodiscard]] bool TranslateBindlessTableFull(BindlessTable::Table& table, uint32_t covered, uint64_t hash,
+	                                              uint64_t frame, uint64_t shader_hash);
+	// differential tables: a large table's translation by difference from its last one (the entries whose words changed or whose slot
+	// died); -1 when it does not apply (the full translation runs), else whether the region was stored.
+	[[nodiscard]] int TranslateTableDiff(BindlessTable::Table& table, uint32_t covered, uint64_t hash, uint64_t frame);
+	// The table slot of one descriptor, resolving its texture now when no table slot shows it yet; 0 = placeholder.
+	[[nodiscard]] uint32_t ResolveTableDescriptor(BindlessTable::Table& table, const std::array<uint32_t, 8>& words,
+	                                              uint64_t frame);
+	// Looks the table's textures up again once per presented frame (every draw for images the GPU writes), as the
+	// heap path does for its resolved keys, and lists their images for the draw.
+	void RefreshTableSlots(BindlessTable::Table& table, uint64_t frame);
+	// Refresh events: appends the table's images a draw's layout walk must see (all of them after the set changed, else
+	// those logged in g_bindless_layout_log since and the GPU-written ones).
+	void ListTableImagesByEvents(BindlessTable::Table& table, std::vector<ImageId>& list);
+	[[nodiscard]] bool RefreshTableSlot(BindlessTable::Table& table, uint32_t slot, uint64_t frame,
+	                                    TableRefreshBatch& batch); // true: remapped
+	// Once per presented frame: stale tables and unused table slots go.
+	void PrepareTablesFrame(uint64_t frame);
+	// KYTY_PERF_BINDLESS_CLASSES: registers an integer class for a float resource of one field whose records (the
+	// table's last translation) hold integer T#s; its next materialization types it.
+	void LearnBindlessClass(uint64_t shader_hash, const ShaderRecompiler::IR::BindlessHeapUse& use,
+	                        const ShaderRecompiler::IR::ImageResource& resource, const BindlessTable::Table& table);
 
 private:
-	struct NativeXprCache;
-	struct NativeXprRecord;
-	struct NativeXprDrawState;
-	NativeXprCache&   NativeXprState();
-	vk::DescriptorSet NativeXprAllocateSet(vk::DescriptorSetLayout layout, vk::DescriptorPool& pool_out);
-	void              NativeXprRetireSet(vk::DescriptorPool pool, vk::DescriptorSet set);
-	void              NativeXprRetire(std::unique_ptr<NativeXprRecord> record);
-	void              NativeXprCollect();
-	bool              NativeXprSweepStates(NativeXprCache& cache, uint64_t frame);
-	bool              NativeXprLearn(const NativeXprRecord& stale, NativeXprRecord& fresh);
-	const char*       NativeXprBindResources(NativeXprRecord& record, std::span<PreparedBindings* const> stages,
-	                                         const PipelineCache::Pipeline& pipeline);
-	void NativeXprStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
-	                    bool primitive_restart_enable, const RenderState& rendering,
-	                    std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state);
-	bool NativeXprValidateResources(NativeXprRecord& record, uint64_t frame, bool mapping_moved);
-	bool NativeXprValidate(NativeXprRecord& record, uint64_t frame, bool& broken);
-	bool NativeXprRebindBuffers(NativeXprRecord& record, std::span<const std::pair<uint32_t, uint32_t>> slots);
-	NativeXprRecord* NativeXprRelocated(uint64_t frame, bool& store);
-	void             NativeXprRefuseStore(CommandBuffer& buffer);
-	void             NativeXprDropRelocated(NativeXprRecord& record);
-	void NativeXprStoreRecord(std::unique_ptr<NativeXprRecord> record, CommandBuffer& buffer,
-	                          const DrawRenderState& state, vk::PrimitiveTopology topology,
-	                          bool primitive_restart_enable, const RenderState& rendering,
-	                          std::span<PreparedBindings* const> stages, const DynamicState& dynamic_state,
-	                          const GuestReadLog* reads);
-	void NativeXprCaptureState(const DrawRenderState& state, const RenderState& rendering, uint64_t state_key,
-	                           const DynamicState& dynamic_state);
-	struct TableImageSet;
-	bool NativeXprEmitTargets(const NativeXprDrawState& draw_state, CommandRecorder vk_buffer,
-	                          const TableImageSet* reading = nullptr);
-	bool NativeXprTargetsCurrent(const NativeXprDrawState& draw_state);
-	void NativeXprEmitDynamic(NativeXprCache& cache, CommandRecorder vk_buffer, const NativeXprDrawState& draw_state,
-	                          bool same_command, bool query_bias);
-	bool NativeXprEmit(CommandBuffer& buffer, NativeXprRecord& record, NativeXprDrawState& draw_state,
-	                   const PipelineCache::Pipeline& pipeline, uint64_t args_addr, uint64_t index_base,
-	                   uint64_t index_bytes, vk::IndexType index_type);
-
-	bool DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args);
+	friend struct DrawPlan; // S2 (renderDrawPlan.h): a draw's plan holds its GraphicsBindings
+	friend struct DrawSlot; // S2 step B.4b (renderDraw.cpp): everything of one draw
+	// Upstream's image heap (imageHeap.cpp) resolves its elements with ResolveTexture; it is never in use here
+	// (RenderContext::ImageHeapEnabled), but compiles.
+	friend class ImageHeap;
+	// False, with nothing drawn, when the draw's indirect records need CPU counts (upstream c513a4a13, 949de19bb,
+	// 86fed10b8): args.indirect with a nonzero address. Our path does not take GPU-read records (the GPU indirect path
+	// and the CPU expansion in graphicsRun.cpp do), so such a call always returns false; every other call draws and
+	// returns true.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// nullptr: the draw ran (or was skipped) on the GPU path. Otherwise the reason it is unsupported,
+	// returned before any draw command is recorded; the caller expands it on the CPU instead.
+	[[nodiscard]] const char* DrawIndirectGpu(uint64_t submit_id, CommandBuffer& buffer,
+	                                          const DrawIndirectGpuArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
-		PreparedBindings                pixel;
+		std::optional<PreparedBindings> pixel;
 	};
 
-	struct TableElementResolution {
-		uint64_t       prepared_stamp = 0;
-		uint32_t       prepared_index = 0;
-		uint32_t       version_slot  = UINT32_MAX;
-		bool           permanent     = false;
-		bool           volatile_dcc  = false;
-		bool           backing_checkable = false;
-		bool           backing_readable  = false;
-		uint64_t       image_epoch   = 0;
-		uint64_t       backing_epoch = 0;
-		uint64_t       checked_epoch = 0;
-		uint64_t       clear_memo    = 0;
-		GuestRange     range;
-		GuestRange     metadata_range;
-		TableViewMemo  view;
-		TextureBinding texture;
-	};
-	struct TableDescriptorHash {
-		size_t operator()(const std::array<uint32_t, 8>& dwords) const noexcept;
-	};
-	using TableElements =
-	    std::unordered_map<std::array<uint32_t, 8>, TableElementResolution, TableDescriptorHash>;
-	struct TableSlot {
-		std::array<uint32_t, 8> dwords {};
-		TableElementResolution* element = nullptr;
-		uint32_t                version_slot = UINT32_MAX;
-	};
-	struct TableResolution {
-		ShaderRecompiler::IR::ImageResource root;
-		uint64_t                            last_use = 0;
-		TableElements                       elements;
-		std::vector<TableSlot>              slots;
-	};
-
-	[[nodiscard]] TableElementResolution&
-	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value,
-	                    uint64_t stamp, TableElementResolution* known = nullptr);
-	[[nodiscard]] TableResolution& FindTableResolution(const ShaderRecompiler::IR::ImageResource& root);
-	[[nodiscard]] bool TableElementBackingReadable(const TableElementResolution& element);
-	void TableElementChanged(const TableElementResolution& element) {
-		if (element.version_slot < m_table_element_versions.size()) {
-			m_table_element_versions[element.version_slot]++;
-		}
-	}
-
-	struct TableBindingState {
-		struct Range {
-			ShaderRecompiler::IR::ImageResource root;
-			TableResolution*                    resolution = nullptr;
-			uint32_t                            table      = 0;
-			uint32_t                            capacity   = 0;
-			uint64_t                            slots_id   = 0;
-		};
-		struct Element {
-			TableElementResolution*               resolution = nullptr;
-			TableResolution*                      table      = nullptr;
-			ShaderRecompiler::IR::DescriptorValue source;
-			uint32_t                              root = 0;
-			ImageId                               pinned;
-			bool always            = false;
-			bool unchecked_backing = false;
-			GuestRange span_range;
-			GuestRange span_metadata;
-		};
-		struct PageSpan {
-			uint64_t first   = 0;
-			uint64_t last    = 0;
-			uint32_t element = 0;
-		};
-		std::vector<Range>                   ranges;
-		std::vector<ShaderRecompiler::IR::DescriptorValue> values;
-		std::vector<Element>                 elements;
-		std::vector<uint32_t>                slots;
-		std::vector<vk::DescriptorImageInfo> infos;
-		std::vector<vk::DescriptorImageInfo> slot_infos;
-		std::vector<uint32_t>                element_slot_begin;
-		std::vector<uint32_t>                element_slots;
-		std::vector<uint32_t>                element_of_version;
-		std::vector<PageSpan>                spans;
-		uint64_t                             max_span = 0;
-		std::vector<uint32_t>                always;
-		std::vector<uint32_t>                unchecked_backing;
-		bool                                 compute = false;
-		std::vector<uint64_t>                marks;
-		uint64_t                             mark_stamp = 0;
-		struct Checked {
-			static constexpr uint32_t None      = UINT32_MAX;
-			static constexpr uint32_t NullImage = UINT32_MAX - 1;
-			uint32_t                  image           = None;
-			uint32_t                  image_version   = 0;
-			uint32_t                  element         = 0;
-			uint32_t                  element_version = 0;
-		};
-		std::vector<Checked>                 checked;
-		uint64_t                             generation = 0;
-		uint64_t                             set_epoch  = 0;
-		uint64_t                             backing_epoch = 0;
-		bool                                 valid = false;
-		vk::DescriptorSet                    slot_set;
-		bool                                 slot_set_current = false;
-		struct RingSet {
-			vk::DescriptorSet       set;
-			vk::DescriptorSetLayout layout;
-			uint64_t                tick    = 0;
-			uint64_t                version = 0;
-		};
-		std::vector<RingSet>                 ring;
-		uint64_t                             slot_version   = 1;
-		uint64_t                             slot_log_floor = 1;
-		std::vector<std::pair<uint64_t, uint32_t>> slot_log;
-	};
-	[[nodiscard]] TableBindingState::RingSet* AcquireTableRingSet(TableBindingState&      state,
-	                                                              vk::DescriptorSetLayout layout);
-	[[nodiscard]] bool ProveTableSlotsLive(const TableBindingState& state);
-	[[nodiscard]] bool ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
-	                                      TableBindingState& state, uint64_t stamp,
-	                                      PreparedBindings& prepared);
-	void MarkTableChanges(TableBindingState& state);
-	void MarkTableElement(TableBindingState& state, uint32_t element);
-	void MarkTablePages(TableBindingState& state, uint64_t address, uint64_t size);
-	void RebuildTableSpans(TableBindingState& state);
-	static void AddTableSpans(TableBindingState& state, uint32_t element);
-	void MergeTableSpans(TableBindingState& state, size_t sorted);
-	static void IndexTableSlots(TableBindingState& state);
-	void PatchTableSlots(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                     const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
-	                     TableBindingState& state, uint64_t stamp);
-	void DropUnusedTableElements(TableBindingState& state);
-	void FinishTableBindings(TableBindingState& state, const PreparedBindings& prepared);
-	void UnpinTableBindings(TableBindingState& state);
-	void RebindReusedTables(PreparedBindings& prepared);
-
-	struct TextureDescKey {
-		std::array<uint32_t, 8> dwords {};
-		std::array<uint32_t, 5> view {};
-		bool                    operator==(const TextureDescKey&) const = default;
-	};
-	struct TextureDescKeyHash {
-		size_t operator()(const TextureDescKey& key) const noexcept;
-	};
-	[[nodiscard]] static TextureDescKey
-	MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   resource,
-	                   const ShaderRecompiler::IR::DescriptorValue& value);
-	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
-	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
-	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
-	bool m_clear_texture_descs = false;
-	uint64_t m_texture_descs_generation = 1;
-
-	uint64_t                           m_draw_resource_key = 0;
-	std::unique_ptr<DrawTemplateTable> m_draw_templates;
-	struct DrawBufferView {
-		uint64_t                 address = 0;
-		uint64_t                 size    = 0;
-		uint32_t                 flags   = 0;
-		uint32_t                 offset  = 0;
-		vk::DescriptorBufferInfo view;
-	};
-	std::array<DrawBufferView, 16> m_draw_buffer_views {};
-	uint32_t                       m_draw_buffer_view_count = 0;
-	bool                           m_draw_buffer_views_on   = false;
-	struct DrawStreamRead {
-		uint64_t address = 0;
-		uint64_t size    = 0;
-		uint64_t offset  = UINT64_MAX;
-	};
-	std::array<DrawStreamRead, 32> m_draw_stream_reads {};
-	uint32_t                       m_draw_stream_read_count = 0;
-	void                           StreamDrawReads(std::span<PreparedBindings* const> stages);
-	bool ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& context, const HW::UserConfig& user_config,
-	                         const HW::Shader& shaders, const ShaderIndirectOffsets& indirect_offsets,
-	                         bool indirect_draw, uint64_t context_id, uint64_t user_config_id);
-	ResolvedDraw& NextResolvedDraw();
-	[[nodiscard]] static bool DrawTemplateEligible(std::span<const ShaderStageRuntime* const> stages);
-	[[nodiscard]] DrawTemplate* FindDrawTemplate(uint64_t key,
-	                                             std::span<const ShaderStageRuntime* const> stages);
-	[[nodiscard]] bool DrawTemplateRefused(uint64_t key) const;
-	void PrepareBindingsFromTemplate(const ShaderStageRuntime& runtime,
-	                                 const DrawTemplateStage& stage, PreparedBindings& prepared);
-	[[nodiscard]] bool CheckTemplateImages(PreparedBindings& prepared);
-	void StoreDrawTemplate(uint64_t key, std::span<PreparedBindings* const> stages);
-	[[nodiscard]] static bool DrawTemplateStagesMatch(const DrawTemplate&                        found,
-	                                                  std::span<const ShaderStageRuntime* const> stages);
-	[[nodiscard]] bool TakeTemplateTargets(const DrawTemplate& found);
-	void               StoreTemplateTargets(DrawTemplate& stored, const RenderState& rendering,
-	                                        vk::ImageAspectFlags feedback_aspects);
-	DrawTemplate*                                              m_commit_capture    = nullptr;
-	bool                                                       m_commit_capture_ok = false;
-	std::vector<std::pair<uint8_t, uint8_t>>                   m_commit_capture_kinds;
-	std::unordered_map<uint64_t, vk::DescriptorUpdateTemplate> m_commit_templates;
-	std::vector<uint8_t>                                       m_commit_data;
-	[[nodiscard]] static bool TemplateCommitsSupported();
-	void StoreTemplateCommit(DrawTemplate& stored, const PipelineCache::Pipeline& pipeline);
-	void CommitTemplateBindings(CommandBuffer& buffer, const PipelineCache::Pipeline& pipeline,
-	                            std::span<PreparedBindings* const> stages, const DrawTemplate& found);
-	[[nodiscard]] uint64_t TemplateRangeEpoch(uint64_t address, uint64_t size);
-	static constexpr uint32_t TemplatePageBuckets = 1u << 16u;
-	std::vector<uint64_t>     m_template_page_epochs;
-	uint64_t                  m_template_pages_epoch = 0;
-	uint64_t                  m_template_pages_floor = 0;
-
-	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
-	                                        uint32_t                                        index,
-	                                        const ShaderRecompiler::IR::DescriptorValue&    value);
-	struct SamplerMemoEntry {
-		std::array<uint32_t, 4> fields {};
-		bool                    integer_border = false;
-		vk::Sampler             sampler        = nullptr;
-	};
-	std::array<SamplerMemoEntry, 256> m_sampler_memo {};
-
-	[[nodiscard]] TextureBinding
-	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
-	                    const ShaderRecompiler::IR::DescriptorValue& value,
-	                    GuestRange*                                  examined = nullptr);
+	// compare_funcs: DEPTH_COMPARE_FUNC bits (1 << func) of the S#s that compare-sample the image, for the null
+	// image of a depth-compare binding (descriptors.cpp NullCompareBinding); 0 when unknown.
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            uint32_t compare_funcs = 0);
+	// ResolveTexture's texture cache lookup and checks for a description (fresh or cached).
+	[[nodiscard]] TextureBinding FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
+	                                                 const ShaderTextureResource&               descriptor,
+	                                                 TextureCache::ImageDesc& desc, bool shader_conversion,
+	                                                 vk::Format pixel_format, vk::Format view_format);
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
+	// PrepareGraphicsBindings' parts in their order - FindBuffers and PrepareBda, RebindImages and the render targets,
+	// RebindBuffers.
+	void PrepareGraphicsBuffersHead(std::span<PreparedBindings* const> stages);
+	void PrepareGraphicsImages(std::span<PreparedBindings* const> stages, std::span<RenderColorInfo> colors);
+	void PrepareGraphicsBuffersTail(std::span<PreparedBindings* const> stages);
+	// A draw's bindings after its stages' PrepareBindings: PrepareGraphicsBindings' parts, then the vertex, index and indirect
+	// buffers, the buffer part taken again while the buffer registry changed under it (renderDraw.cpp, the registry epoch
+	// guard). buffers_mark: set after the stages' buffers of the first pass (KYTY_TRACE_LONG_PREP).
+	void PrepareDrawBindings(DrawPlan& plan, CommandBuffer& buffer, std::span<RenderColorInfo> colors,
+	                         std::chrono::steady_clock::time_point* buffers_mark);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
-	                              uint32_t render_target_slot, bool ignore_target_mask = false,
-	                              bool exact_format = false);
+	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
+	                              bool ignore_target_mask = false, bool exact_format = false);
 	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	// Project 15 S2c: the color target from the registers alone (colorRenderTarget.cpp); false: no color output.
+	[[nodiscard]] static bool DescribeRenderColorTarget(const HW::Context& hw, RenderColorInfo& r, uint32_t render_target_slice_offset,
+	                                                    uint32_t rt_slot, bool ignore_target_mask);
+	// Project 15 S2c: the depth target from the registers alone (depthRenderTarget.cpp); false: no attachment.
+	[[nodiscard]] static bool DescribeRenderDepthTarget(GraphicContext& graphics, const HW::Context& hw, RenderDepthInfo& r);
+	// The registers ask a depth/stencil copy instead of a draw (DepthStencilCopy's condition).
+	[[nodiscard]] static bool DepthStencilCopyAsked(const HW::Context& hw);
+	// Project 15 S2b: a stage's images and samplers without a write (descriptors.cpp); true: every slot and the samplers
+	// answered. count: the KYTY_CHECK_PEEK=2 statistics of today's peek (false for the peeks ahead).
+	bool PeekStageImages(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+	                     bool soft, PeekStageImagesResult& peek, bool count);
+	// N4.1: the stage images PeekAhead found for `program` in the running draw's slot (taken once), and the running draw's
+	// ahead key against today's (renderDraw.cpp, after ResolvedDraw).
+	bool TakeAheadImages(const void* program, PeekStageImagesResult& out, uint32_t& distance);
+	void CheckAheadKey(const PipelineCache::GraphicsPipelineKey& key_today);
+	// N4.2b: a stage's buffer plan entries (descriptors.cpp).
+	void PeekStageBuffers(const ShaderRecompiler::IR::CompiledShaderInfo& program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
+	                      const StageF::ResolveRecord* record, uint32_t distance, std::vector<PlanBuffer>& out);
+	// N4.2a: the running draw's plan (PeekAhead): whether there is one, the set version it names for a stage's program, and
+	// whether today's adoption took the predicted programs; the pipeline it found (null: none).
+	[[nodiscard]] bool                     PlanPresent() const;
+	[[nodiscard]] uint64_t                 PlanSetVersion(const void* program) const;
+	[[nodiscard]] bool                     PlanProgramsHold() const;
+	[[nodiscard]] PipelineCache::Pipeline* PlanPipeline() const;
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
-	struct DrawRenderStorage;
-	struct ColorTargetMemo;
-	struct DepthTargetMemo;
-	struct RenderTargetMemo;
+	                                   const DrawEmitInfo& emit, DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
+	                                          const DrawCallInfo& draw,
+	                                          uint32_t            render_target_slice_offset,
+	                                          DrawRenderState& state);
+	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
+	                         DrawRenderState& state, vk::PrimitiveTopology topology,
+	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
+	                         bool                      primitive_restart_enable,
+	                         const DrawIndirectSource* indirect = nullptr);
+	// S1: the part of a draw after its "cannot touch guest memory" point,
+	// from what ExecutePreparedDraw prepared (the plan).
+	void CommitPreparedDraw(DrawPlan& plan);
+	// KYTY_CHECK_CHUNKS=2 (project 15, the oracle v2, renderDraw.cpp): a chunk member is prepared twice. ChunkCheckFirst
+	// takes the print of the first preparation (with KYTY_CHECK_CHUNKS_FAULT's error in it, when due), ChunkCheckSecond
+	// compares the second's with it (PERF chunk_check). `plan`: the draw's (vertex and index buffers), null for a dispatch.
+	void ChunkCheckFirst(std::span<PreparedBindings* const> stages, DrawPlan* plan);
+	void ChunkCheckSecond(std::span<PreparedBindings* const> stages, const DrawPlan* plan, bool dispatch);
+	// The first preparation's own bindings: 0..2 the vertex stages, 3 the pixel stage, 4 a dispatch.
+	[[nodiscard]] static PreparedBindings& ChunkScratchBindings(uint32_t index);
+	// The steps the draw entries share. DrawEntryStart: DrawIndex and DrawAuto.
+	// ColorOperationInstead: a metadata, copy or resolve operation took the place of the draw (true: it ends here).
+	void DrawEntryStart(CommandBuffer& buffer);
+	[[nodiscard]] bool ColorOperationInstead(CommandBuffer& buffer, uint32_t render_target_slice_offset, const char* drop_reason);
+	// The slot of the draw being handled (never null: every draw entry takes one before its plan).
+	DrawSlot* NextDrawSlot();
+	uint64_t  m_async_skipped_draws = 0; // draws not issued while a worker creates their pipeline
 	struct ResolvedDrawRing;
-	void               CaptureRenderTargetKey(const HW::Context& registers, uint32_t mrt_mask);
-	[[nodiscard]] bool RenderTargetMemoCurrent();
-	[[nodiscard]] bool TryReuseRenderTargets(const HW::Context& registers, uint32_t mrt_mask);
-	void StoreRenderTargetMemo(const RenderColorInfo* colors, uint32_t color_count,
-	                           const RenderDepthInfo& depth, const vk::ImageView* views,
-	                           vk::ImageView depth_view, ImageId stencil);
-	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool  tessellation,
-	                                                      bool& shaders_resolved,
-	                                                      const ShaderIndirectOffsets& indirect_offsets,
-	                                                      bool indirect_draw);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
-	                                          const DrawCallInfo& draw, DrawRenderState& state);
-	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
-	                                       const DrawIndexBufferSource& index_source);
+	[[nodiscard]] ResolvedDraw& NextResolvedDraw();
+	// The draw state the resolve thread made for the operation's draw, its selection adopted (null: the draw selects
+	// itself): only a draw of the operation's own registers and indirect layout, once.
+	[[nodiscard]] DrawRenderState* TakeResolvedState(const ShaderIndirectDrawInfo& indirect_draw);
+	// The same for a direct dispatch: `input_info` and `program` as GetComputeProgram would leave them (false: it runs).
+	[[nodiscard]] bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, ShaderProgram& program);
+	ResolvedDraw* m_resolved_draw  = nullptr; // the operation's
+	uint64_t      m_plan_set_version = 0;      // N4.2a: the table set a plan names for the stage being prepared
+	bool          m_slot_taken       = false;  // N4.2: TakeResolvedState took the running draw's slot (UseResolvedDraw clears it)
+	bool          m_state_resolved = false;   // the draw being prepared adopted its state
+	bool          m_bind_suppressed = false;  // T1b check (KYTY_CHECK_TARGET_MEMO=2): the second search binds nothing
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr, nullptr};
+	DrawSlot* m_draw_slot    = nullptr; // allocated on first use
+	DrawSlot* m_current_slot = nullptr;
+	// S2 step B.4f: the bindless in-draw marks the commit being made covers (SIZE_MAX: all).
+	size_t    m_commit_bindless_heaps  = SIZE_MAX;
+	size_t    m_commit_bindless_tables = SIZE_MAX;
+	uint64_t  m_commit_bindless_plan   = 0; // the committed plan's serial (0: not a plan)
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
-	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
-	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
+	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
+	                                              uint32_t render_target_slice_offset);
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                       uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
 	void                      BindRenderTarget(ImageId id);
-	void                      ResetBindings();
-	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
-	                                        CommandBuffer& command, uint32_t group_x,
-	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
-	[[nodiscard]] bool ConsumeReplicate(const ShaderBufferResource& destination, const ShaderBufferResource& source,
-	                                    uint64_t count, uint64_t pattern, uint32_t group_x);
-	[[nodiscard]] bool TryLinearCopy(const HW::ComputeShaderInfo& cs, uint32_t group_x, uint32_t group_y,
-	                                 uint32_t group_z, uint32_t mode);
-	void CreatePssrPipeline();
-	struct UpscalerFeature;
-	[[nodiscard]] UpscalerFeature* UpscalerFeatureFor(const Pssr::Request& request,
-	                                                  const Dlss::Inputs& inputs, bool& reset);
-	[[nodiscard]] static bool EvaluateUpscaler(vk::CommandBuffer command, UpscalerFeature& feature,
-	                                           const Pssr::Request& request, Dlss::Inputs& inputs,
-	                                           bool reset);
-	static void ReleaseUpscalerFeature(UpscalerFeature* feature);
-
-	struct UpscalerContext {
-		uint64_t         context;
-		Dlss::Creation   creation;
-		UpscalerFeature* feature;
+	// The plan flags (S2 step B.3): the image binding flags of the draw being prepared stay in its plan (not in the images)
+	// until its commit applies them.
+	struct PlanImageFlags {
+		static constexpr size_t IndexSlots = 128;
+		struct IndexSlot {
+			ImageId  id {};
+			uint32_t pos = 0;
+			uint32_t gen = 0;
+		};
+		std::vector<std::pair<ImageId, ImageBinding>> flags;
+		std::vector<ImageId>                          bound;
+		uint64_t                                      hash = 0;
+		std::array<IndexSlot, IndexSlots>             index {};
+		uint32_t                                      index_gen      = 1;
+		bool                                          index_overflow = false;
 	};
+	void                      BeginDrawPlan();
+	static PlanImageFlags&    SlotFlags(DrawSlot& slot);
+	void                      ApplyPlanFlags();
+	void                      ReleasePlanFlags(PlanImageFlags& plan);
+	ImageBinding&             PlanFlags(PlanImageFlags& plan, ImageId id);
+	// D6 step K5 (the scalar-read check): the draw's own target descriptions while CommitPreparedDraw commits it
+	// (null otherwise, e.g. for dispatches): the scalar-read check tests reads against the bytes they describe.
+	const CommitTargets* m_commit_targets = nullptr;
+	[[nodiscard]] PlanImageFlags* PrepFlags() const;
+	void                          SetPrepFlags(PlanImageFlags* flags);
+	void                      ClearImageBinding(Image& image, ImageId id);
+	PlanImageFlags*               m_prep_flags       = nullptr; // the draw being prepared
+	PlanImageFlags*               m_applied_flags    = nullptr; // the draw committed (released by ResetBindings)
+	bool                          m_texture_plan_transfer_set = false;
+	void                      ResetBindings();
+	void                      UpdateComputeMetaClears(const ShaderComputeInputInfo& input,
+	                                                  const CommandBuffer&          buffer);
+	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+	                                              CommandBuffer& command, uint32_t group_x,
+	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
-	GraphicsBindings                     m_graphics_bindings;
-	DrawTargets                           m_targets;
-	DrawTargets*                          m_draw_targets = &m_targets;
+	uint64_t                              m_bindless_frame = UINT64_MAX;
+	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<uint32_t>                 m_bindless_srt;
+	// KYTY_PERF_SRT_GPU_WORDS (RebindBuffers): flat SRT words holding the device addresses of shader-only words, as
+	// {flat index, value}, and the guest addresses sorted into ranges.
+	std::vector<std::pair<uint32_t, uint32_t>> m_gpu_word_patches;
+	std::vector<std::pair<uint64_t, uint32_t>> m_gpu_word_addresses;
+	std::vector<std::tuple<uint32_t, uint32_t, uint64_t>> m_gpu_word_values; // index, value, guest
+	// The last bindless image lists CommitBindings walked, with the epochs of that walk.
+	struct BindlessLayoutMemo {
+		std::vector<ImageId> ids;
+		uint64_t             registry = 0;
+		uint64_t             layouts  = 0;
+	};
+	std::array<BindlessLayoutMemo, 8> m_bindless_layout_memos {};
+	uint32_t                          m_bindless_layout_memo_next = 0;
+	// A running hash of this draw's image binds (BindImage / BindRenderTarget: id and order), reset by ResetBindings.
+	uint64_t                          m_bound_hash = 0;
+	// Uniform const buffers (ShaderIR.h): words padded to whole uvec4 elements before an upload read as a uniform buffer.
+	// The soft-resolve flag below: set and reset around a soft resolve; read by its own image slots and table-set keys.
+	std::vector<uint32_t>             m_uniform_words;
+	static inline thread_local bool                  m_soft_texture_resolve = false;
+	bool                                  m_bindless_cached      = false;
+	uint64_t                              m_bindless_draw             = 0;
+	std::vector<uint32_t>                 m_bindless_words;
+	std::unordered_map<uint64_t, uint64_t> m_bindless_refreshed; // image -> last refreshed frame
+	uint64_t                              m_bindless_stats_frame = 0;
+	std::vector<BindlessTable::Heap*>     m_bindless_draw_heaps; // heaps of the stage being prepared
+	// The bytes of the table being checked, the fields of the use being prepared, the
+	// translation stamp (TableSlotInfo::stamp) and the frames of the per-frame work.
+	std::vector<uint32_t>                 m_table_words;
+	std::vector<BindlessTable::TableField> m_table_fields;
+	uint32_t                              m_table_stamp         = 0;
+	std::vector<ImageId>                  m_table_touch; // refresh events: unchanged slots' images (RefreshTableSlots)
+	// The slot journal: a translated table's slots before it (TranslateBindlessTable).
+	std::vector<std::pair<uint32_t, uint32_t>> m_table_old_slots;
+	// The difference translation's scratch: dead-slot marks and the new slot list.
+	std::vector<uint8_t>                       m_diff_dead;
+	std::vector<uint32_t>                      m_diff_new;   // the slots a difference translation took
+	std::vector<uint32_t>                      m_diff_seen;  // per slot, the stamp of the difference translation that listed it
+	std::vector<ImageId>                       m_diff_touch; // their images to touch (differential tables step 2)
+	std::vector<std::pair<uint32_t, uint32_t>> m_diff_slots;
+	uint64_t                              m_table_frame         = 0;
+	uint64_t                              m_table_release_frame = 0;
 	PreparedBindings                     m_compute_bindings;
-	std::shared_ptr<RayTracingCheck>     m_rt_check;
+	// KYTY_WORKAROUND_STENCIL_STORAGE_SHADOW: storage writes to a stencil plane go to an R8_UINT shadow
+	// that is filled from the stencil before the dispatch and copied back after it.
+	struct StencilShadow {
+		ImageId shadow;
+		ImageId depth;
+	};
+	std::vector<StencilShadow> m_stencil_shadows;
+	std::unique_ptr<Buffer>    m_stencil_copy_buffer;
+	void CopyStencilShadow(vk::CommandBuffer command, const StencilShadow& pair, bool to_stencil);
+	void FlushStencilShadows(vk::CommandBuffer command);
+	void CopyStencilToAlias(ImageId depth_id, ImageId target_id);
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
-	std::vector<vk::CopyDescriptorSet>    m_descriptor_copies;
-	std::vector<vk::WriteDescriptorSet>   m_slot_set_writes;
-	std::vector<ImageTableBinding>        m_table_fills;
-	std::vector<vk::WriteDescriptorSet>   m_table_writes;
-	std::vector<uint8_t>                  m_table_element_live;
-	std::vector<uint8_t>                  m_table_slot_live;
-	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
-	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
-	vk::Pipeline                          m_pssr_pipeline          = nullptr;
-	std::vector<UpscalerContext>          m_upscaler_contexts;
-	std::deque<TableResolution>           m_table_resolutions;
-	std::deque<TableElements>             m_retired_table_elements;
-	uint64_t                              m_table_resolution_tick = 0;
-	uint64_t                              m_table_prepare_stamp   = 0;
-	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
-	uint64_t                              m_table_generation = 0;
-	std::unordered_map<const void*, TableBindingState> m_table_states;
-	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
-	std::vector<uint32_t>                              m_table_marked;
-	std::vector<TableBindingState::PageSpan>           m_table_spans;
-	std::vector<uint32_t>                              m_table_remap;
-	struct ChangedTableSlot {
-		uint32_t slot  = 0;
-		uint32_t range = 0;
-		uint32_t index = 0;
-	};
-	std::vector<ChangedTableSlot>                      m_table_changed_slots;
-	std::vector<uint8_t>                               m_table_element_flags;
-	std::vector<uint32_t>                              m_table_moved_slots;
-	std::vector<uint32_t>                              m_table_checks;
-	std::vector<uint8_t>                               m_table_flags;
-	std::vector<uint32_t>                              m_table_element_versions;
-	std::vector<uint32_t>                              m_free_table_element_versions;
-	std::vector<uint64_t>                              m_bound_image_marks;
-	uint64_t                                           m_bound_image_stamp = 0;
-	uint32_t                                           m_shader_write_queue      = 0;
-	bool                                               m_shader_write_deferred   = false;
-	uint32_t                                           m_guest_queue             = 0;
-	bool                                               m_deferred_barrier        = false;
-	uint32_t                                           m_deferred_barrier_queue  = 0;
-	bool                                               m_dispatch_chained        = false;
-	uint64_t                                           m_linear_copy_shader      = 0;
-	uint64_t                                           m_linear_copy_generation  = 0;
-	uint32_t                                           m_linear_copy_uses        = 0;
-	std::array<uint64_t, 4>                            m_replicated {};
-	std::unique_ptr<DrawRenderStorage, void (*)(DrawRenderStorage*)> m_draw_state {nullptr,
-	                                                                               nullptr};
-	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring {nullptr,
-	                                                                                nullptr};
-	ResolvedDraw*                                                  m_resolved_draw = nullptr;
-	uint64_t                                                       m_context_id    = 0;
-	uint64_t                                                       m_user_config_id = 0;
-	StateKeyCache                                                  m_state_key_cache;
-	uint64_t m_checked_context_id = 0;
-	std::unique_ptr<ColorTargetMemo, void (*)(ColorTargetMemo*)> m_color_target_memo {nullptr,
-	                                                                                  nullptr};
-	std::unique_ptr<DepthTargetMemo, void (*)(DepthTargetMemo*)> m_depth_target_memo {nullptr,
-	                                                                                  nullptr};
-	std::unique_ptr<RenderTargetMemo, void (*)(RenderTargetMemo*)> m_render_target_memo {nullptr,
-	                                                                                     nullptr};
-	bool     m_render_targets_reused = false;
-	bool     m_targets_from_memo     = false;
-	uint64_t m_draw_window           = 0;
-	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
-	    nullptr, nullptr};
-	std::unique_ptr<NativeXprCache, void (*)(NativeXprCache*)> m_native_xpr {nullptr, nullptr};
-	struct TableXpr;
-	struct TablePair;
-	struct TableVariant;
-	struct TableImageSet;
-	struct TableFlatStage;
-	enum class TableResult { Drawn, Native, Store, Deferred };
-	std::unique_ptr<TableXpr, void (*)(TableXpr*)> m_table_xpr {nullptr, nullptr};
-	bool m_table_store = false;
-	const void* m_table_ticket = nullptr;
-	TableXpr&   OwnTable();
-	[[nodiscard]] static constexpr uint32_t Role() noexcept { return 0; }
-	static constexpr uint32_t               Roles = 1;
-	[[nodiscard]] RenderExecutor&           Catalog() noexcept { return *this; }
-	[[nodiscard]] TableXpr*                 CatalogTable() noexcept { return m_table_xpr.get(); }
-	struct CatalogLock {
-		CatalogLock() noexcept {}
-		~CatalogLock() {}
-	};
-	[[nodiscard]] static CatalogLock CatalogWrite() noexcept { return {}; }
-	[[nodiscard]] static CatalogLock CatalogRead() noexcept { return {}; }
-	void TableMemoRetired();
-	void DropStaleCatalog() {}
-	void ForgetStaleCatalog() {}
-	void TableForgetStates();
-	void TableSweepPairs();
-	const DrawIndexArgs* m_native_xpr_direct = nullptr;
-public:
-	struct NativeXprDirectDraw {
-		uint64_t index_address  = 0;
-		uint32_t index_count    = 0;
-		uint32_t instance_count = 1;
-		int32_t  base_vertex    = 0;
-		bool     indexed        = true;
-		bool     indirect       = false;
-	};
-private:
-	TableResult TableTry(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
-	                     uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
-	bool        TableContinue(CommandBuffer& buffer, std::span<const uint64_t> commands, uint64_t index_base,
-	                          uint64_t index_bytes, vk::IndexType index_type, const NativeXprDirectDraw* direct);
-	TableResult TableDraw(CommandBuffer& buffer, TablePair& pair, TableVariant& variant,
-	                      const NativeXprDrawState& draw_state, std::span<const uint64_t> commands,
-	                      uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
-	                      const NativeXprDirectDraw* direct);
-	void        TableReset(TablePair& pair);
-	void        TableRuns(TablePair& pair);
-	void        TablePack(TablePair& pair, const std::array<TableFlatStage, 2>& flat_forms);
-	bool        TableEvaluate(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	void        TableGather(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	TableImageSet* TableSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
-	                        const NativeXprDrawState* draw_state);
-	TableImageSet* TableResolveSet(CommandBuffer& buffer, TablePair& pair, const TableVariant* variant,
-	                               const NativeXprDrawState* draw_state, std::span<const uint32_t> words);
-	bool        TableValidateSet(TableImageSet& set);
-	bool        TableTransit(const TableImageSet& set, CommandRecorder vk_buffer, const NativeXprDrawState* draw_state);
-	void        TablePrepareBda(const TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data);
-	bool        TableBlocks(TablePair& pair, std::array<std::span<const uint32_t>, 2> user_data,
-	                        std::array<vk::DeviceAddress, 2>& blocks, bool* writes);
-	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
-	                bool primitive_restart_enable, const RenderState& rendering, const DynamicState& dynamic_state,
-	                bool storable);
-	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute,
-	                        bool thread_dimensions);
-	void TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why);
-	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-	                   uint64_t indirect_args, bool thread_dimensions);
-	[[nodiscard]] static vk::AccessFlags2 TableTargetRead(const TableImageSet& set, ImageId id);
-	bool m_native_xpr_store = false;
-	std::array<std::atomic<uint64_t>, 65536> m_native_xpr_drawn {};
-	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
-	std::atomic<bool>                        m_table_drew_draws {false};
-	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
-	std::array<std::atomic<uint64_t>, 4096> m_table_dispatch_mixed_until {};
-	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};
-	std::array<uint64_t, 4096> m_table_refused {};
-	std::array<uint64_t, 4096> m_table_refused_generation {};
-	bool                       m_table_try_refused = false;
+	vk::DescriptorSetLayout               m_indirect_td_desc_layout {};
+	vk::PipelineLayout                    m_indirect_td_pipe_layout {};
+	vk::Pipeline                          m_indirect_td_pipeline {};
+	std::unique_ptr<Buffer>               m_indirect_td_ring;
+	uint32_t                              m_indirect_td_cursor = 0;
+	void                                  EnsureIndirectThreadDimsPipeline();
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;
@@ -753,6 +672,6 @@ private:
                                             ShaderBufferResource& descriptor,
                                             uint32_t& packed_clear, uint64_t& size);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_ */

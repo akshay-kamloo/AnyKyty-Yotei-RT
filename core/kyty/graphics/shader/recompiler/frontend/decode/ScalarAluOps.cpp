@@ -122,7 +122,7 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x18u, Opcode::S_CBRANCH_CDBGUSER},
     {0x19u, Opcode::S_CBRANCH_CDBGSYS_OR_USER},
     {0x1au, Opcode::S_CBRANCH_CDBGSYS_AND_USER},
-    {0x1eu, Opcode::S_ENDPGM},
+    {0x1eu, Opcode::S_ENDPGM}, // s_endpgm_ordered_ps_done
     {0x20u, Opcode::S_INST_PREFETCH},
     {0x21u, Opcode::S_CLAUSE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
@@ -142,7 +142,7 @@ void DecodeBinarySources(uint32_t pc, std::span<const uint32_t> code, uint32_t w
 	ReadLiteralOperands(code, word_index, inst);
 }
 
-}
+} // namespace
 
 void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst) {
@@ -156,6 +156,7 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.opcode_id = opcode;
 	inst.opcode    = Detail::LookupOpcode(SOP1_OPS, opcode);
 	if (opcode == 0x21u && sdst == 125u) {
+		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
 		inst.opcode = Opcode::S_SETPC_B64;
 	}
 	SetRawWords(inst, code, word_index, 1);
@@ -352,4 +353,4 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder

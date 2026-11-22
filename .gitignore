@@ -123,3 +123,16 @@ cookies.txt
 *.pfx
 id_rsa*
 id_ed25519*
+
+# Local builds, caches, game runtime, backups & tooling (source-code-only repo)
+run-PPSA26344/
+core/Backup/
+_tools/
+_recon/
+evidence/
+anykyty-erlou-overlay/
+*.prx
+*.profdata
+*.profraw
+*.zar
+*.kyhints

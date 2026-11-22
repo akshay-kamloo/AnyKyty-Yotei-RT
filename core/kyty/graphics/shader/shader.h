@@ -15,17 +15,29 @@
 
 namespace Libs::Graphics {
 
+namespace ShaderError {
+
+[[nodiscard]] inline bool Fail(std::string* error, std::string_view message) {
+	if (error != nullptr) {
+		error->assign(message.data(), message.size());
+	}
+	return false;
+}
+
+} // namespace ShaderError
+
 namespace HW {
 struct VertexShaderInfo;
 struct PixelShaderInfo;
 struct ComputeShaderInfo;
 struct ShaderRegisters;
-}
+} // namespace HW
 
 enum class ShaderType {
 	Unknown,
 	Vertex,
 	Pixel,
+	Fetch,
 	Compute,
 	Mesh,
 	Local,
@@ -33,16 +45,23 @@ enum class ShaderType {
 	TessellationEvaluation
 };
 
-struct ShaderModule;
+namespace ShaderRecompiler::IR {
+struct CompiledShaderInfo;
+} // namespace ShaderRecompiler::IR
 
-inline constexpr std::string_view ShaderInputLayoutTag = "3";
+namespace StageF {
+struct ResolveRecord;
+} // namespace StageF
 
 struct ShaderStageRuntime {
-	const ShaderModule*                           module    = nullptr;
-	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
+	// The resolve thread's lookups (stageFLookup.h): what the resolve thread already found for `resources` when ProgramCache::Get
+	// adopted the resolve thread's snapshot for this draw (null otherwise). Only FindBuffers of the same draw reads it.
+	const StageF::ResolveRecord*                    stagef_record = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return module != nullptr && resources != nullptr;
+		return program != nullptr && resources != nullptr;
 	}
 };
 
@@ -82,14 +101,13 @@ struct ShaderWorkgroupInputInfo {
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
-	uint32_t input_primitive       = 0;
-	uint32_t output_primitive_size = 3;
-	uint32_t primitives_per_group  = 0;
-	uint32_t vertices_per_group    = 0;
-	uint32_t max_vertices          = 0;
-	uint32_t max_primitives        = 0;
-	uint32_t provoking_vertex      = 0;
-	bool     fast_launch           = false;
+	uint32_t input_primitive      = 0;
+	uint32_t primitives_per_group = 0;
+	uint32_t vertices_per_group   = 0;
+	uint32_t max_vertices         = 0;
+	uint32_t max_primitives       = 0;
+	uint32_t provoking_vertex     = 0;
+	bool     fast_launch          = false;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -124,18 +142,33 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
-#if defined(ANYPS5_KYTY)
-	uint32_t merged_hull           = 0;
-#endif
+	// Ghost of Yotei 2.000's merged LS+HS program, split in two (SplitMergedHullProgram, shader.cpp): the VGPRs its HS
+	// part reads before writing them, which on the hardware still hold what the LS part left in the same lane (one wave
+	// runs both parts); bit k = v<k>. The LS stage exports them after its outputs and the HS stage starts with them
+	// (CarriedOutput/CarriedInput, Translate.cpp). Empty for every other pair (AnalyzeTessellationPrograms).
+	std::array<uint32_t, 8> carried_vgprs {};
 };
 
-struct ShaderIndirectOffsets {
-	static constexpr uint8_t None = UINT8_MAX;
+// GPU indirect draws: vertex program variant for indirect
+// draws the GPU executes. The command processor would patch the user SGPRs the packet names with
+// each draw's base vertex, start instance and draw index; the variant reads those SGPRs from the
+// SPIR-V draw parameters instead, and a natively fetching shader sees zero-based vertex and instance
+// indices, as with the patched SGPRs (the host draw passes the offsets in the indirect command).
+// With draw base once every vertex program of the variant does (draw_base_once).
+struct ShaderIndirectDrawInfo {
+	static constexpr uint8_t NoSgpr = 0xff;
 
-	uint8_t vertex   = None;
-	uint8_t instance = None;
+	bool    enabled       = false;
+	uint8_t base_vertex   = NoSgpr; // user-data index (SPI_SHADER_USER_DATA_GS_<n>)
+	uint8_t base_instance = NoSgpr;
+	uint8_t draw_index    = NoSgpr;
 
-	bool operator==(const ShaderIndirectOffsets&) const = default;
+	[[nodiscard]] uint32_t Key() const {
+		return enabled ? 1u | (static_cast<uint32_t>(base_vertex) << 8u) |
+		                     (static_cast<uint32_t>(base_instance) << 16u) |
+		                     (static_cast<uint32_t>(draw_index) << 24u)
+		               : 0u;
+	}
 };
 
 struct ShaderVertexInputInfo {
@@ -152,30 +185,53 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
 	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
 	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
-	ShaderIndirectOffsets   indirect_offsets;
-	bool                    indirect_draw       = false;
-	bool                    has_dynamic_vertex_fetch = false;
+	ShaderIndirectDrawInfo  indirect_draw;
+	// Set by the program cache for the indirect_draw variant: one of its SGPRs also feeds
+	// descriptors or SRT reads the host evaluates, which would see the unpatched register value.
+	bool                    indirect_draw_resource_sgprs = false;
+	bool                    fetch_external      = false;
+	bool                    fetch_embedded      = false;
+	// Draw base once: v5/v8
+	// start as the vertex and instance index without the draw's base vertex and start instance, as
+	// the hardware seeds them, so the base the shader adds from its user SGPRs counts once.
+	bool                    draw_base_once      = false;
+	// The place of the former table-mode key (KYTY_PERF_TABLE_BUFFERS / project D), always 0: the graphics
+	// journal's schema fingerprint takes sizeof (shaderPrecompile.cpp GraphicsSchemaFingerprint), so existing journals stay.
+	uint8_t                 reserved_table_key  = 0;
 };
+
+inline constexpr uint8_t ComputeVariantPairOff     = 2u;
+inline constexpr uint8_t ComputeVariantPairSpin    = 4u; // KYTY_DIAG_TWIN_DISPATCH: spin exchanges
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               async_compute              = false;
 	uint8_t            float_mode                 = 0xc0;
+	// Program variants of one dispatch (part of the key only when set; one byte, so sizeof stays):
+	// ComputeVariantPairOff – KYTY_DIAG_TWIN_DISPATCH's default twin: a shader of the
+	// pair list gets the two-lanes-per-invocation module instead of the paired one.
+	uint8_t            compute_variant            = 0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
 	uint64_t           indirect_args_address       = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
+	bool               indirect_dispatch_threads  = false;
 	bool               lds_storage                = false;
-	bool               dispatch_indirect_threads  = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// COMPUTE_PGM_RSRC1.DX10_CLAMP (KYTY_FIX_CLAMP_NAN; part of the key only when that switch is on and the bit is 0).
+	// In the padding before `stage`: sizeof (the precompile journal's schema) stays; the journal does not record it
+	// (its replays compile with the usual 1).
+	bool               dx10_clamp                 = true;
 	ShaderStageRuntime stage;
 };
 
@@ -195,10 +251,13 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint8_t                                        target_packed_unorm_mask      = 0;
-	uint8_t                                        target_uint_mask             = 0;
-	uint8_t                                        target_sint_mask             = 0;
+	// CB round mode per converted export: zero adds half an LSB, one truncates.
 	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	// The place of the former table-mode key (KYTY_PERF_TABLE_BUFFERS / project D), always 0: the graphics
+	// journal's schema fingerprint takes sizeof (shaderPrecompile.cpp GraphicsSchemaFingerprint), so existing journals stay.
+	uint8_t                                        reserved_table_key           = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
 	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
@@ -215,11 +274,21 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
 	bool                                           object_primitive_id          = false;
+	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
+	bool                                           ps_execute_on_noop           = false;
+	// The ObjPrimID write: the colour slot that receives this draw's hardware ObjPrimID write (VGT_OBJECT_ID plus
+	// the primitive index when ADD_PIPED_PRIM_ID is set), 0xff for none. VGT_OBJECT_ID changes every draw, so it
+	// is push constant dword objprim_push_dword, not part of the program. Bytes in the padding before `stage`,
+	// so the precompile journal's schema (sizeof) stays; the journal stores them in its flag word.
+	uint8_t                                        objprim_slot                 = 0xffu;
+	uint8_t                                        objprim_push_dword           = 0xffu;
+	bool                                           objprim_add_prim_id          = false;
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
+	bool HasObjprimOutput() const { return objprim_slot < 8u; }
 };
 
 union ShaderStageInputInfo {
@@ -242,6 +311,16 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+// Draw base once: the hardware gives a vertex shader
+// its vertex and instance index (v5/v8) without the draw's base vertex and start instance; the
+// shader adds them itself from user SGPRs (s30/s31: V_SAD_U32 v5, s30, 0, v5). Without the switch
+// v5/v8 are gl_VertexIndex/gl_InstanceIndex, which carry the host draw's offsets, and the base counts
+// twice wherever the host draw carries it: indirect draws of vertex shaders with embedded-fetch
+// metadata (CPU expansion and the GPU indirect variant), direct draws whose embedded-fetch
+// plan moved the base SGPRs into the host draw. The switch takes those offsets off v5/v8 (vertex
+// entry in Translate.cpp, the variant in spirvEmitterFlow.cpp) and leaves out of a CPU-expanded
+// indirect draw the offsets no vertex input needs (IndirectDrawNativeOffsets, renderDraw.cpp).
+// Mesh, LS and the other tessellation stages are unchanged.
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;
@@ -339,22 +418,23 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
-[[nodiscard]] uint64_t ShaderMapGeneration();
-[[nodiscard]] uint64_t ShaderHashAt(uint64_t addr);
-std::span<const uint32_t> ShaderMappedBinary(uint64_t addr);
-void ShaderSetRegisteredName(uint64_t addr, const char* name);
-const char* ShaderRegisteredName(uint64_t addr);
-bool ShaderNameRegistered(const char* name);
-
+// Milliseconds since the game first created the shader with this code hash (AgcCreateShader), -1 if never.
+[[nodiscard]] double ShaderCreatedMsAgo(uint64_t hash);
+// The shader mapped at addr and the hash of its code, if there is one (the preparation of a program exits
+// when there is none). Callable from any thread; used by the resolve thread.
+bool ShaderLookupMapped(uint64_t addr, ShaderMappedData* data, uint64_t* hash);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
-
-using ShaderMapListener = void (*)(void* userdata, uint64_t hash, std::span<const uint32_t> code);
-void ShaderSetMapListener(ShaderMapListener listener, void* userdata);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 
-}
+// KYTY_DIAG_SKIP_UNSUPPORTED_CS=1 (logged APPROXIMATION, default on, Common::EnvDefaults): a compute
+// shader whose code contains instructions the decoder does not implement is not dispatched (=0: the translation stops
+// the emulator naming the instruction). Also KYTY_DIAG_SKIP_CS_HASHES. KYTY_TRACE_PERF counts both (PERF workaround_hits
+// skip_cs / skip_unsupported).
+bool ShaderComputeSkippedAsUnsupported(const HW::ComputeShaderInfo& regs);
 
-#endif
+} // namespace Libs::Graphics
+
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_H_ */

@@ -1,4 +1,3 @@
-#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/ddsImage.h"
 
 #include "common/assert.h"
@@ -135,5 +134,4 @@ ImTextureRef DdsImage::Texture() const {
 	return ImTextureRef {static_cast<ImTextureID>(reinterpret_cast<uintptr_t>(m_descriptor))};
 }
 
-}
-#endif
+} // namespace Libs::Graphics

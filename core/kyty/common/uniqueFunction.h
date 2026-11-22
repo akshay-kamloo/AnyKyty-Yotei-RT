@@ -49,6 +49,6 @@ private:
 	std::unique_ptr<CallableBase> m_callable;
 };
 
-}
+} // namespace Common
 
-#endif
+#endif // KYTY_COMMON_UNIQUEFUNCTION_H_

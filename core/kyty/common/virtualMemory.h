@@ -23,13 +23,23 @@ inline bool IsExecute(Mode mode) {
 	        mode == Mode::ExecuteReadWrite);
 }
 
-bool AllocFixed(uint64_t address, uint64_t size, Mode mode);
-bool Free(uint64_t address, uint64_t size);
-bool Protect(uint64_t address, uint64_t size, Mode mode);
-bool FlushInstructionCache(uint64_t address, uint64_t size);
+void Init();
 
-}
+uint64_t Alloc(uint64_t address, uint64_t size, Mode mode);
+uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment);
+bool     AllocFixed(uint64_t address, uint64_t size, Mode mode);
+bool     Commit(uint64_t address, uint64_t size, Mode mode);
+uint64_t Reserve(uint64_t address, uint64_t size);
+uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment);
+bool     ReserveFixed(uint64_t address, uint64_t size);
+bool     Decommit(uint64_t address, uint64_t size);
+bool     Free(uint64_t address);
+bool     FreeRange(uint64_t address, uint64_t size);
+bool     Protect(uint64_t address, uint64_t size, Mode mode);
+bool     FlushInstructionCache(uint64_t address, uint64_t size);
 
-}
+} // namespace VirtualMemory
 
-#endif
+} // namespace Common
+
+#endif /* KYTY_COMMON_VIRTUALMEMORY_H_ */

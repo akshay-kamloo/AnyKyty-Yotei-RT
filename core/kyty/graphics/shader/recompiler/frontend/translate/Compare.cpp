@@ -19,6 +19,7 @@ void Translator::EmitCompareConstant(const Decoder::Instruction& inst, bool valu
 
 void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                     IR::Type type, bool scalar, bool swap_operands) {
+	// The equality compares share their IR opcode with the unsigned ones.
 	const bool signed_64 = opcode == IR::ValueOpcode::SLessThan64 ||
 	                       opcode == IR::ValueOpcode::SLessThanEqual64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMP_EQ_I64 ||
@@ -26,6 +27,7 @@ void Translator::EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueO
 	                       inst.opcode == Decoder::Opcode::V_CMP_NE_I64 ||
 	                       inst.opcode == Decoder::Opcode::V_CMPX_NE_I64;
 	const auto read = [&](const Decoder::Operand& operand) {
+		// RDNA2 expands signed 64-bit integer literals by sign extension.
 		if (signed_64 && operand.kind == Decoder::OperandKind::LiteralConstant) {
 			return IR::Value(static_cast<uint64_t>(
 			    static_cast<int64_t>(std::bit_cast<int32_t>(operand.value))));
@@ -60,16 +62,13 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 }
 
 void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered,
-                                         IR::Type type) {
-	const auto is_nan_op =
-	    type == IR::Type::F64 ? IR::ValueOpcode::FPIsNan64 : IR::ValueOpcode::FPIsNan32;
-	const auto is_nan = [&](const Decoder::Operand& operand) {
-		const auto value =
-		    type == IR::Type::F16 ? IR::Value(ReadF16AsF32(operand)) : ReadOperand(operand, type);
-		return IR::U1(ir.Emit(is_nan_op, {value}));
-	};
-	const auto lhs       = is_nan(inst.src0);
-	const auto unordered = ir.LogicalOr(lhs, is_nan(inst.src1));
+                                         bool is64) {
+	const auto type      = is64 ? IR::Type::F64 : IR::Type::F32;
+	const auto is_nan_op = is64 ? IR::ValueOpcode::FPIsNan64 : IR::ValueOpcode::FPIsNan32;
+	const auto lhs       = ReadOperand(inst.src0, type);
+	const auto rhs       = ReadOperand(inst.src1, type);
+	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(is_nan_op, {lhs})),
+	                                    IR::U1(ir.Emit(is_nan_op, {rhs})));
 	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false);
 }
 
@@ -82,4 +81,4 @@ void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool ha
 	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {value, mask})), false);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

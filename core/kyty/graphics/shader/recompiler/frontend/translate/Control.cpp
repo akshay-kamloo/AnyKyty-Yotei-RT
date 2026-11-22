@@ -1,6 +1,9 @@
 #include "common/assert.h"
+#include "common/shaderEnv.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
-#include "graphics/shader/recompiler/ir/passes/RelativeVgprLowering.h"
+
+#include <cstdio>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
@@ -15,7 +18,13 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 	}
 }
 
+Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
+	Decoder::Operand operand;
+	operand.kind = kind;
+	return operand;
 }
+
+} // namespace
 
 void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {
 	const auto zero  = IR::U32(IR::Value(0u));
@@ -27,6 +36,7 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 		instruction_branch_condition = ir.IEqual(ir.BitwiseOr(lo, hi), zero);
 		WriteRawU32(inst.dst, ir.Select(instruction_branch_condition, saved,
 		                               ir.Select(low_active, hi, lo)));
+		// Keep the ISA assignment order: SDST may itself name an EXEC half.
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecHi),
 		            ir.Select(low_active, zero, ir.GetExecHi()));
 	} else {
@@ -52,6 +62,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		                                                : ir.BitwiseOr(lhs, rhs);
 	};
 	if (!write_64) {
+		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
 		const auto old    = ir.GetExecLo();
 		const auto result = combine(old, ReadU32(inst.src0));
 		WriteRawU32(inst.dst, old);
@@ -59,6 +70,8 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
+	// EXEC words combine bitwise; the per-lane EXEC combines the per-lane masks, so helper lanes
+	// stay enabled.
 	const auto old      = ir.GetExec();
 	const auto src      = ReadMask(inst.src0);
 	const auto lhs      = negate_exec ? ir.LogicalNot(old) : old;
@@ -79,6 +92,7 @@ void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use
 	auto       result  = partial;
 	auto       carry   = ir.ULessThan(partial, lhs);
 	if (use_carry_in) {
+		// The carry-in is 0 or 1, so the second add carries out only when it wraps to zero.
 		result = ir.IAdd(partial, vector ? ConditionBit(inst.src2)
 		                                 : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc)));
 		carry  = ir.LogicalOr(carry, ir.ULessThan(result, partial));
@@ -133,6 +147,7 @@ void Translator::S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract) 
 	const auto lhs    = ReadU32(inst.src0);
 	const auto rhs    = ReadU32(inst.src1);
 	const auto result = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
+	// Signed overflow moves the result past lhs the wrong way for the sign of rhs.
 	const auto ge = [&](IR::Value a, IR::Value b) {
 		return IR::U1(ir.Emit(IR::ValueOpcode::SGreaterThanEqual32, {a, b}));
 	};
@@ -178,7 +193,7 @@ void Translator::S_BARRIER() {
 
 void Translator::S_SENDMSG(const Decoder::Instruction& inst) {
 	if (program.stage == ShaderType::Mesh) {
-		EXIT_NOT_IMPLEMENTED(inst.src0.value != 9u);
+		EXIT_NOT_IMPLEMENTED(inst.src0.value != 9u); // MSG_GS_ALLOC_REQ
 		ir.Emit(IR::ValueOpcode::MeshAllocate, {ir.GetM0()});
 	} else {
 		ir.Emit(IR::ValueOpcode::Sendmsg);
@@ -231,6 +246,7 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
+	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);
@@ -241,6 +257,7 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 	                   {condition, ReadMaskValid(inst.src0), ReadMaskValid(false_source)}));
 	WriteU32Pair(inst.dst,
 	             {ir.Select(condition, lhs[0], rhs[0]), ir.Select(condition, lhs[1], rhs[1])});
+	// Scalar selects preserve the raw pair even when EXEC/VCC holds an address.
 	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
 		ir.SetExec(selected_mask);
 	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
@@ -252,7 +269,29 @@ void Translator::ScalarSelect64(const Decoder::Instruction& inst,
 	}
 }
 
+// KYTY_DIAG_MOV_NO_FLOAT_MODS=1 (default off until approved): v_mov_b32 is a bit move (its operand is B32 in AMD's
+// ISA tables, as refinterp models it), so the neg/abs input modifiers of its VOP3/SDWA/DPP forms leave the source
+// unchanged. Found in the cloud shadow shader a2dfc83fbe2e55b8 (pc 0x2e4 v_mov_b32_sdwa v12, -s106, s106 = 1.0):
+// with the modifier applied every texel of the cloud shadow maps gets the same sign, the moon is fully occluded
+// and the directional shadow mask (3b9d96bf1ea203be) is black on all geometry.
+static bool MovNoFloatMods() {
+	static const bool enabled = [] {
+		const char* value = Common::ShaderEnv::Read("KYTY_DIAG_MOV_NO_FLOAT_MODS");
+		const bool  on    = value != nullptr && value[0] == '1';
+		if (on) std::fprintf(stderr, "DIAG_MOV_NO_FLOAT_MODS enabled\n");
+		return on;
+	}();
+	return enabled;
+}
+
 void Translator::MOV_B32(const Decoder::Instruction& inst, bool apply_float_modifiers) {
+	if (apply_float_modifiers && MovNoFloatMods() && (inst.src0.negate || inst.src0.absolute)) {
+		auto source     = inst.src0;
+		source.negate   = false;
+		source.absolute = false;
+		WriteOperand(DestinationOperand(inst), ReadOperand(source, IR::Type::U32));
+		return;
+	}
 	if (apply_float_modifiers && (inst.src0.negate || inst.src0.absolute)) {
 		WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
 	} else {
@@ -267,10 +306,13 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 	IR::U1 source_mask;
 	IR::U1 source_mask_valid;
 	if (mask_source) {
+		// A full VCC copy carries its predicate even in wave32; ReadMask also handles
+		// individual 32-bit VCC halves, which cannot preserve that provenance.
 		source_mask = inst.src0.kind == Decoder::OperandKind::VccLo ? ir.GetVcc()
 		                                                          : ReadMask(inst.src0);
 		source_mask_valid = ReadMaskValid(inst.src0);
 	}
+	// Preserve all 64 scalar bits independently of the per-thread predicate.
 	WriteU32Pair(inst.dst, ReadU32Pair(inst.src0));
 	if (mask_source) {
 		switch (inst.dst.kind) {
@@ -323,6 +365,8 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 			}
 		}
 
+		// A 32-bit write preserves the other EXEC/VCC half and invalidates any
+		// overlapping SGPR-pair mask provenance through the ordinary scalar path.
 		WriteRawU32(inst.dst, low);
 		if (destination_is_mask) {
 			const auto is_high_half = [](const Decoder::Operand& operand) {
@@ -345,6 +389,7 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 			} else {
 				live = ir.GetVcc();
 			}
+			// A cross-half copy refers to different lanes, so only scalar bits apply.
 			if (is_high_half(inst.src0) == destination_is_high) {
 				live = ir.LogicalOr(retained_live, live);
 			}
@@ -359,6 +404,9 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 		return;
 	}
 
+	// WQM adds live lanes but never removes a source lane. Keep that fact separate
+	// from the scalar mask: reconstructing an entry-true predicate from a ballot
+	// otherwise introduces a spurious dependency into every vector write.
 	const auto live = ir.LogicalOr(retained_live, ThreadBit(ExtractU64(result)));
 	WriteOperand(DestinationOperand(inst), result);
 	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
@@ -389,9 +437,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = IR::U32(ir.Emit(IR::ValueOpcode::SelectU32,
-		                           {match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected},
-		                           IR::RelativeVgprReadFlags(base, current_vector_limit - base - 1u)));
+		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
 	}
 	WriteOperand(DestinationOperand(inst), selected);
 }
@@ -409,19 +455,11 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto value = ReadU32(inst.src0);
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
-	uint32_t end = base;
-	for (; end < current_vector_limit; end++) {
-		const auto [first_write, last_read] = lane_spills[end];
-		if (end != base && first_write < current_pc && current_pc < last_read) {
-			break;
-		}
-	}
-	for (uint32_t index = base; index < end; index++) {
+	for (uint32_t index = base; index < current_vector_limit; index++) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
-		const auto flags = IR::RelativeVgprWriteFlags(current_pc >> 2u, base, index - base, end - base);
-		ir.SetVectorReg(reg, IR::U32(ir.Emit(IR::ValueOpcode::SelectU32, {write, value, ir.GetVectorReg(reg)}, flags)));
+		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
 	}
 }
 
@@ -453,6 +491,7 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
+	// An EXEC-disabled source lane without FI disables the write unless BOUND_CTRL reads zero.
 	const auto inactive = flags.fetch_inactive || flags.bound_control
 	                          ? IR::U32(IR::Value(0u))
 	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
@@ -465,4 +504,4 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	WriteOperand(dst, result);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Frontend

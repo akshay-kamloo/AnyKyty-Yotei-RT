@@ -10,6 +10,7 @@ namespace Libs::Graphics {
 
 struct HostInputTouchPadVisualState {
 	bool     enabled        = false;
+	bool     cursor_visible = true;
 	bool     drawing        = false;
 	bool     position_valid = false;
 	float    x              = 0.5f;
@@ -37,6 +38,6 @@ void               HostInputDisconnectGamepadTouchPad(int id);
 void               HostInputToggleMouseToJoystick();
 [[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms);
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif /* KYTY_GRAPHICS_PRESENTATION_WINDOW_HOST_INPUT_H_ */

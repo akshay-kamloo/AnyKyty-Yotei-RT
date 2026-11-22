@@ -27,10 +27,11 @@ public:
 	KYTY_CLASS_NO_COPY(Presenter);
 
 	[[nodiscard]] Frame&         PrepareFrame(CommandBuffer& command, const ImageInfo& info,
-	                                          uint64_t video_out_format, bool headset);
+	                                          bool hdr = false, bool headset = false);
 	[[nodiscard]] Frame&         PrepareBlankFrame(uint32_t width, uint32_t height, bool opaque,
 	                                               CommandBuffer* producer = nullptr);
 	[[nodiscard]] bool           PresentLastFrame();
+	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           IsHdrSupported() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
@@ -39,13 +40,13 @@ public:
 	void                         ClearLayer(int bus);
 	void                         Discard(Frame& frame);
 #if defined(ANYPS5_KYTY)
-	void AttachSurface();
+	void                         AttachSurface();
 #endif
 
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;
 };
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_PRESENTER_H_

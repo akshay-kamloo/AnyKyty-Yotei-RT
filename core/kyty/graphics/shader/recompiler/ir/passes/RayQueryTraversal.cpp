@@ -993,7 +993,7 @@ bool PerLane(ValueOpcode op) {
 	                               Op::WriteLane,     Op::SubgroupUMinU32,     Op::SubgroupUMaxU32,
 	                               Op::SubgroupOrU32, Op::Permlane16U32,       Op::PermuteU32,
 	                               Op::BpermuteU32,   Op::SwizzleU32,          Op::DppMoveU32,
-	                               Op::DppUpdateU32,  Op::LoadDeviceAddressU32};
+	                               Op::DppUpdateU32};
 	const auto           plain = [](Type type) {
 		return type == Type::U1 || type == Type::U32 || type == Type::F32;
 	};

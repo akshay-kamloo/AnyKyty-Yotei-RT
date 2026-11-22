@@ -22,4 +22,4 @@ template <typename T>
 	return static_cast<T>(value - value % size);
 }
 
-}
+} // namespace Common

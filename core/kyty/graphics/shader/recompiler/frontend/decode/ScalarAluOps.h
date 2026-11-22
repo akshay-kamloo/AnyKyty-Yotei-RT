@@ -16,6 +16,6 @@ void DecodeSopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                 Instruction& inst);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SCALARALUOPS_H_ */

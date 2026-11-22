@@ -215,4 +215,4 @@ U1 IREmitter::LogicalNot(U1 value) {
 	return U1(Emit(ValueOpcode::LogicalNot, {value}));
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

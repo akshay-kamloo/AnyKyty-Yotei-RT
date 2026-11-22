@@ -687,10 +687,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 		const auto& first = s.program.info.images[memory(samples[0]).resource];
 		const auto& image = s.program.info.images[memory(inst).resource];
 		return memory(inst).sampler == memory(samples[0]).sampler && image.heap == first.heap &&
-		       image.indirect_mapping_offset == first.indirect_mapping_offset &&
-		       image.table_descriptor_base == first.table_descriptor_base &&
-		       image.table_mapping_offset == first.table_mapping_offset &&
-		       image.table_entry_mask == first.table_entry_mask;
+		       image.indirect_mapping_offset == first.indirect_mapping_offset;
 	});
 	const auto alpha_type = s.builder.Type(spv::OpTypeArray, u, ConstantU32(s, static_cast<uint32_t>(AlphaArgument::Count)));
 	const auto cache_type = s.builder.Type(spv::OpTypeArray, u, ConstantU32(s, static_cast<uint32_t>(AlphaCache::Count)));

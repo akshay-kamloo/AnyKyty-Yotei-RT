@@ -40,4 +40,4 @@ void Subsystems::EmergencyShutdownActive() {
 	}
 }
 
-}
+} // namespace Common

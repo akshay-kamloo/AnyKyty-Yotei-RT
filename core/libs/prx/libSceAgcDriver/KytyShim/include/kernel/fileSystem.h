@@ -54,8 +54,9 @@ struct Lifecycle {
 
 void                  Mount(const std::filesystem::path& folder, const std::string& point);
 void                  Umount(const std::string& folder_or_point);
+// Returns an empty path when the guest path has no mounted filesystem.
 std::filesystem::path GetRealFilename(const std::string& mounted_file_name);
-int StatHostPath(const std::filesystem::path& real_file_name, FileStat* sb);
+// Returns whether d is an open file, directory or device descriptor.
 bool                  IsOpenDescriptor(int d);
 
 int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
@@ -82,6 +83,6 @@ int KYTY_SYSV_ABI     KernelMkdir(const char* path, uint16_t mode);
 int KYTY_SYSV_ABI     KernelRmdir(const char* path);
 int KYTY_SYSV_ABI     KernelCheckReachability(const char* path);
 
-}
+} // namespace Libs::LibKernel::FileSystem
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_FILESYSTEM_H_ */

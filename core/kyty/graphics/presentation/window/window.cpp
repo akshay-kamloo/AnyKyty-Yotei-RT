@@ -1,5 +1,4 @@
-﻿#if !defined(ANYPS5_KYTY)
-#include "graphics/presentation/window.h"
+﻿#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -14,6 +13,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/renderDoc.h"
@@ -33,12 +33,9 @@
 #include <vector>
 #include <vulkan/vk_platform.h>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <dxgi1_6.h>
-#include <wrl/client.h>
-#endif
-
 #include "stb_image.h"
+
+// IWYU pragma: no_include <intrin.h>
 
 #define KYTY_DBG_INPUT
 
@@ -135,51 +132,16 @@ struct EventController {
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
-Common::Mutex                  g_luminance_mutex;
-DisplayLuminance               g_luminance;
 
-}
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-static bool GetOutputDesc(HMONITOR monitor, DXGI_OUTPUT_DESC1* desc) {
-	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-	Microsoft::WRL::ComPtr<IDXGIOutput>   output;
-	Microsoft::WRL::ComPtr<IDXGIOutput6>  output6;
-	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-		return false;
-	}
-	for (UINT a = 0; factory->EnumAdapters1(a, &adapter) == S_OK; a++) {
-		for (UINT o = 0; adapter->EnumOutputs(o, &output) == S_OK; o++) {
-			if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(desc)) &&
-			    desc->Monitor == monitor) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
-static void RefreshDisplayLuminance(SDL_Window* window) {
-	auto* hwnd = static_cast<HWND>(SDL_GetPointerProperty(
-	    SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
-
-	DXGI_OUTPUT_DESC1 desc {};
-	DisplayLuminance  luminance;
-	if (GetOutputDesc(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &desc) &&
-	    desc.MaxLuminance > 0.0f && desc.MaxFullFrameLuminance > 0.0f) {
-		luminance = {desc.MaxFullFrameLuminance, desc.MaxLuminance, desc.MinLuminance};
-	}
-	LOGF("Display luminance: max full frame = %g, max = %g, min = %g nits\n",
-	     luminance.max_full_frame, luminance.max, luminance.min);
-	Common::LockGuard lock(g_luminance_mutex);
-	g_luminance = luminance;
-}
-#else
-static void RefreshDisplayLuminance(SDL_Window* ) {}
-#endif
+} // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
+
+static void SetPause(WindowLoopState& game, bool flag) {
+	LOGF("Pause: %s\n", flag ? "true" : "false");
+
+	game.paused.store(flag, std::memory_order_release);
+}
 
 static void GameEventQuit(WindowLoopState& game) {
 	LOGF("Event: quit\n");
@@ -314,12 +276,7 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	if (f.remapped) {
-		if (Controller::GetActiveControllerId() == f.id) {
-			Controller::ResetInputState();
-		}
-		return;
-	}
+	EXIT_NOT_IMPLEMENTED(f.remapped);
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -378,6 +335,26 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 static void GameEventLowMemory() {
 	LOGF("Event: low_memory\n");
+}
+
+static void GameEventWillEnterBackground(WindowLoopState& game) {
+	LOGF("Event: will_enter_background\n");
+
+	SetPause(game, true);
+}
+
+static void GameEventDidEnterBackground() {
+	LOGF("Event: did_enter_background\n");
+}
+
+static void GameEventWillEnterForeground() {
+	LOGF("Event: will_enter_foreground\n");
+}
+
+static void GameEventDidEnterForeground(WindowLoopState& game) {
+	LOGF("Event: did_enter_foreground\n");
+
+	SetPause(game, false);
 }
 
 void WindowContext::Resize(int new_width, int new_height) {
@@ -447,8 +424,6 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
 			break;
-		case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
-		case SDL_EVENT_WINDOW_HDR_STATE_CHANGED: RefreshDisplayLuminance(window); break;
 		default:
 			LOGF("Window %" PRIu32 " got unknown event %" PRIu32 "\n", window_event.windowID,
 			     static_cast<uint32_t>(window_event.type));
@@ -533,6 +508,14 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_EVENT_TERMINATING: GameEventTerminate(game); break;
 
 		case SDL_EVENT_LOW_MEMORY: GameEventLowMemory(); break;
+
+		case SDL_EVENT_WILL_ENTER_BACKGROUND: GameEventWillEnterBackground(game); break;
+
+		case SDL_EVENT_DID_ENTER_BACKGROUND: GameEventDidEnterBackground(); break;
+
+		case SDL_EVENT_WILL_ENTER_FOREGROUND: GameEventWillEnterForeground(); break;
+
+		case SDL_EVENT_DID_ENTER_FOREGROUND: GameEventDidEnterForeground(game); break;
 
 		case SDL_EVENT_KEY_DOWN:
 		case SDL_EVENT_KEY_UP: {
@@ -754,23 +737,33 @@ void WindowContext::ProcessEvent(double time_s) {
 
 void WindowContext::Run() {
 	Common::Timer timer;
+	timer.Start();
 
 	loop.event     = {};
 	loop.need_exit = false;
+	loop.paused.store(false, std::memory_order_release);
 
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
-	auto title_frames = PerformanceOverlayGuestFlips();
+	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
 
 	while (!loop.need_exit) {
+		if (loop.paused.load(std::memory_order_acquire)) {
+			if (!timer.IsPaused()) {
+				timer.Pause();
+			}
+		} else if (timer.IsPaused()) {
+			timer.Resume();
+		}
+
+		// Refresh the title on the main thread without making presentation wait for it.
 		const auto now     = SDL_GetTicks();
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
-			const auto frames = PerformanceOverlayGuestFlips();
-			const auto host   = loop.presented_frames.load(std::memory_order_relaxed);
-			if (host != 0) {
-				UpdateTitle(frames, host, static_cast<double>(frames - title_frames) * 1000.0 /
-				                              static_cast<double>(elapsed));
+			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			if (frames != 0 || g_precompile_wait_percent.load(std::memory_order_relaxed) >= 0) {
+				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
+				                        static_cast<double>(elapsed));
 			}
 			title_time   = now;
 			title_frames = frames;
@@ -792,6 +785,7 @@ static void WindowCreate(WindowContext& context) {
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
 	if (Config::RenderDocEnabled()) {
 		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
 	}
@@ -802,8 +796,16 @@ static void WindowCreate(WindowContext& context) {
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
-	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled());
+	// --precompile-only: the window is never shown (the device and the swapchain are made as for the game, nothing is
+	// presented; the launcher shows the progress).
+	uint32_t window_flags = WindowContext::InitialWindowFlags(Config::FullscreenEnabled() && !Config::PrecompileOnly());
+	if (Config::PrecompileOnly()) {
+		window_flags |= static_cast<uint32_t>(SDL_WINDOW_HIDDEN);
+	}
 #if defined(__APPLE__)
+	// SDL loads Vulkan while creating a Vulkan window, so select the bundled
+	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
+	// override, and fall back to SDL's normal loader search when no bundle is present.
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
 		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
@@ -818,6 +820,9 @@ static void WindowCreate(WindowContext& context) {
 		}
 	}
 
+	// macOS 26 window chrome (CoreUI asset decode, SwiftUI titlebar) has been observed
+	// throwing NSExceptions under Rosetta during the first CATransaction commit. A
+	// borderless window skips that machinery entirely.
 	if (std::getenv("KYTY_BORDERLESS") != nullptr) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
@@ -828,7 +833,6 @@ static void WindowCreate(WindowContext& context) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	RefreshDisplayLuminance(context.window);
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
@@ -868,17 +872,18 @@ void WindowRun() {
 	g_window->render_context->GetPipelineCache().Save();
 }
 
+int WindowPrecompileOnly(uint32_t threads, const std::atomic<bool>& stop) {
+	EXIT_IF(g_window == nullptr);
+	auto& context = *g_window->render_context;
+	return context.GetPipelineCache().RunPrecompileOnly(threads, stop, context.GetMutex());
+}
+
 void WindowShutdown() {
 	if (g_window != nullptr) {
 		HostInputShutdown();
 		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
-}
-
-DisplayLuminance WindowGetDisplayLuminance() {
-	Common::LockGuard lock(g_luminance_mutex);
-	return g_luminance;
 }
 
 static int WindowIconRead(void* user, char* data, int size) {
@@ -957,7 +962,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, uint64_t host_frames, double current_fps) {
+void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -968,17 +973,26 @@ void WindowContext::UpdateTitle(uint64_t frame_num, uint64_t host_frames, double
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
 
-	static constexpr auto build_type = KYTY_BUILD == KYTY_BUILD_DEBUG ? "Debug" : "Release";
+#if KYTY_BUILD == KYTY_BUILD_DEBUG
+	static constexpr auto build_type = "Debug";
+#elif KYTY_BUILD == KYTY_BUILD_RELEASE
+	static constexpr auto build_type = "Release";
+#else
+	static constexpr auto build_type = "Unknown";
+#endif
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}, presented: {}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps, host_frames);
+	    device_name, processor_name, frame_num, current_fps);
+	// The game's start waits for the shader precompile (PipelineCache::StartBackgroundCompiles).
+	if (const int percent = g_precompile_wait_percent.load(std::memory_order_relaxed); percent >= 0) {
+		text += fmt::format(" - preparing shaders {}%", percent);
+	}
 
 	SDL_SetWindowTitle(window, text.c_str());
 }
 
-}
-#endif
+} // namespace Libs::Graphics

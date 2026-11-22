@@ -36,7 +36,7 @@ std::string GetTitle(const nlohmann::json& param) {
 	return GetString(param, "titleName");
 }
 
-}
+} // namespace
 
 std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
                                             const std::string&           title_id) {
@@ -50,6 +50,7 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 		return {};
 	}
 
+	// Scan directories separately so an unreadable child does not discard its siblings.
 	std::vector<std::filesystem::path> pending {root};
 	std::vector<std::filesystem::path> params;
 	while (!pending.empty()) {
@@ -84,6 +85,7 @@ std::vector<AddContentEntry> FindAddContent(const std::filesystem::path& dir,
 			continue;
 		}
 		const auto param = nlohmann::json::parse(stream, nullptr, false);
+		// applicationCategoryType is required for applications, not additional content.
 		if (!param.is_object() || param.contains("applicationCategoryType")) {
 			continue;
 		}
@@ -126,4 +128,4 @@ std::optional<AddContentEntry> ParseAddContent(std::string_view value) {
 	return entry;
 }
 
-}
+} // namespace Common

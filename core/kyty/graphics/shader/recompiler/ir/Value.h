@@ -55,6 +55,12 @@ public:
 
 	bool operator==(const Value& other) const;
 
+	// The saved resource plans (host renderer's reuseDisk.cpp): the stored type tag and an immediate's bits (only its
+	// width; registers as their index), and the value back from them.
+	[[nodiscard]] Type     RawType() const { return type; }
+	[[nodiscard]] uint64_t ImmediateBits() const;
+	[[nodiscard]] static Value FromImmediateBits(Type type, uint64_t bits) { return Value(type, bits); }
+
 private:
 	Type type = Type::Void;
 	union {
@@ -77,17 +83,23 @@ class TypedValue: public Value {
 public:
 	TypedValue() = default;
 
+	template <Type other_type>
+	requires(TypesOverlap(type_, other_type))
+	TypedValue(const TypedValue<other_type>& value): Value(value) {}
+
 	explicit TypedValue(Value value): Value(value) {
 		EXIT_IF(!AreTypesCompatible(value.GetType(), type_));
 	}
 };
 
-using U1  = TypedValue<Type::U1>;
-using U16 = TypedValue<Type::U16>;
-using U32 = TypedValue<Type::U32>;
-using U64 = TypedValue<Type::U64>;
-using F16 = TypedValue<Type::F16>;
-using F32 = TypedValue<Type::F32>;
+using U1     = TypedValue<Type::U1>;
+using U8     = TypedValue<Type::U8>;
+using U16    = TypedValue<Type::U16>;
+using U32    = TypedValue<Type::U32>;
+using U64    = TypedValue<Type::U64>;
+using F16    = TypedValue<Type::F16>;
+using F32    = TypedValue<Type::F32>;
+using U32F32 = TypedValue<Type::U32 | Type::F32>;
 
 struct Use {
 	Inst*  user    = nullptr;
@@ -117,8 +129,15 @@ public:
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const { return parent; }
 	[[nodiscard]] const std::vector<Use>& Uses() const { return uses; }
-	[[nodiscard]] uint32_t WalkOutput() const { return walk_output; }
-	void SetWalkOutput(uint32_t index) const { walk_output = index; }
+	// SRT walker output index, assigned by the resource plan that owns this instruction.
+	// Runtime indices belong to the resource plan that owns this instruction (SrtWalker, SrtTape).
+	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
+		if (evaluation_index == UINT32_MAX) {
+			evaluation_index = count++;
+		}
+		return evaluation_index;
+	}
+	// Backend definitions belong to one emission. Wave64 emulation needs one per half.
 	[[nodiscard]] uint32_t Definition(uint32_t half) const { return definitions[half]; }
 	void SetDefinition(uint32_t half, uint32_t definition) const {
 		definitions[half] = definition;
@@ -130,6 +149,7 @@ public:
 	void AddPhiOperand(Block* predecessor, Value value);
 	void ReplaceUsesWith(Value replacement, bool preserve = true);
 	void Invalidate();
+	// Drops the arguments without updating their use lists, for teardown that destroys both sides.
 	void DropArgs();
 
 	template <typename T>
@@ -162,7 +182,7 @@ private:
 	ValueOpcode         opcode;
 	uint8_t             num_args;
 	bool                live = false;
-	mutable uint32_t    walk_output = UINT32_MAX;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 	mutable std::array<uint32_t, 2> definitions {};
 	uint64_t            flags;
 	Block*              parent = nullptr;
@@ -176,6 +196,7 @@ private:
 
 static_assert(sizeof(Inst) <= 120, "Inst operand and backend storage unintentionally increased");
 
+// Called per operand by the IR passes and the resource walker; inline, as the build has no LTO.
 inline bool Value::IsIdentity() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
 }
@@ -215,4 +236,4 @@ inline Value Inst::Arg(size_t index) const {
 	return ArgSlot(*this, index);
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

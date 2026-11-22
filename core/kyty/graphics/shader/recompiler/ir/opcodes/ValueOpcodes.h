@@ -82,4 +82,4 @@ static_assert(std::is_trivially_copyable_v<ExportFlags>);
 [[nodiscard]] ImageOpcodeInfo   ImageOpcodeInfoOf(ValueOpcode opcode);
 [[nodiscard]] std::string_view  ValueOpcodeName(ValueOpcode opcode);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::IR

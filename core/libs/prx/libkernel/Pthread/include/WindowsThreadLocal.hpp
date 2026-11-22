@@ -7,6 +7,12 @@
 template<class T>
 class WindowsThreadLocal {
 public:
+    static T* TryGet() noexcept {
+        const DWORD slot = slotIndex();
+        if (slot == FLS_OUT_OF_INDEXES) return nullptr;
+        return static_cast<T*>(FlsGetValue(slot));
+    }
+
     static T& Get() {
         const DWORD slot = slotIndex();
         if (slot == FLS_OUT_OF_INDEXES) throw std::runtime_error("Cannot allocate native thread state slot");

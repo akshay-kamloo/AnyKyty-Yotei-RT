@@ -83,7 +83,7 @@ void FlushLocked() {
 void Initialize() {
     const auto direction = Config::GetPrintfDirection();
     const auto path = Config::GetPrintfOutputFile();
-    const auto session = Config::GetSessionLogFile();
+    const std::filesystem::path session;
     std::lock_guard lock(g_mutex);
     const bool again = g_initialized.load(std::memory_order_relaxed);
     FlushLocked();
@@ -150,6 +150,11 @@ void Write(fmt::text_style style, std::string_view text) {
     }
 }
 
+void WriteToSessionLog(std::string_view text) {
+    std::lock_guard lock(g_mutex);
+    if (g_session != nullptr) std::fwrite(text.data(), 1, text.size(), g_session);
+}
+
 void WriteToConsoleAndLog(std::string_view text) {
     if (g_initialized.load(std::memory_order_acquire) && g_sink.load(std::memory_order_relaxed) != Sink::Standard) WriteStandard(text);
     Write({}, text);
@@ -157,9 +162,13 @@ void WriteToConsoleAndLog(std::string_view text) {
     Flush();
 }
 
-void WriteToSessionLog(std::string_view text) {
-    std::lock_guard lock(g_mutex);
-    if (g_session != nullptr) std::fwrite(text.data(), 1, text.size(), g_session);
+void WriteFatal(std::string_view text) {
+    WriteToConsoleAndLog(text);
+}
+
+void WriteFatal(fmt::text_style style, std::string_view text) {
+    static_cast<void>(style);
+    WriteToConsoleAndLog(text);
 }
 
 }

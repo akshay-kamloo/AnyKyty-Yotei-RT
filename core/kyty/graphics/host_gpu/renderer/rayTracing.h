@@ -30,7 +30,6 @@ struct ShaderInfo;
 }
 
 class BufferCache;
-class CommandRecorder;
 class CommandScheduler;
 class RenderContext;
 struct GraphicContext;
@@ -86,7 +85,7 @@ public:
 	void AnnounceWalks(std::span<const uint64_t> blases);
 	void NoteTlasInstances(uint32_t count) noexcept { m_next_instances = count; }
 
-	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
+	void Prepare(vk::CommandBuffer command, uint64_t user_pointer, const TlasSource& source,
 	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash,
 	             bool count_rays = false, bool per_lane = false);
 
@@ -116,7 +115,7 @@ public:
 		Base460,
 		Base252,
 	};
-	void RecordHleTlas(const CommandRecorder& command, uint64_t input_va, uint32_t count,
+	void RecordHleTlas(vk::CommandBuffer command, uint64_t input_va, uint32_t count,
 	                   uint32_t stride, uint64_t header_va, HleTlasFormat format);
 	static constexpr uint32_t HleTlasMaxInstances = 4096;
 	static uint32_t HleTlasHeader(uint32_t count, HleTlasFormat format,
@@ -129,7 +128,7 @@ public:
 		std::array<uint32_t, 4>  vsharp {};
 		std::array<float, 16>    matrix {};
 	};
-	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
+	void RecordHleRefit(vk::CommandBuffer command, std::span<const uint64_t> blases,
 	                    std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
 	                    bool arguments = false);
 	static constexpr uint32_t HleRefitBlasHeaderBytes = 256;
@@ -310,8 +309,8 @@ private:
 	void EvictOverBudget(std::vector<uint32_t>& evicted);
 	void EvictSlot(uint32_t index);
 	void Defragment(std::vector<uint32_t>& moved);
-	bool RecordBuilds(const CommandRecorder& command);
-	bool RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered);
+	bool RecordBuilds(vk::CommandBuffer command);
+	bool RecordBuildBatch(vk::CommandBuffer command, bool urgent_only, bool& gathered);
 	void ProcessReadback(Readback& readback);
 
 	bool              m_enabled = false;

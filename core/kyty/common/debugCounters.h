@@ -9,42 +9,44 @@ namespace Common::DebugCounters {
 
 static_assert(std::atomic<uint64_t>::is_always_lock_free && std::atomic<bool>::is_always_lock_free);
 
+// Collect events only while the panel is visible. Relaxed, lock-free atomics keep updates
+// cheap and safe in signal handlers. Rates come from comparing two snapshots.
 enum class Counter {
+	// GPU work.
 	Draws,
 	DrawInstances,
 	IndirectDraws,
 	Dispatches,
 	QueueSubmits,
-	GpuWaits,
+	GpuWaits, // CPU blocked on a GPU timeline semaphore.
 	GpuWaitNs,
-	GpuFaults,
+	GpuFaults, // Guest writes to GPU-tracked memory.
 	ShadersCompiled,
 	ShaderCompileNs,
 	PipelinesCreated,
 	PipelineCreateNs,
+	// Caches.
 	TextureUploadBytes,
 	TextureDownloadBytes,
 	TextureEvictions,
-	ColorMetadataReadbacks,
+	ColorMetadataReadbacks, // CPU blocked reading back GPU-written DCC/CMASK metadata.
 	ColorMetadataReadbackNs,
-	ColorMetadataChecks,
+	ColorMetadataChecks, // GPU clear-key checks of DCC/CMASK metadata.
 	BufferUploadBytes,
 	BufferDownloadBytes,
 	BufferEvictions,
+	// Presentation.
 	FlipsRequested,
-	FlipsRejected,
-	LateVblanks,
+	FlipsRejected, // Guest flip queue was full.
+	LateVblanks,   // The present thread fell behind the vblank rate.
 	SwapchainRecreations,
 	DroppedPresents,
-	EmulatedInstructions,
+	// Emulator.
+	EmulatedInstructions, // Host CPU lacked an instruction the guest used.
 	UnresolvedImportCalls,
 	GuestFileReadBytes,
 	GuestFileWriteBytes,
 	AudioUnderruns,
-	GpuThreadBusyNs,
-	PresentNs,
-	PresentAcquireNs,
-	OverlayNs,
 	Count
 };
 
@@ -54,7 +56,7 @@ namespace Detail {
 inline std::atomic<bool>     g_enabled {false};
 inline std::atomic<uint64_t> g_counters[static_cast<int>(Counter::Count)] {};
 inline std::atomic<uint64_t> g_peaks[static_cast<int>(Peak::Count)] {};
-}
+} // namespace Detail
 
 [[nodiscard]] inline bool Enabled() noexcept {
 	return Detail::g_enabled.load(std::memory_order_relaxed);
@@ -73,7 +75,6 @@ inline void Add(Counter counter, uint64_t value = 1) noexcept {
 
 class ScopedTimer final {
 public:
-	explicit ScopedTimer(Counter duration): ScopedTimer(Counter::Count, duration) {}
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
 	      m_start(Enabled() ? std::chrono::steady_clock::now()
@@ -86,9 +87,7 @@ public:
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                              std::chrono::steady_clock::now() - m_start)
 		                              .count());
-		if (m_count != Counter::Count) {
-			Add(m_count);
-		}
+		Add(m_count);
 		Add(m_duration, elapsed);
 		if (m_peak != Peak::Count) {
 			auto& peak     = Detail::g_peaks[static_cast<int>(m_peak)];
@@ -116,6 +115,6 @@ private:
 	return Detail::g_peaks[static_cast<int>(peak)].load(std::memory_order_relaxed);
 }
 
-}
+} // namespace Common::DebugCounters
 
-#endif
+#endif /* KYTY_COMMON_DEBUG_COUNTERS_H_ */

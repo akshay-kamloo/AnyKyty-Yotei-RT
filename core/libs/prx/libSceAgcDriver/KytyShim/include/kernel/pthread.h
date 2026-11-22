@@ -4,14 +4,7 @@
 #include "common/abi.h"
 #include "common/common.h"
 
-#include <cstdint>
-#include <vector>
-
-#if defined(ANYPS5_KYTY) && defined(_WIN32)
-#include <pthread.h>
-#undef pthread_attr_getguardsize
-#undef pthread_attr_setguardsize
-#endif
+// IWYU pragma: no_include <pthread.h>
 
 extern "C" {
 struct sched_param;
@@ -19,7 +12,7 @@ struct sched_param;
 
 namespace Loader {
 struct Program;
-}
+} // namespace Loader
 
 namespace Libs {
 
@@ -98,8 +91,6 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
-uint64_t              AllocateEmulatorGuestStack(size_t size, size_t* allocated);
-void                  FreeEmulatorGuestStack(uint64_t address, size_t size);
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);
@@ -120,7 +111,6 @@ void KYTY_SYSV_ABI    PthreadYield();
 int KYTY_SYSV_ABI     PthreadGetthreadid();
 int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
-std::vector<uint64_t>  PthreadGuestHostThreadIds();
 void                  PthreadWakeForSignal(Pthread thread);
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
@@ -211,13 +201,21 @@ int KYTY_SYSV_ABI      KernelConvertLocaltimeToUtc(int64_t local_time, int64_t r
 int KYTY_SYSV_ABI      KernelConvertUtcToLocaltime(int64_t utc_time, int64_t* local_time,
                                                    KernelTimesec* st, uint64_t* dst_sec);
 uint64_t KYTY_SYSV_ABI KernelGetTscFrequency();
+// Guest TSC = host TSC * multiplier >> 32.
 uint64_t               KernelGuestTscMultiplier();
 uint64_t KYTY_SYSV_ABI KernelReadTsc();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounter();
 uint64_t KYTY_SYSV_ABI KernelGetProcessTimeCounterFrequency();
 
-}
+} // namespace LibKernel
+
+#ifdef pthread_attr_getguardsize
+#undef pthread_attr_getguardsize
+#endif
+#ifdef pthread_attr_setguardsize
+#undef pthread_attr_setguardsize
+#endif
 
 namespace Posix {
 
@@ -303,8 +301,8 @@ int KYTY_SYSV_ABI   pthread_getstack(const LibKernel::PthreadAttr* __restrict at
                                      void** __restrict stack_addr, size_t* __restrict stack_size);
 int64_t KYTY_SYSV_ABI lseek(int d, int64_t offset, int whence);
 
-}
+} // namespace Posix
 
-}
+} // namespace Libs
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_KERNEL_PTHREAD_H_ */

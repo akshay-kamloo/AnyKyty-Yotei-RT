@@ -4,190 +4,78 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/file.h"
-#include "common/uniqueFunction.h"
-#include "graphics/host_gpu/renderer/colorRenderTarget.h"
-#include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineHelpers.h"
+#include "graphics/host_gpu/renderer/dispatchCensus.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 
+#include <shared_mutex>
+#include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
-#include <deque>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
-#include <mutex>
-#include <optional>
-#include <queue>
-#include <functional>
 #include <span>
-#if defined(ANYPS5_KYTY)
-#include <source_location>
-#endif
-#include <stop_token>
-#include <string>
-#include <thread>
 #include <type_traits>
-#include <utility>
 #include <unordered_map>
-#include <unordered_set>
-#include <array>
-#include <vector>
+#include <thread>
+
+namespace Common {
+class Mutex;
+} // namespace Common
 
 namespace Libs::Graphics {
 
-class GuestReadLog {
-public:
-	void Clear() {
-		m_entries.clear();
-		m_bytes.clear();
-		m_flat_loads.clear();
-		m_words.clear();
-		m_refresh.clear();
-		m_stage       = 0;
-		m_plan        = nullptr;
-		m_failed      = false;
-		m_gpu_written = false;
-	}
-	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	void               RecordLoad(uint64_t address, uint32_t value, uint32_t flat_slot);
-	void               RecordLoads(std::span<const uint64_t> loads);
-	void SetStage(uint32_t stage, const ShaderRecompiler::IR::ResourcePlan* plan = nullptr) {
-		m_stage = stage;
-		m_plan  = plan;
-	}
-	void               Fail() { m_failed = true; }
-	[[nodiscard]] bool Failed() const { return m_failed; }
-	[[nodiscard]] bool MayHaveReadGpuWrites() const { return m_gpu_written; }
-	[[nodiscard]] bool StillValid() const;
-	[[nodiscard]] bool HasDescriptorRefresh() const { return !m_refresh.empty(); }
-	void RefreshDescriptorWords(std::span<ShaderRecompiler::IR::ResourceSnapshot>          resources,
-	                            std::span<const ShaderRecompiler::IR::ResourcePlan* const> plans) const;
-	void RefreshFlatLoads(std::span<ShaderRecompiler::IR::ResourceSnapshot> resources,
-	                      bool gpu_copies = false) const;
+class RenderContext;
 
-	[[nodiscard]] bool     DwordAligned() const;
-	[[nodiscard]] size_t   WordCount() const { return m_bytes.size() / 4u; }
-	[[nodiscard]] uint32_t WordAt(size_t index) const;
-	void                   SetWord(size_t index, uint32_t value);
-	[[nodiscard]] bool     SameReads(const GuestReadLog& other) const;
-	[[nodiscard]] bool     CollectChanges(std::vector<std::pair<uint32_t, uint32_t>>& changed) const;
-	[[nodiscard]] bool     FirstMismatch(uint32_t& index, uint64_t& address, uint32_t& size, uint32_t& old_value,
-	                                     uint32_t& new_value) const;
-	template <typename Function>
-	void ForEachRead(Function&& function) const {
-		for (const auto& entry: m_entries) {
-			function(entry.address, uint64_t {entry.size});
-		}
-	}
-
-private:
-	static constexpr uint64_t StrictCheckBytes = 64;
-	struct Entry {
-		uint64_t address = 0;
-		uint32_t size    = 0;
-		uint32_t offset  = 0;
-		bool     strict  = false;
-		bool     zero_test = false;
-		uint64_t watched = 0;
-		uint32_t words_begin = 0;
-		uint32_t words_end   = 0;
-	};
-	struct Word {
-		uint32_t offset = 0;
-		uint32_t stage  = 0;
-		uint32_t source = 0;
-		uint32_t word   = 0;
-		uint32_t mask   = 0;
-	};
-	void ReadNow(const Entry& entry, uint8_t* bytes) const;
-	[[nodiscard]] bool OnlyRefreshableBitsChanged(const Entry& entry) const;
-	struct FlatLoad {
-		uint64_t address = 0;
-		uint32_t stage   = 0;
-		uint32_t slot    = 0;
-		uint32_t count   = 1;
-	};
-	void                  Append(uint64_t address, const void* data, uint32_t size, bool strict,
-	                             bool zero_test = false);
-	[[nodiscard]] bool ZeroTestHolds(const Entry& entry) const;
-	std::vector<Entry>    m_entries;
-	std::vector<uint8_t>  m_bytes;
-	std::vector<FlatLoad> m_flat_loads;
-	std::vector<Word>     m_words;
-	mutable std::vector<uint32_t> m_refresh;
-	struct CheckedPage {
-		uint64_t       page    = UINT64_MAX;
-		bool           owned   = false;
-		const uint8_t* backing = nullptr;
-	};
-	mutable std::array<CheckedPage, 8> m_checked {};
-	uint32_t              m_stage       = 0;
-	const ShaderRecompiler::IR::ResourcePlan* m_plan = nullptr;
-	bool                  m_failed      = false;
-	bool                  m_gpu_written = false;
-};
-
-struct ProgramResolution {
-	static constexpr uint32_t MaxStages = 4;
-
-	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
-	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
-	std::array<const ShaderRecompiler::IR::ResourcePlan*, MaxStages>    plans {};
-	GuestReadLog                                                        reads;
-	uint32_t                                                            stages = 0;
-	bool                                                                refreshed_words = false;
-
-	void Reset() {
-		reads.Clear();
-		stages          = 0;
-		refreshed_words = false;
-	}
-	[[nodiscard]] bool Revalidate(bool gpu_flat_loads = false) {
-		if (!reads.StillValid()) {
-			return false;
-		}
-		refreshed_words = reads.HasDescriptorRefresh();
-		reads.RefreshDescriptorWords(std::span(resources).first(stages), std::span(plans).first(stages));
-		reads.RefreshFlatLoads(std::span(resources).first(stages), gpu_flat_loads);
-		return true;
-	}
-};
+// The stage materializations the resolve thread made for one operation from its register snapshot (opaque;
+// pipelineCache.cpp). While the execution thread runs the operation, t_resolved_stages points at them, so a draw takes the
+// whole selection (AdoptResolvedPrograms) or ProgramCache::Get takes a matching result; either only when everything the
+// resolve thread read still reads the same.
+struct ResolvedStages;
+[[nodiscard]] ResolvedStages* NewResolvedStages();
+void                          DeleteResolvedStages(ResolvedStages* stages);
+[[nodiscard]] bool            ResolvedStagesEmpty(const ResolvedStages& stages) noexcept;
+// KYTY_CHECK_RESOLVE=2 (project 15 N2.2): SetResolveCheck(true) once at start keeps each stage's active sources for the
+// comparison; ResolvedStagesCompare compares two resolutions of one operation: 1 refused (stage count, or a stage not
+// ok), 2 reads differ (the read logs), 3 equal, 4 different (`field` names the first difference). ResolvedStagesFault
+// puts KYTY_CHECK_RESOLVE_FAULT's error `fault` into a result that is only compared.
+void               SetResolveCheck(bool on);
+[[nodiscard]] int  ResolvedStagesCompare(const ResolvedStages& a, const ResolvedStages& b, const char** field);
+void               ResolvedStagesFault(ResolvedStages& stages, uint32_t fault);
+inline thread_local ResolvedStages* t_resolved_stages = nullptr;
+// KYTY_TRACE_DISPATCH_CENSUS: how ProgramCache::Get<Compute> got the last compute stage's resources on this thread
+// (2 materialized, 3 the resolve thread's result, 4 compiled: a program miss). Not touched when the selection is adopted.
+inline thread_local uint32_t t_compute_program_path = 0;
 
 struct GraphicContext;
-#if defined(ANYPS5_KYTY)
-class RenderContext;
-#endif
-struct ShaderParams;
-struct ManifestModule;
-struct PipelineManifest;
+class ShaderPrecompiler;
+class PrecompileWarmList;
+struct RenderColorInfo;
+struct RenderDepthInfo;
 class CommandBuffer;
+class CommandScheduler;
+
+namespace ShaderRecompiler::IR {
+struct ResourcePlan;
+} // namespace ShaderRecompiler::IR
 
 namespace HW {
 class Context;
-class UserConfig;
 class Shader;
-}
-
-namespace ShaderRecompiler {
-struct CompileOptions;
-struct ShaderSource;
-struct TranslateResult;
-}
+class UserConfig;
+struct ComputeShaderInfo;
+} // namespace HW
 
 namespace ShaderRecompiler::IR {
 class ImageHeapSource;
-}
-
+} // namespace ShaderRecompiler::IR
 namespace ShaderRecompiler::Spirv {
 struct Profile;
-}
+} // namespace ShaderRecompiler::Spirv
 
 #pragma pack(push, 1)
 
@@ -195,12 +83,14 @@ struct PipelineStaticParameters {
 	bool                       negative_one_to_one      = false;
 	bool                       depth_clip_enable        = true;
 	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	uint32_t                   patch_control_points     = 0;
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
+	bool                       cull_front                                         = false;
+	bool                       cull_back                                          = false;
+	bool                       face                                               = false;
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
 	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
@@ -211,650 +101,341 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
-#if defined(ANYPS5_KYTY)
-	uint32_t                   merged_hull                                        = 0;
-#endif
+
+	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
+
+#pragma pack(pop)
+
+static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
+static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
+static_assert(alignof(PipelineStaticParameters) == 1);
+static_assert(sizeof(PipelineStaticParameters) == 117);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
 	vk::Format                                           depth_format   = vk::Format::eUndefined;
 	vk::Format                                           stencil_format = vk::Format::eUndefined;
 	uint32_t                                             color_count    = 0;
+
+	bool operator==(const PipelineRenderingState&) const = default;
 };
 
 struct PipelineVertexInputState {
 	struct Binding {
-		uint32_t stride   = 0;
-		uint8_t  instance = 0;
+		uint32_t stride                           = 0;
+		bool     instance                         = false;
+		bool     operator==(const Binding&) const = default;
 	};
 	struct Attribute {
-		uint32_t offset  = 0;
-		uint8_t  binding = 0;
+		uint32_t offset                             = 0;
+		uint8_t  binding                            = 0;
+		bool     operator==(const Attribute&) const = default;
 	};
 
 	std::array<Binding, ShaderVertexInputInfo::RES_MAX>   bindings {};
 	std::array<Attribute, ShaderVertexInputInfo::RES_MAX> attributes {};
 	uint8_t                                               binding_count   = 0;
 	uint8_t                                               attribute_count = 0;
+
+	bool operator==(const PipelineVertexInputState&) const = default;
 };
 
-struct alignas(4) GraphicsPipelineKey {
-	std::array<uint64_t, 4>  stage_ids {};
-	PipelineRenderingState   rendering;
-	PipelineVertexInputState vertex_input;
-	PipelineStaticParameters static_params;
+struct ShaderProgram {
+	uint64_t         id     = 0;
+	vk::ShaderModule module = nullptr;
 
-	bool operator==(const GraphicsPipelineKey& other) const;
+	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
-#pragma pack(pop)
-
-static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
-
-#if defined(ANYPS5_KYTY)
-namespace HW {
-struct ModeControl;
-}
-
-[[nodiscard]] vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back);
-
-class PipelineLibraries;
-
-struct OptimizedGraphicsPipeline {
-	GraphicsPipelineKey key {};
-	bool                native   = false;
-	vk::Pipeline        pipeline = nullptr;
-};
-
-[[nodiscard]] PipelineStaticParameters LibraryStaticParameters(const HW::Context&    context,
-                                                               const HW::UserConfig& user_config,
-                                                               bool                  tessellation,
-                                                               const ShaderTessellationInputInfo& tess,
-                                                               bool ps_active, bool ps_sample_shading);
-#endif
-
-struct ShaderModule {
-	uint64_t                                     id     = 0;
-	vk::ShaderModule                             module = nullptr;
-	ShaderRecompiler::IR::CompiledShaderInfo     info;
-	ShaderRecompiler::IR::ResourceSpecialization specialization;
-	std::vector<uint32_t>                        function_code;
-	std::vector<vk::Format>                      vertex_formats;
-	std::vector<RectListParameter>               rect_parameters;
-	bool                                         mesh_task = false;
-	uint32_t                                     spirv_words = 0;
-	std::shared_ptr<const ShaderModule>          plain;
-	bool                                         guest_traversal = false;
-	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;
-#if defined(ANYPS5_KYTY)
-	mutable bool                                 pipeline_requested = false;
-	bool                                         shared_variant     = false;
-#endif
-};
-
-[[nodiscard]] std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&   module,
-                                                                  std::span<const uint32_t> spirv,
-                                                                  vk::Device            device);
-
-inline constexpr uint64_t PlainModuleIdXor = 0x9e3779b97f4a7c15ull;
-
-[[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
-[[nodiscard]] bool RecordsNoMipStats(const ShaderStageRuntime& stage);
-
-struct DrawTargets {
-	RenderDepthInfo depth;
-	RenderColorInfo colors[RENDER_COLOR_ATTACHMENTS_MAX];
-	uint32_t        color_count = 0;
-};
-
-struct DrawRenderState {
-	uint32_t                             mrt_mask = 0;
-	vk::PrimitiveTopology                topology = vk::PrimitiveTopology::ePointList;
-	bool                                 primitive_restart_enable = false;
-	bool                                 ps_active                = false;
-	bool                                 ps_plain                 = false;
-	std::array<ShaderVertexInputInfo, 3> vertex_info;
-	ShaderPixelInputInfo                 ps_input_info;
-	ShaderIndirectOffsets                indirect_offsets;
-	bool                                 indirect_draw = false;
-
-	[[nodiscard]] std::span<const ShaderVertexInputInfo> VertexStages() const {
-		return {vertex_info.data(), vertex_info[1].stage ? 3u : 1u};
-	}
-};
-
-class ShaderStoreWriter {
-public:
-	ShaderStoreWriter();
-	void Open(const std::filesystem::path& path, std::span<const uint8_t> header, uint64_t kept);
-	explicit operator bool() const { return !m_file.IsInvalid(); }
-	void Append(std::vector<uint8_t>&& record);
-	void Post(Common::UniqueFunction<void>&& job);
-	void Finish() { m_thread = {}; }
-
-private:
-	friend struct PipelineCacheTestAccess;
-
-	Common::File                             m_file;
-	std::mutex                               m_mutex;
-	std::condition_variable_any              m_ready;
-	std::queue<Common::UniqueFunction<void>> m_jobs;
-	std::jthread m_thread;
-};
-
-class PrecompileMean {
-public:
-	void Add(double seconds) {
-		m_samples++;
-		m_mean = m_samples <= Window ? m_mean + (seconds - m_mean) / m_samples
-		                             : m_mean + (seconds - m_mean) / Window;
-	}
-	[[nodiscard]] double Get() const { return m_samples >= MinSamples ? m_mean : 0.0; }
-
-private:
-	static constexpr uint32_t MinSamples = 8;
-	static constexpr uint32_t Window     = 32;
-	double                    m_mean     = 0.0;
-	uint32_t                  m_samples  = 0;
-};
-
+// The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
-	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap,
-	              const std::filesystem::path& shader_store = {});
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
-	void Save();
+	// True when the driver cache was written; a background save returns true once its thread is started.
+	bool Save(bool background = false);
+	void SaveIfDue();
+	// --precompile-only (WindowPrecompileOnly): starts the background compiles of the journals at once on `threads`
+	// workers (0: KYTY_SHADER_PRECOMPILE_THREADS) and prints PRECOMPILE_* lines on stdout (start, progress every
+	// second, periodic saves, done) until every job is through or `stop` is set (the running compiles finish; the queued
+	// ones stay for the next run). The driver cache is saved in the background every 6 minutes while compiling (as
+	// SaveIfDue) and at the end, each save under `save_mutex`; the warm list then lists what
+	// was compiled, so the next run (and the game) leaves it out. Returns the exit code: 0 all done, 3 stopped (what was
+	// done is saved), 2 nothing to run (no driver cache or KYTY_SHADER_PRECOMPILE=0), 4 the final save failed.
+	[[nodiscard]] int RunPrecompileOnly(uint32_t threads, const std::atomic<bool>& stop, Common::Mutex& save_mutex);
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
-		vk::ShaderStageFlags    push_stages;
+		// KYTY_BINDLESS: a stage samples bindless images; descriptor set 1 is the bindless table.
+		bool                    uses_bindless         = false;
 		bool                    uses_push_descriptors = false;
+		// The record packets: the descriptor update template (push descriptors, or the descriptor set of a heap
+		// pipeline) CommitBindings creates on first use, and the bytes of descriptor infos it reads (destroyed with the
+		// pipeline).
+		mutable vk::DescriptorUpdateTemplate push_template       = nullptr;
+		mutable uint32_t                     push_template_bytes = 0;
 		bool                    uses_image_heap       = false;
-		bool                    use_noted             = false;
-		bool                    native_bindings       = false;
+		// EvictIdlePipelines: the presented frame of the last lookup that returned this pipeline. An idle pipeline's
+		// Vulkan objects are destroyed (pipeline == nullptr) and the next lookup creates them again from the same inputs.
+		uint32_t                last_used             = 0;
 	};
 
-	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
-	bool GetGraphicsProgramsAhead(const HW::Context& context, const HW::UserConfig& user_config,
-	                              const HW::Shader& shaders, DrawRenderState& state,
-	                              ProgramResolution& ahead);
-	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                      ShaderComputeInputInfo&      input_info,
-	                                      bool                         guest_traversal = false);
-	const ShaderModule* GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
-	                                                 ShaderComputeInputInfo& input_info, bool& queued);
-	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
-	                                std::span<const uint32_t> data, bool one_address);
-	static void RetireAheadGuestWrites(uint64_t executed);
-	[[nodiscard]] static bool AheadGuestWritesPending();
-	[[nodiscard]] static uint64_t AheadWritesSequence();
-	static void SyncAheadWrites(uint64_t sequence);
-	static void BeginAheadThread(uint32_t slot);
-#if defined(ANYPS5_KYTY)
-	[[nodiscard]] static bool NarrowProgramLock();
-	static void BeginExecuteThread();
-#endif
-	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
-	                                           ShaderComputeInputInfo&      input_info,
-	                                           ProgramResolution&           ahead);
+	struct GraphicsPrograms {
+		std::array<ShaderProgram, 3> vertex;
+		ShaderProgram pixel;
 
-	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets, bool allow_async = false,
-	                              bool native_bindings = false);
-#if defined(ANYPS5_KYTY)
-	[[nodiscard]] bool PreparesGraphicsLibraries() const;
-	void SetRenderContext(RenderContext* context) { m_render = context; }
-	enum class AsyncDraw : uint8_t {
-		Off,
-		WritesMemory,
-		LinearTarget,
-		Occlusion,
-		SmallTarget,
-		Eligible,
+		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
-	void PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
-	                              const DrawRenderState& state);
-#endif
-	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
-	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info);
-	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const {
-		return m_pipeline_waiting;
-	}
 
-	enum class TableStatus : uint8_t {
-		Ready,
-		Pending,
-		Refused,
+	// indirect_draw: GPU indirect vertex variant (ShaderIndirectDrawInfo); it applies to
+	// a plain vertex stage only, mesh and tessellation programs ignore it.
+	GraphicsPrograms
+	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
+	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                    const HW::Context& context, const HW::UserConfig& user_config,
+	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                    ShaderPixelInputInfo& pixel_info,
+	                    const ShaderIndirectDrawInfo& indirect_draw = {});
+	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
+	                                const HW::ShaderRegisters&   sh,
+	                                ShaderComputeInputInfo&      input_info);
+	// KYTY_DIAG_TWIN_DISPATCH (diagnostic, renderCompute.cpp TwinDispatch): GetComputeProgram with `variant_xor` toggled in
+	// the program variant (ShaderComputeInputInfo::compute_variant) - the other module of the same dispatch.
+	ShaderProgram GetComputeProgramTwin(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                                    ShaderComputeInputInfo& input_info, uint8_t variant_xor);
+
+	// ---- The resolve thread ----
+	// What GetGraphicsPrograms and GetComputeProgram would select for an operation, from its register snapshots, into
+	// `vertex_info`, `pixel_info`, `programs` and `results`: the exact program of each stage, its materialization with the
+	// logged reader, FindBuffers' sources (ResolveRecord) and its permutation. They only read the program cache: a stage
+	// without a program stays with the execution thread, nothing compiles here (the cache's programs_mutex, taken
+	// exclusively by inserts and permutation appends).
+	void ResolveGraphicsPrograms(RenderContext& renderer, const HW::VertexShaderInfo& vertex_regs,
+	                             const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                             const HW::Context& context, const HW::UserConfig& user_config,
+	                             std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
+	                             std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+	                             const ShaderIndirectDrawInfo& indirect_draw, GraphicsPrograms& programs,
+	                             ResolvedStages& results);
+	void ResolveDispatchPrograms(RenderContext& renderer, const HW::ComputeShaderInfo& regs, uint32_t groups_x,
+	                             uint32_t groups_y, uint32_t groups_z, uint32_t mode, bool indirect, bool async_compute,
+	                             ShaderComputeInputInfo& input_info, ShaderProgram& program, ResolvedStages& results);
+	// The execution thread: the whole selection stands in for GetGraphicsPrograms or GetComputeProgram (true), when
+	// the resolve thread found every stage and everything it read reads the same now.
+	[[nodiscard]] bool AdoptResolvedPrograms(ResolvedStages& results);
+	[[nodiscard]] bool AdoptResolvedProgramsChecked(ResolvedStages& results); // KYTY_CHECK_PEEK=2 (project 15 S2d)
+	// Project 15 N4.1 (KYTY_CHECK_PEEK=2): PeekAdopt for an operation ahead (the slot keeps the prediction, checked when it
+	// is adopted); InstallAhead puts the predicted programs into the slot's state for the other peeks (saved), RestoreAhead
+	// puts back what was there.
+	struct AheadSaved {
+		std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 4> program {};
+		std::array<ShaderProgram, 4>                                   handle {};
+		uint32_t                                                       count = 0;
 	};
-	struct TableProgram {
-		const ShaderModule* module = nullptr;
-		TableStatus         status = TableStatus::Refused;
-		const std::string*  refusal = nullptr;
-		std::shared_ptr<const std::atomic<bool>> waiting;
-	};
-	std::pair<const ShaderRecompiler::IR::ResourcePlan*, const ShaderRecompiler::IR::ResourceSpecialization*>
-	ProgramPlanOf(const ShaderModule& module) const;
-	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
-	                               ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
-	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
-	TableProgram GetComputeProgramTable(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
-	                                    const ShaderRecompiler::IR::ResourceSpecialization& specialization);
-	TableProgram GetVertexProgramTable(const ShaderParams& params, const ShaderVertexInputInfo& input_info,
-	                                   const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                   uint32_t& push_data_cursor);
-	TableProgram GetPixelProgramTable(const ShaderParams& params, const ShaderPixelInputInfo& input_info,
-	                                  const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                                  uint32_t& push_data_cursor);
+	[[nodiscard]] bool PeekAdoptAhead(ResolvedStages& results, uint32_t distance);
+	static void        InstallAhead(ResolvedStages& results, AheadSaved& saved);
+	static void        RestoreAhead(ResolvedStages& results, const AheadSaved& saved);
+	[[nodiscard]] static bool     StagesAdoptable(const ResolvedStages& results);
+	[[nodiscard]] static bool     AheadProgramsOk(const ResolvedStages& results);
+	[[nodiscard]] static uint32_t StageCount(const ResolvedStages& results);
+	[[nodiscard]] static const ShaderRecompiler::IR::CompiledShaderInfo* AheadProgram(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const ShaderRecompiler::IR::ResourceSnapshot*   StageResources(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const ShaderRecompiler::IR::CompiledShaderInfo* AdoptedProgram(const ResolvedStages& results, uint32_t i);
+	[[nodiscard]] static const StageF::ResolveRecord*                    StageRecord(const ResolvedStages& results, uint32_t i);
+
+	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	                              const RenderDepthInfo&                 depth,
+	                              std::span<const ShaderVertexInputInfo> vertex_info,
+	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                              const GraphicsPrograms& programs);
+	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                             const ShaderProgram&          compute_program);
+
+	// KYTY_PERF_TABLE_ASYNC (default on; =0: every draw creates its pipeline on the calling thread, as before 28.10): a
+	// graphics pipeline made in the background (renderDraw.cpp ExecutePreparedDraw: every draw that writes no memory asks
+	// here). Ready: the pipeline, as GetGraphicsPipeline returns it. Not created yet: its creation is queued on the
+	// compile workers (background threads, KYTY_PERF_TABLE_ASYNC_THREADS, default 4) and null is returned; the caller
+	// skips the draw. A later draw with the same key finds it ready (the GPU thread moves the finished pipeline in,
+	// records it for KYTY_SHADER_PRECOMPILE as GetGraphicsPipeline does). A creation the driver refused (`failed`) makes
+	// every draw of that key create it on the GPU thread as before (logged). Counters: "PERF table_async" every 5 s
+	// (KYTY_TRACE_PERF). The name is project D's (21.10, the table-mode pipelines were the first made this way).
+	// Based on chenxiao07/KytyPS5 v20261020b (src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp,
+	// CompileWorkers, TableWorkers, the pending graphics pipelines of GetGraphicsPipeline), GPL-2.0.
+	[[nodiscard]] static bool TableAsyncEnabled();
+	// `failed` (may be null): set when the worker could not create the pipeline (null is returned for good).
+	[[nodiscard]] Pipeline* GetGraphicsPipelineAsync(std::span<const RenderColorInfo>       colors,
+	                                                 const RenderDepthInfo&                 depth,
+	                                                 std::span<const ShaderVertexInputInfo> vertex_info,
+	                                                 CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
+	                                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                                                 const GraphicsPrograms& programs, bool* failed = nullptr);
 
 private:
-	friend struct PipelineCacheTestAccess;
+	struct ProgramCache;
+	struct TableCompileJob;
+	class TableCompileWorkers;
 
-	struct Program {
-		std::unique_ptr<ShaderRecompiler::ShaderSource> call_source;
-		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::deque<ShaderModule>                     modules;
-		bool                                         skip_dispatch = false;
-		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
-#if defined(ANYPS5_KYTY)
-		struct FailedVariant {
-			ShaderRecompiler::IR::ResourceSpecialization specialization;
-			uint32_t                                     push_data_cursor = 0;
-			std::vector<uint32_t>                        function_code;
-		};
-		std::vector<FailedVariant> failed_variants;
+public:
+	struct GraphicsPipelineKey {
+		PipelineRenderingState   rendering;
+		std::array<uint64_t, 3>  vertex_shader_ids {};
+		uint64_t                 ps_shader_id = 0;
+		PipelineVertexInputState vertex_input;
+		PipelineStaticParameters static_params;
 
-		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
-		                          uint32_t push_data_cursor) const;
-		void               NoteFailed(uint32_t push_data_cursor);
-		ShaderModule*      ShareModule(const ShaderRecompiler::IR::ResourceSpecialization& requested,
-		                               const ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
-		                               uint32_t push_data_cursor, bool calls);
-		void               PromoteEmptyBuffers(const ShaderRecompiler::IR::ResourceSnapshot& snapshot,
-		                                       ShaderRecompiler::IR::ResourceSpecialization& specialization,
-		                                       uint32_t push_data_cursor) const;
-#endif
-
-		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
-		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);
-		template <bool HasCalls>
-		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
-		                         uint32_t push_data_cursor, bool& failed);
-#if defined(ANYPS5_KYTY)
-		template <bool HasCalls>
-		ShaderModule* MatchModule(uint32_t push_data_cursor);
-#endif
+		bool operator==(const GraphicsPipelineKey& other) const {
+			return rendering == other.rendering && vertex_shader_ids == other.vertex_shader_ids &&
+			       ps_shader_id == other.ps_shader_id && vertex_input == other.vertex_input &&
+			       static_params == other.static_params;
+		}
 	};
 
-	struct ProgramKey {
-		ShaderType            stage           = ShaderType::Unknown;
-		uint64_t              hash            = 0;
-		uint32_t              user_data_count = 0;
-		std::vector<uint32_t> static_state;
-
-		bool operator==(const ProgramKey&) const = default;
-	};
-
-	struct ProgramKeyHash {
-		std::size_t operator()(const ProgramKey& key) const { return key.hash; }
+private:
+	struct PipelineKeyHash {
+		static void Mix(std::size_t& hash, std::size_t value) {
+			hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) +
+			        (hash >> 2u);
+		}
 	};
 
 	struct GraphicsPipelineKeyHash {
 		std::size_t operator()(const GraphicsPipelineKey& key) const;
 	};
 
-	using ModuleMap = std::unordered_map<uint64_t, const ShaderModule*>;
+	// The key of a draw's graphics pipeline (GetGraphicsPipeline, GetGraphicsPipelineAsync): its programs and the state
+	// of the live registers and render targets the pipeline is made with.
+	GraphicsPipelineKey MakeGraphicsPipelineKey(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                            std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
+	                                            const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                            bool primitive_restart_enable, const GraphicsPrograms& programs);
 
-	GraphicContext&                        m_graphics;
-	ShaderRecompiler::IR::ImageHeapSource* m_image_heap;
-	std::unordered_map<ProgramKey, Program, ProgramKeyHash> m_program_cache;
-	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
-	ProgramKey                             m_lookup_key;
-	bool                                   m_guest_traversal = false;
-	bool                                   m_queue_only      = false;
-	bool                                   m_queued          = false;
+public:
+	// Project 15 S2c: the same key from the operation's registers. described: the targets come from their description
+	// (DescribeRenderColorTarget / DescribeRenderDepthTarget, no image id): every color given is present, the depth is
+	// present when its format is defined.
+	[[nodiscard]] GraphicsPipelineKey MakeGraphicsPipelineKeyFrom(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                                                              std::span<const ShaderVertexInputInfo> vertex_info,
+	                                                              const HW::Context& ctx, const HW::UserConfig& user_config,
+	                                                              const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                                                              bool primitive_restart_enable, const GraphicsPrograms& programs,
+	                                                              bool described);
+	// Project 15 S2c: the pipeline of a key without a write. Found: in the map with its objects (the pointer stays valid:
+	// entries are never removed); the other classes go in order (today's GetGraphicsPipeline[Async]).
+	enum class PipelineFind : uint8_t { Found, Evicted, PendingDone, Pending, Missing, Count };
+	[[nodiscard]] std::pair<Pipeline*, PipelineFind> FindGraphicsPipeline(const GraphicsPipelineKey& key, bool read_object = true) const;
+	// (read_object false, N5.1: a resolve helper - the entry only, Found when it is in the map; the commit checks the object)
+	// N4.3: a plan's pipeline taken as GetGraphicsPipeline[Async] takes a found one (housekeeping, last_used); null when its
+	// objects were given back (today's lookup recreates them).
+	[[nodiscard]] Pipeline* TakePlannedPipeline(Pipeline* planned);
+	[[nodiscard]] size_t GraphicsPipelineCount() const { return m_graphics_pipelines.size() + m_table_pending.size(); }
+
+private:
+
+	GraphicContext&               m_graphics;
+	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
+	std::chrono::steady_clock::time_point m_last_save {};
+	uint64_t                      m_pipelines_since_save = 0; // created since the last driver-cache save
+	std::thread                   m_save_thread;              // background write of a periodic save
+	// KYTY_SHADER_PRECOMPILE: background compiles of recorded compute permutations and graphics pipelines
+	// (shaderPrecompile.h).
+	std::unique_ptr<ShaderPrecompiler> m_precompiler;
+	// --export-hints / --import-hints: the PRECOMPILE_HINTS line RunPrecompileOnly prints (empty: neither asked), and
+	// whether the export was asked (the run then ends after it) or failed.
+	std::string                        m_hints_line;
+	bool                               m_hints_export = false;
+	bool                               m_hints_failed = false;
+	std::atomic<uint32_t>              m_precompiled_since_save {0}; // pipelines it created since the last save
 	std::filesystem::path         m_driver_cache_path;
-	std::mutex                    m_driver_cache_mutex;
-	std::chrono::steady_clock::time_point m_next_driver_cache_save;
-	std::chrono::steady_clock::time_point m_driver_cache_posted;
-	bool                          m_driver_cache_dirty = false;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_native_graphics_pipelines;
-	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
-	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
-	GraphicsPipelineKey m_last_graphics_key {};
-	Pipeline*           m_last_graphics_pipeline = nullptr;
-	std::atomic_flag m_program_lock;
+	uint64_t                      m_driver_cache_loaded_bytes = 0; // the payload loaded from its file (0: none)
+	// The warm list: the recorded pipelines the saved driver cache holds (shaderPrecompile.h); the
+	// background save commits it.
+	std::shared_ptr<PrecompileWarmList> m_warm;
+	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
+	                                                        m_graphics_pipelines;
+	// N5.1: every change of m_graphics_pipelines and m_table_pending (the execution thread) holds it exclusively; a resolve
+	// helper's FindGraphicsPipeline holds it shared. The execution thread's own reads need no lock (it is the only writer).
+	mutable std::shared_mutex m_pipelines_mutex;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// KYTY_PERF_TABLE_ASYNC: the workers (started at the first queued creation) and the creations queued, running,
+	// finished but not taken yet, or refused (kept: their draws stay on today's path).
+	std::unique_ptr<TableCompileWorkers> m_table_workers;
+	std::unordered_map<GraphicsPipelineKey, std::shared_ptr<TableCompileJob>, GraphicsPipelineKeyHash> m_table_pending;
+	bool                                 m_table_workers_stopped = false;
+	// KYTY_TRACE_MEM_CENSUS: driver-cache bytes loaded at start, and written by the last save (its thread stores it).
+	uint64_t                               m_cache_loaded_bytes = 0;
+	std::shared_ptr<std::atomic<uint64_t>> m_cache_saved_bytes  = std::make_shared<std::atomic<uint64_t>>(0);
 
-	struct CompileJob;
-	static constexpr uint32_t CompileWorkers = 6;
-	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight;
-	std::mutex                                               m_job_mutex;
-	std::condition_variable                                  m_job_available;
-	std::deque<std::unique_ptr<CompileJob>>                  m_jobs;
-	bool                                                     m_stopping = false;
-	std::vector<std::jthread>                                m_workers;
-
-	ShaderStoreWriter m_store;
-	std::jthread      m_driver_cache_timer;
-
-	bool ResolveGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
-	                             const HW::Shader& shaders, DrawRenderState& state,
-	                             ProgramResolution* ahead);
-	template <typename InputInfo>
-	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
-	                               uint32_t& push_data_cursor);
-	template <typename InputInfo>
-	const ShaderModule* GetAhead(const ShaderParams& params, InputInfo& input_info,
-	                             uint32_t& push_data_cursor, ProgramResolution& ahead);
-	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
-	                            ShaderRecompiler::CompileOptions  options,
-	                            ShaderRecompiler::TranslateResult translated,
-	                            uint32_t push_data_cursor, std::span<const uint32_t> code);
-	ShaderModule BuildModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
-	                         ShaderRecompiler::TranslateResult                   translated,
-	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                         std::span<const uint32_t> function_code, uint32_t push_data_cursor,
-	                         std::vector<uint32_t>& spirv, std::vector<uint32_t>& plain_spirv,
-	                         std::string* table_refusal = nullptr) const;
-	void AddedModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
-	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv,
-	                 const ShaderRecompiler::CompileOptions& options,
-	                 std::span<const uint32_t> code, uint32_t push_data_cursor);
-	void DestroyModule(const ShaderModule& module) const;
-#if defined(ANYPS5_KYTY)
-	void LockPrograms(std::source_location where = std::source_location::current());
-#else
-	void LockPrograms();
-#endif
-	void UnlockPrograms();
-	template <typename InputInfo>
-	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
-	                  uint32_t                                            push_data_cursor,
-	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
-	                  bool                                                guest_traversal = false);
-	bool WaitForCompile(const ProgramKey& key);
-	template <typename InputInfo>
-	void RunCompileJob(CompileJob& job, InputInfo& input_info);
-	void CompileWorker();
-	void StopWorkers();
-
-	struct TableVariant {
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		uint32_t                                     push_data_cursor = 0;
-		bool                                         done             = false;
-		std::shared_ptr<std::atomic<bool>>           waiting = std::make_shared<std::atomic<bool>>(false);
-		std::optional<ShaderModule>                  module;
-		std::string                                  refusal;
-	};
-	std::unordered_map<ProgramKey, std::deque<TableVariant>, ProgramKeyHash> m_table_programs;
-	template <typename InputInfo>
-	TableProgram GetTableProgram(const ShaderParams& params, const InputInfo& input_info,
-	                             const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	                             uint32_t push_data_cursor);
-	template <typename InputInfo>
-	void RunTableJob(CompileJob& job, InputInfo& input_info);
-
-	struct AsyncPipelineJob {
-		bool                               compute = false;
-		bool                               native  = false;
-		GraphicsPipelineKey                key {};
-		std::array<const ShaderModule*, 4> stages {};
-		const ShaderModule*                module = nullptr;
-	};
-	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending_graphics;
-	std::unordered_set<uint64_t>                                     m_async_pending_compute;
-	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_graphics;
-	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_async_ready;
-	struct AsyncNativePipeline {
-		std::shared_ptr<std::atomic<bool>> done = std::make_shared<std::atomic<bool>>(false);
-		Pipeline                           pipeline;
-	};
-	std::unordered_map<GraphicsPipelineKey, AsyncNativePipeline, GraphicsPipelineKeyHash> m_async_native;
-	std::shared_ptr<const std::atomic<bool>>                                   m_pipeline_waiting;
-	std::unordered_map<uint64_t, Pipeline>                                     m_async_ready_compute;
-	std::unordered_set<uint64_t>                                               m_async_asked_compute;
-	std::mutex                                                       m_async_mutex;
-	std::condition_variable                                          m_async_available;
-	std::deque<AsyncPipelineJob>                                     m_async_jobs;
-	std::deque<AsyncPipelineJob>                                     m_async_sibling_jobs;
-	void QueueSiblingPipeline(const GraphicsPipelineKey& key, const std::array<const ShaderModule*, 4>& stages,
-	                          const ShaderModule* pixel);
-	bool                                                             m_async_stopping = false;
-	std::vector<std::jthread>                                        m_async_threads;
-	bool                                                             m_async_handoff = false;
-	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_claimed_graphics;
-	std::unordered_set<uint64_t>                                     m_claimed_compute;
-
-	std::jthread m_precompile;
-	void         StartPrecompile();
-	void         Precompile(const std::stop_token& stop);
-
-	struct PipelineStall {
-		uint32_t                              threads = 0;
-		std::chrono::steady_clock::time_point since;
-		std::chrono::steady_clock::time_point ended;
-	};
-	class StallScope {
-	public:
-		explicit StallScope(PipelineCache& cache);
-#if defined(ANYPS5_KYTY)
-		StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why = nullptr);
-		StallScope(PipelineCache& cache, const char* what, const ShaderModule& module);
-#endif
-		~StallScope();
-		KYTY_CLASS_NO_COPY(StallScope);
-
-	private:
-		PipelineCache& m_cache;
-#if defined(ANYPS5_KYTY)
-		std::chrono::steady_clock::time_point m_started;
-		const char*                           m_what = nullptr;
-		uint64_t                              m_hash = 0;
-		const char*                           m_why  = nullptr;
-#endif
-	};
-	mutable std::mutex m_stall_mutex;
-	PipelineStall      m_stall;
-	[[nodiscard]] PipelineStall GetPipelineStall() const;
-#if defined(ANYPS5_KYTY)
-	struct StallStats {
-		uint64_t count      = 0;
-		uint64_t total_ns   = 0;
-		uint64_t max_ns     = 0;
-		uint64_t over_100ms = 0;
-		uint64_t over_500ms = 0;
-		uint64_t pipelines  = 0;
-	};
-	StallStats            m_stall_stats;
-	StallStats            m_stall_logged;
-	std::atomic<uint64_t> m_pipelines_created {0};
-	void                  LogStallStats(bool force);
-#endif
-
-	std::unique_ptr<PipelineHelpers> m_helpers;
-	std::unordered_map<uint64_t, const ShaderModule*> m_helper_jobs;
-	std::mutex                                        m_helper_caches_mutex;
-	std::vector<vk::PipelineCache>                    m_helper_caches;
-	vk::PipelineCache                                 m_helper_cache = nullptr;
-	std::atomic<uint64_t> m_helper_found {0}, m_helper_created {0}, m_helper_compiled_here {0},
-	    m_helper_taken_back {0};
-	void StartHelpers();
-	void StopHelpers();
-	bool CreateComputePipelineElsewhere(const ShaderModule& module, const std::vector<uint32_t>& spirv,
-	                                    bool urgent);
-	void OnHelperResult(PipelineHelpers::Result&& result);
-	void PublishComputePipeline(const ShaderModule& module, const Pipeline& pipeline,
-	                            std::chrono::steady_clock::time_point started);
-
-#if defined(ANYPS5_KYTY)
-	std::unique_ptr<PipelineLibraries>     m_libraries;
-	std::vector<vk::Pipeline>              m_retired_pipelines;
-	std::vector<OptimizedGraphicsPipeline> m_optimized_deferred;
-	uint64_t                               m_optimized_seen = 0;
-	size_t                                 m_optimized_scanned = 0;
-	[[nodiscard]] AsyncDraw HeldDraw(const CommandBuffer& command, const DrawRenderState& state,
-	                                 const DrawTargets& targets) const;
-	[[nodiscard]] bool LiveTargets(const DrawTargets& targets) const;
-	RenderContext* m_render = nullptr;
-	bool CreateGraphicsPipelineNow(Pipeline& pipeline, const GraphicsPipelineKey& key,
-	                               const std::array<const ShaderModule*, 4>& stages);
-	bool CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
-	                                const std::array<const ShaderModule*, 4>& stages);
-	void ApplyOptimizedPipelines();
-
-	struct ChainJob;
-	std::mutex                              m_chain_mutex;
-	std::condition_variable                 m_chain_available;
-	std::deque<std::unique_ptr<ChainJob>>   m_chain_jobs;
-	bool                                    m_chain_stopping = false;
-	std::vector<std::jthread>               m_chain_threads;
-	std::array<std::atomic<uint64_t>, 5> m_async_skipped {};
-	std::atomic<uint64_t> m_async_first_waits {0}, m_async_first_wait_ns {0}, m_async_first_ready {0},
-	    m_async_probes {0}, m_async_probe_ns {0}, m_async_created_now {0};
-	std::atomic<uint64_t> m_chain_queued {0}, m_chain_dropped {0}, m_chain_prepared {0}, m_chain_failed {0},
-	    m_chain_compiled {0}, m_chain_ns {0};
-	void NoteFirstWait(std::chrono::steady_clock::time_point started, bool ready);
-	void QueueChain(std::unique_ptr<ChainJob>&& job);
-	void ChainWorker();
-	void StopChains();
-	void RunChain(ChainJob& job);
-	template <typename InputInfo>
-	const ShaderModule* ChainModule(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
-	                                ShaderRecompiler::IR::ResourceSnapshot& resources);
-#endif
-	void QueueAsyncPipeline(const AsyncPipelineJob& job);
-	template <typename Matches>
-	bool TakeQueuedAsyncPipeline(Matches&& matches);
-	void AsyncPipelineWorker();
-	void StopAsyncPipelines();
-	void CreateComputePipelineAhead(const ShaderModule& module, const std::vector<uint32_t>& spirv);
-#if defined(ANYPS5_KYTY)
-	void RequestComputePipelineAhead(const ShaderModule& module);
-#endif
-	void ClaimPipeline(const GraphicsPipelineKey& key);
-	void ClaimComputePipeline(uint64_t module_id);
 	void InitializeDriverCache();
-	void CheckpointDriverCache(bool slow_creation = false);
-	void NoteCreatedPipeline(std::chrono::steady_clock::time_point started);
-	void PostDueDriverCache();
-	void WriteDriverCache();
+	void StartBackgroundCompiles();
+	// What every request of a pipeline does first: StartBackgroundCompiles and SaveIfDue.
+	void PipelineHousekeeping();
 
-	void WarmUp(const std::filesystem::path& path);
-	struct StoreRecord;
-	bool ReadRecord(std::span<const uint8_t> frame, StoreRecord& record) const;
-	bool AddRecord(StoreRecord& record);
-	void StoreModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
-	                 const std::vector<uint32_t>& spirv, const std::vector<uint32_t>& plain_spirv);
-	void StorePipeline(const GraphicsPipelineKey& key);
-	void StoreLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
-	[[nodiscard]] ModuleMap MapModules() const;
-	bool CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
-	                            const ModuleMap& modules);
+public:
+	// KYTY_SHADER_PRECOMPILE: joins the background compiles; RenderContext calls it before it destroys the
+	// bindless table they may use.
+	void StopBackgroundCompiles();
 
-	std::unordered_set<uint64_t> m_baked_stride_programs;
-	[[nodiscard]] bool RuntimeStride(uint64_t program_hash) const {
-		return !m_baked_stride_programs.contains(program_hash);
-	}
-	void DecideRuntimeStrides(std::span<PipelineManifest*> manifests);
-
-	struct ManifestState;
-	struct ManifestStateDeleter {
-		void operator()(ManifestState* state) const;
+	// KYTY_TRACE_MEM_CENSUS (GPU thread): shader modules this cache keeps for the whole session (each holds its
+	// SPIR-V in the driver), pipelines, and the driver-cache bytes loaded and last saved.
+	struct HostCensus {
+		uint64_t shader_modules = 0, graphics_pipelines = 0, compute_pipelines = 0, cache_loaded = 0, cache_saved = 0;
 	};
-	std::unique_ptr<ManifestState, ManifestStateDeleter> m_manifest;
-	bool                           m_manifest_warm = false;
+	[[nodiscard]] HostCensus TakeHostCensus() const;
 
-	void OpenManifest();
-	void CloseManifest();
-	void RecordModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
-	                  std::span<const uint32_t> code, uint32_t push_data_cursor,
-	                  const ShaderModule& module);
-	void RecordPipeline(const GraphicsPipelineKey& key);
-	void RecordLayout(uint64_t key, const ShaderTessellationInputInfo& layout);
-	static void OnShaderMapped(void* userdata, uint64_t hash, std::span<const uint32_t> code);
-	bool ProvideCode(uint64_t hash, std::span<const uint32_t> code, bool from_guest);
-	void CodeStoreThread(const std::stop_token& stop);
-	bool ScanGameFiles(const std::stop_token&                                          stop,
-	                   const std::function<void(uint64_t, std::span<const uint32_t>)>& append);
-	void ManifestWorker(const std::stop_token& stop);
-	std::pair<uint32_t, uint32_t> AddManifestRecords(PipelineManifest& loaded);
-	void ReloadSharedManifest();
-	void BuildManifestModule(uint32_t index, std::span<const uint32_t> code,
-	                         std::span<const uint32_t> back_code, bool guest_traversal = false);
-	void CreateManifestPipeline(uint32_t index);
-	void CreateManifestComputePipeline(const ShaderModule& module, const std::vector<uint32_t>& spirv,
-	                                   bool from_assets);
-	void SetHostInput(ManifestModule& module) const;
-	const ShaderModule* FindCompiledModule(
-	    const ProgramKey& key, const ShaderRecompiler::IR::ResourceSpecialization& specialization,
-	    uint32_t push_data_cursor) const;
-	void ManifestProgress(bool force);
-	void SaveManifestRecording();
-	struct ManifestBacklog {
-		uint32_t modules         = 0;
-		uint32_t compute_modules = 0;
-		uint32_t pipelines       = 0;
-		uint32_t running         = 0;
-		bool     scanning        = false;
-		uint64_t modules_done    = 0;
-		uint64_t pipelines_done  = 0;
-		uint32_t threads         = 0;
-		double   module_seconds   = 0.0;
-		double   pipeline_seconds = 0.0;
-	};
-	[[nodiscard]] ManifestBacklog GetManifestBacklog() const;
+	// GPU thread, once per frame (RenderContext::RunGarbageCollector): pipelines no lookup returned for
+	// PipelineIdleFrames frames give their Vulkan objects back (destroyed once the GPU finished the open tick); a later
+	// lookup creates them again (the driver cache has them). Each pipeline is ~0.7 MiB of host memory (24.10):
+	// kept until the end of the session before: ~5 GB per hour of play.
+	void EvictIdlePipelines(CommandScheduler& scheduler);
 
-	struct UseOrder;
-	struct UseOrderDeleter {
-		void operator()(UseOrder* order) const;
-	};
-	std::unique_ptr<UseOrder, UseOrderDeleter> m_use_order;
-	void OpenUseOrder(const std::filesystem::path& path);
-	void NoteUse(Pipeline& pipeline, std::span<const ShaderModule* const> stages);
-	static constexpr uint32_t MappedRank = PipelineHelpers::NoRank - 1;
-	[[nodiscard]] uint32_t    UseRank(uint64_t program_hash) const;
+private:
+	uint32_t m_last_eviction = 0;
+	uint64_t m_evicted = 0, m_recreated = 0;
+	void     RecreateComputePipeline(Pipeline& pipeline, const ShaderComputeInputInfo& input_info,
+	                                 const ShaderProgram& compute_program);
+	void     RecreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                                  std::span<const ShaderVertexInputInfo> vertex_info,
+	                                  const ShaderPixelInputInfo* ps_input_info, const GraphicsPrograms& programs);
 };
+
+void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+
+// The SPIR-V profile of this device's shader compiles (upstream 460a196fc, 286481889). Every compile of a program uses
+// it: ProgramCache::Get, and the background compiles of KYTY_SHADER_PRECOMPILE, whose modules the GPU thread reuses.
+[[nodiscard]] ShaderRecompiler::Spirv::Profile ShaderCompileProfile(const GraphicContext& graphics);
+// KYTY_TRACE_PERF: one "PERF shader_reuse" line (totals since the start) while the shader reuse is on
+// (shaderPrecompile.h).
+void ReportShaderReusePerf();
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const PipelineRenderingState&          rendering,
+                            const PipelineVertexInputState&        vertex_input,
+                            std::span<const ShaderVertexInputInfo> vertex_info,
+                            const ShaderPixelInputInfo*            ps_input_info,
+                            const PipelineCache::GraphicsPrograms& programs,
+                            const PipelineStaticParameters&        static_params,
+                            vk::PipelineCache                      driver_cache);
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const ShaderComputeInputInfo& input_info,
+                            vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+// Why the graphics CreatePipelineInternal would exit on this pipeline on this device, or null: a device feature it
+// needs or a value its state helpers reject. The stages' programs must be set. The background compiles
+// (shaderPrecompile.h) skip such records: their journal may hold another build's records.
+[[nodiscard]] const char* GraphicsPipelineUnsupported(const GraphicContext& graphics,
+                                                      const PipelineRenderingState&          rendering,
+                                                      const PipelineVertexInputState&        vertex_input,
+                                                      std::span<const ShaderVertexInputInfo> vertex_info,
+                                                      const ShaderPixelInputInfo*            ps_input_info,
+                                                      const PipelineStaticParameters&        static_params);
 
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native = true);
 
-std::string PipelineCacheTitleId();
-std::filesystem::path ShaderStorePath();
-ShaderRecompiler::Spirv::Profile SpirvProfile(const GraphicContext& graphics);
+} // namespace Libs::Graphics
 
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const GraphicsPipelineKey&                 key,
-                            const std::array<const ShaderModule*, 4>& stages,
-                            vk::PipelineCache                          driver_cache);
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const ShaderModule& module, vk::PipelineCache driver_cache);
-bool FindComputePipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                         const ShaderModule& module, vk::PipelineCache cache);
-struct DriverCreations {
-	uint32_t running = 0;
-	uint32_t slow    = 0;
-	double   longest = 0.0;
-};
-[[nodiscard]] DriverCreations GetDriverCreations(double slow_seconds);
-void DescribeDriverPipelineCreation(std::string& report);
-
-[[nodiscard]] std::vector<uint8_t> EncodeComputeModule(const ShaderModule&          module,
-                                                       const std::vector<uint32_t>& spirv);
-[[nodiscard]] bool EncodeModuleRecord(ShaderType stage, uint64_t hash, uint32_t user_data_count,
-                                      const std::vector<uint32_t>&              static_state,
-                                      const ShaderRecompiler::IR::ResourcePlan& plan,
-                                      const ShaderModule& module, const std::vector<uint32_t>& spirv,
-                                      const std::vector<uint32_t>& plain_spirv,
-                                      std::vector<uint8_t>&        record);
-bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
-                         std::vector<uint32_t>& spirv);
-
-}
-
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_PIPELINECACHE_H_

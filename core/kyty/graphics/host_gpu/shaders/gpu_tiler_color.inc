@@ -1,3 +1,4 @@
+// ColorTransform values match imageInfo.h. Preserve the component bit fields exactly.
 uvec2 transform_color(uvec2 value, uint transform, bool to_host) {
 	switch (transform) {
 		case 1u:

@@ -2,6 +2,7 @@
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_
 
 #include "common/common.h"
+// #include "common/subsystems.h"
 
 #include "common/abi.h"
 #include "kernel/eventQueue.h"
@@ -11,7 +12,7 @@
 namespace Libs::Graphics {
 class CommandBuffer;
 class Presenter;
-}
+} // namespace Libs::Graphics
 
 namespace Libs::VideoOut {
 
@@ -35,8 +36,12 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
+	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
-	void WaitFlipDone(const uint64_t* label);
+	// waitUntilSafeForRendering (default): blocks until no flip of the buffer is pending.
+	void WaitFlipDone(int handle, int index);
+	// KYTY_UPSTREAM_FLIP_SUSPEND=1 (upstream a358b847c): non-blocking; false also arms a GPU wake for the next flip.
+	[[nodiscard]] bool IsSafeForRendering(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
 
@@ -47,7 +52,6 @@ private:
 [[nodiscard]] VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height,
                                            Graphics::Presenter& presenter);
 void                          VideoOutShutdown();
-uint64_t* VideoOutGetBufferLabels(int handle, int* bus);
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
@@ -105,6 +109,6 @@ KYTY_SYSV_ABI int VideoOutLatencyMeasureSetStartPoint(int handle, uint32_t point
 KYTY_SYSV_ABI int VideoOutColorSettingsSetGamma(VideoOutColorSettings* settings, float gamma);
 KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* settings);
 
-}
+} // namespace Libs::VideoOut
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_VIDEOOUT_H_ */

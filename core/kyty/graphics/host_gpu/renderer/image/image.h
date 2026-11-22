@@ -5,10 +5,9 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
-#include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/drawRepeat.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
-#include <algorithm>
 #include <array>
 #include <atomic>
 #include <compare>
@@ -17,9 +16,11 @@
 #include <optional>
 #include <span>
 #include <utility>
+#include <atomic>
 #include <vector>
 
 namespace Libs::Graphics {
+
 
 class Buffer;
 class CommandScheduler;
@@ -34,9 +35,28 @@ struct CachedImageView {
 };
 
 struct ImageUsage {
+	// texture / depth_target: kept although nothing in the renderer reads them (upstream 8f7d74538 removed them); our
+	// tests check them.
+	bool texture       = false;
+	bool storage       = false;
 	bool render_target = false;
+	bool depth_target  = false;
 	bool video_out     = false;
 };
+
+// The bindless layout memo (CommitBindings): bumped whenever the layout of an image with Image::bindless_watched changes.
+inline std::atomic<uint64_t> g_bindless_layout_epoch {1};
+// Bindless table refresh events (on with the tables): the images with
+// Image::bindless_watched whose layout changed, in order (entry n is position base + n); a bindless table lists for a
+// draw's layout walk only those of its images logged since its last listing (RenderExecutor::PrepareBindlessTable).
+// Trimmed once per frame (base rises).
+struct BindlessLayoutLog {
+	std::mutex           mutex;
+	std::vector<ImageId> ids;
+	uint64_t             base = 0;
+};
+inline BindlessLayoutLog g_bindless_layout_log;
+inline std::atomic<bool> g_bindless_layout_log_on {false};
 
 struct ImageBinding {
 	vk::ImageLayout  attachment_layout = vk::ImageLayout::eUndefined;
@@ -48,6 +68,7 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -55,13 +76,41 @@ public:
 	KYTY_CLASS_NO_COPY(Image);
 
 	[[nodiscard]] vk::ImageView FindView(const ImageViewInfo& view_info);
-	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// Project 15 S2b: the cached view FindView would return, or null when it would create one (no write).
+	[[nodiscard]] vk::ImageView FindViewExisting(const ImageViewInfo& view_info) const;
+	[[nodiscard]] ImageViewInfo NormalizeView(const ImageViewInfo& view_info) const;
+	// GetBarriers' result: the usual one barrier for the whole image (or two) without a heap allocation (7.11:
+	// Transit runs for most draws and dispatches); more spill into the vector.
+	class Barriers {
+	public:
+		void push_back(const vk::ImageMemoryBarrier2& barrier) {
+			if (m_heap.empty() && m_count < m_inline.size()) {
+				m_inline[m_count++] = barrier;
+				return;
+			}
+			if (m_heap.empty()) m_heap.assign(m_inline.begin(), m_inline.begin() + m_count);
+			m_heap.push_back(barrier);
+		}
+		[[nodiscard]] const vk::ImageMemoryBarrier2* data() const {
+			return m_heap.empty() ? m_inline.data() : m_heap.data();
+		}
+		[[nodiscard]] size_t size() const { return m_heap.empty() ? m_count : m_heap.size(); }
+		[[nodiscard]] bool   empty() const { return size() == 0; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2& operator[](size_t i) const { return data()[i]; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* begin() const { return data(); }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* end() const { return data() + size(); }
+
+	private:
+		std::array<vk::ImageMemoryBarrier2, 2> m_inline {};
+		uint32_t                               m_count = 0;
+		std::vector<vk::ImageMemoryBarrier2>   m_heap;
+	};
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
 	                                   std::optional<ImageSubresourceRange> range);
 	void Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-	             std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer);
+	             std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer);
 	void Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	            uint64_t size);
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -72,56 +121,10 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
-	[[nodiscard]] static uint64_t CpuDirtyEpoch() noexcept {
-		return s_cpu_dirty_epoch.load(std::memory_order_relaxed);
-	}
-
 	void MarkCpuDirty() {
-		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
-		DropPartialDirty();
 		HeapChanged();
-	}
-
-	[[nodiscard]] bool CanTakePartialDirty() const noexcept {
-		return !m_maybe_cpu_dirty && (!m_cpu_dirty || m_partial_dirty);
-	}
-	void InvalidateCpuWritePartial(uint64_t begin, uint64_t end) {
-		if (!CanTakePartialDirty() || begin >= end) {
-			EXIT("image cannot take a partial CPU write\n");
-		}
-		if (!m_cpu_dirty) {
-			m_cpu_dirty     = true;
-			m_partial_dirty = true;
-			m_dirty_ranges.clear();
-		}
-		AddRange(m_dirty_ranges, begin, end);
-		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
-		HeapChanged();
-	}
-	[[nodiscard]] bool IsPartiallyCpuDirty() const noexcept { return m_cpu_dirty && m_partial_dirty; }
-	[[nodiscard]] const std::vector<std::pair<uint64_t, uint64_t>>& CpuDirtyRanges() const noexcept {
-		return m_dirty_ranges;
-	}
-	void DropPartialDirty() noexcept {
-		m_partial_dirty = false;
-		m_dirty_ranges.clear();
-	}
-	static void AddRange(std::vector<std::pair<uint64_t, uint64_t>>& ranges, uint64_t begin,
-	                     uint64_t end) {
-		auto at = ranges.begin();
-		while (at != ranges.end() && at->second < begin) {
-			++at;
-		}
-		auto last = at;
-		while (last != ranges.end() && last->first <= end) {
-			begin = std::min(begin, last->first);
-			end   = std::max(end, last->second);
-			++last;
-		}
-		at = ranges.erase(at, last);
-		ranges.insert(at, {begin, end});
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
@@ -131,52 +134,65 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
-			s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 			HeapChanged();
 		}
 	}
-	void ResolveMaybeCpuHash(uint64_t hash) {
+	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
+		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
+			EXIT("image cannot resolve maybe-dirty hash\n");
+		}
 		m_maybe_cpu_dirty = false;
-		m_cpu_dirty       = hash != m_maybe_cpu_hash;
-		StateChanged();
+		m_cpu_dirty |= hash != m_maybe_cpu_hash;
+		return m_cpu_dirty;
 	}
 
 	void RefreshComplete() {
+		if (!IsCpuDirty()) {
+			EXIT("clean image cannot complete a refresh\n");
+		}
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
-		DropPartialDirty();
-		StateChanged();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept {
-		if (!m_gpu_modified) {
-			m_gpu_modified = true;
-			StateChanged();
-		}
+		m_gpu_modified = true;
+		content_serial = NextContentSerial();
 	}
-	void ClearGpuModified() noexcept {
-		if (m_gpu_modified) {
-			m_gpu_modified = false;
-			StateChanged();
-		}
-	}
+	// KYTY_WORKAROUND_ALIAS_SYNC: the write that produced this image's contents (monotonic over all
+	// images), so same-address aliases of another extent can take over newer data.
+	uint64_t content_serial = 0;
+	// KYTY_WORKAROUND_STENCIL_PLANE_SYNC: content_serial of the last shader (storage) write, not of host-side copies.
+	uint64_t shader_write_serial = 0;
+	// content_serial last copied into a buffer that reads this image's memory.
+	uint64_t buffer_sync_serial = 0;
+	// KYTY_FIX_SHARED_IMAGE_MEMORY: content_serial of the newest overlapping image already merged into this one.
+	uint64_t alias_synced_serial = 0;
+	// The bytes [read_address, read_address + read_size) of this image are not in guest memory yet and its pages are under
+	// the image read watch (TextureCache::ArmImageRead).
+	bool     read_armed   = false;
+	bool     read_lifted  = false; // armed, but a page of it was opened without a serve (the next write closes it)
+	uint64_t read_address = 0;
+	uint64_t read_size    = 0;
+	// KYTY_WORKAROUND_PRESERVE_STENCIL: the stencil was restored on the GPU; skip the guest-memory refresh.
+	bool stencil_restored = false;
+	// KYTY_WORKAROUND_PRESERVE_STENCIL: guest stencil plane currently held by this depth image's stencil aspect.
+	uint64_t stencil_plane_address = 0;
+	static uint64_t NextContentSerial() noexcept { return ++s_content_serial; }
+	static inline uint64_t s_content_serial = 0;
+	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
-		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void ClearBufferModified() noexcept {
-		if (m_buffer_modified) {
-			m_buffer_modified = false;
-			StateChanged();
-		}
-	}
+	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
-	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size) const noexcept {
-		return info.data.address < address + size && address < info.data.End();
+	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
+	                            bool pages = false) const noexcept {
+		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
+		             : ImageRangeOverlaps(info.data.address, info.data.size, address, size);
 	}
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
@@ -190,65 +206,90 @@ public:
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
 	}
-	struct HeapChange {
-		GuestRange data;
-		uint64_t   serial = 0;
-	};
-
-	void StateChanged() const noexcept {
-		state_epoch.fetch_add(1u, std::memory_order_relaxed);
-		if (version != nullptr) {
-			version->fetch_add(1u, std::memory_order_release);
-		}
-	}
-	static inline std::atomic<uint64_t> state_epoch {0};
-	[[nodiscard]] static uint64_t       StateEpoch() noexcept { return state_epoch.load(std::memory_order_relaxed); }
-	void HeapChanged() const {
-		StateChanged();
+	// Resident image heaps sample an image without rediscovering it until one changes its
+	// contents, tracking, identity or layout.
+	void HeapChanged() const noexcept {
+		// The bindless slot journal: a table slot's replay check reads the serial of the image it pins (journaled first).
+		if (bindless_pinned && g_table_slot_journal_on.load(std::memory_order_relaxed))
+			JournalTableImage((uint64_t {self_id.generation} << 32u) | self_id.index);
+		change_serial++; // bindless table refresh events
 		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
-			std::scoped_lock lock {heap_mutex};
-			heap_changes.push_back({info.data, serial});
+			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
 		}
 	}
+	// Bindless table refresh events (E1 fast version): bumped with every change HeapChanged reports (CPU-dirty
+	// marks, buffer writes, untracking, leaving the read layout), whether a heap references the image or not.
+	mutable uint32_t change_serial = 0;
 
-	static inline std::mutex              heap_mutex;
-	static inline std::vector<HeapChange> heap_changes;
-	static inline std::atomic<uint64_t>   serials {0};
+	static inline std::atomic<uint64_t> heap_epoch {0};
+	static inline std::atomic<uint64_t> serials {0};
 
+	// Unique per image, unlike ImageId: freed slots are reused.
 	const uint64_t   serial = serials.fetch_add(1u, std::memory_order_relaxed) + 1u;
-	uint64_t         validity = 0;
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
+	// table (TextureCache::on_bindless_unregister) to repoint the slot.
+	bool             bindless_pinned = false;
+	// Checked by CommitBindings' bindless layout walk; its layout changes bump
+	// g_bindless_layout_epoch (GetBarriers, the only writer of backing.state).
+	bool             bindless_watched = false;
+	ImageId          self_id {}; // bindless table refresh events: its own id (set by TextureCache when inserted)
+	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
-	std::vector<std::pair<uint64_t, uint64_t>> untracked_holes;
-	bool             partial_candidate = false;
 	ImageId          depth_id {};
-	uint64_t         write_count        = 0;
-	uint64_t         candidate_clear_key = 0;
-	bool             is_depth_copy      = false;
-	ImageId          depth_copy_source {};
-	uint64_t         depth_copy_writes  = UINT64_MAX;
-	bool             is_stencil_copy     = false;
-	uint64_t         stencil_copy_writes = 0;
+	// Stencil associations that refer to this depth image.
 	std::vector<ImageId> stencil_ids;
+	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint32_t         registrations      = 0;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
+	// TextureCache::TouchImage: the GC tick of the image's last LRU touch (or registration); a touch
+	// at the same tick changes nothing. ~0: not registered yet.
+	uint64_t         lru_touch_tick     = ~uint64_t {0};
+	// TextureCache::FindTextureReplay: 1 + the image-page epoch of the image's first page when
+	// SyncExtentAliases found no same-address alias it could copy from (0: not known).
+	uint64_t         alias_free_epoch   = 0;
+	// KYTY_FIX_SHARED_IMAGE_MEMORY (TextureCache::SyncSharedImageMemory): the other registered images overlapping this
+	// image's memory, valid while shared_overlap_epoch is 1 + the exact image-page epoch sum of that memory (0: not known).
+	std::vector<ImageId> shared_overlaps;
+	uint64_t             shared_overlap_epoch = 0;
+	// KYTY_FIX_IMAGE_MEMORY_OWNER: another image or guest memory took bytes of this image's memory since its last sync
+	// (TextureCache::OwnerSyncImage has work to check); set under m_lock exclusively, with HeapChanged().
+	bool                 owner_stale = false;
+	// KYTY_FIX_IMAGE_MEMORY_OWNER, the proofs that a sync has nothing to do (under m_lock exclusively):
+	// owner_disturbed rises with every holder change over its memory by others and every read of its bytes by others
+	// (OwnerDisturb, pulls and copies from it); owner_run_disturbed is its value at the image's own last write, so equal
+	// values mean its draw run (or storage write) is untouched since. owner_memo_rect: that write's draw rectangle.
+	// owner_sole: it holds every byte of its memory and no other image holds any of them. owner_adopt_registry /
+	// owner_alone_registry: the image registry epoch at which its overlap set was adopted / found empty.
+	uint64_t                owner_disturbed      = 0;
+	uint64_t                owner_run_disturbed  = 0;
+	std::array<int32_t, 5>  owner_memo_rect      {}; // valid flag, x0, y0, x1, y1 (valid 0: no memo)
+	bool                    owner_sole           = false;
+	uint64_t                owner_adopt_registry = 0;
+	uint64_t                owner_alone_registry = 0;
+	// KYTY_FIX_SHARED_IMAGE_MEMORY=3/4 (probe): the image was filled with the probe pattern (or, =4, would have been)
+	// when other images had written its memory; the next binds look for it (TextureCache::ProbeSharedImageRead).
+	uint8_t              probe_pending = 0;
+	uint8_t              probe_checks  = 0;
+	// TextureCache::RegisterImage: the AccountedSize() counted for it while registered (KYTY_TRACE_PERF images=).
+	uint64_t         registered_bytes   = 0;
+	// KYTY_VRAM_GC_FIX: the collector recorded its download and frees it once the bytes are in guest memory.
+	bool             eviction_pending   = false;
+	// The plan flags (S2 step B.3): draws being prepared that bind this image (as a texture or target); their
+	// flags are in the draw's plan until it is committed. Counts as "bound" where the cache asks (needs_rebind).
+	uint16_t         plan_uses          = 0;
+	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
-	uint64_t         lru_tick           = 0;
-	uint32_t         table_pins         = 0;
-	uint64_t         readback_begin     = 0;
-	uint64_t         readback_end       = 0;
-#if defined(ANYPS5_KYTY)
-	std::array<uint64_t, 4> target_frames {};
-#endif
-	std::atomic<uint32_t>* version = nullptr;
+	// Texture relocation: steady-clock ms of its last move to another VMA block (0: never), so a texture is not moved back and
+	// forth between blocks.
+	uint64_t         texmove_ms         = 0;
 
 private:
 	friend struct ImageTestAccess;
@@ -264,13 +305,8 @@ private:
 	uint64_t          m_maybe_cpu_hash  = 0;
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
-	bool              m_partial_dirty   = false;
-	std::vector<std::pair<uint64_t, uint64_t>> m_dirty_ranges;
 	bool              m_gpu_modified    = false;
 	bool              m_buffer_modified = false;
-
-	inline static std::atomic<uint64_t> s_next_serial {0};
-	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {1};
 };
 
 namespace ImageOps {
@@ -278,8 +314,8 @@ namespace ImageOps {
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
 
-}
+} // namespace ImageOps
 
-}
+} // namespace Libs::Graphics
 
-#endif
+#endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_IMAGE_H_

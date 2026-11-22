@@ -1,15 +1,25 @@
 #include "common/hostStats.h"
 
 #include "common/config.h"
-#include "common/timer.h"
 
 #include <algorithm>
+#include <chrono>
 #include <thread>
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#include <windows.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+// clang-format off
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+// clang-format on
+#include <string>
+#include <vector>
+#pragma comment(lib, "pdh.lib")
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
@@ -32,6 +42,7 @@ namespace Common {
 
 namespace {
 
+// Cumulative counters; rates come from the difference between two samples.
 struct Counters {
 	struct Thread {
 		uint64_t    cpu_ns;
@@ -49,15 +60,66 @@ struct Counters {
 	uint64_t                             wall_ns = 0;
 };
 
+uint64_t WallNanoseconds() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
 uint64_t FileTimeTo100Ns(const FILETIME& time) {
 	return (static_cast<uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime;
 }
 
-struct PlatformState {};
+// GPU utilization of this process (11.11: the overlay's "GPU" row was n/a on Windows - only macOS read it): the
+// Windows performance counter behind Task Manager's GPU column, "\GPU Engine(pid_<pid>_*engtype_3D)\Utilization
+// Percentage", summed over the matching engine instances and clamped to 100. The first sample has no value (PDH needs
+// two collections for a rate).
+struct PlatformState {
+	PDH_HQUERY   query   = nullptr;
+	PDH_HCOUNTER counter = nullptr;
+	bool         tried   = false;
+	~PlatformState() {
+		if (query != nullptr) PdhCloseQuery(query);
+	}
+};
 
-void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
+void SampleGpu(PlatformState& state, HostStats& stats) {
+	if (!state.tried) {
+		state.tried = true;
+		if (PdhOpenQueryW(nullptr, 0, &state.query) != ERROR_SUCCESS) {
+			state.query = nullptr;
+			return;
+		}
+		const std::wstring path = L"\\GPU Engine(pid_" + std::to_wstring(GetCurrentProcessId()) +
+		                          L"_*engtype_3D)\\Utilization Percentage";
+		if (PdhAddEnglishCounterW(state.query, path.c_str(), 0, &state.counter) != ERROR_SUCCESS) {
+			PdhCloseQuery(state.query);
+			state.query   = nullptr;
+			state.counter = nullptr;
+			return;
+		}
+		PdhCollectQueryData(state.query);
+		return;
+	}
+	if (state.query == nullptr || PdhCollectQueryData(state.query) != ERROR_SUCCESS) return;
+	DWORD bytes = 0, count = 0;
+	if (PdhGetFormattedCounterArrayW(state.counter, PDH_FMT_DOUBLE, &bytes, &count, nullptr) != PDH_MORE_DATA) return;
+	std::vector<unsigned char> buffer(bytes);
+	auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+	if (PdhGetFormattedCounterArrayW(state.counter, PDH_FMT_DOUBLE, &bytes, &count, items) != ERROR_SUCCESS) return;
+	double sum = 0.0;
+	for (DWORD i = 0; i < count; i++) {
+		if (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA || items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA) {
+			sum += items[i].FmtValue.doubleValue;
+		}
+	}
+	stats.gpu_percent = std::min(100.0, sum);
+}
+
+void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
+	SampleGpu(state, stats);
 	const auto process = GetCurrentProcess();
 	FILETIME   creation {};
 	FILETIME   exit {};
@@ -68,6 +130,7 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 	}
 	FILETIME idle {};
 	if (GetSystemTimes(&idle, &kernel, &user) != 0) {
+		// Kernel time includes idle time.
 		now.system_total = FileTimeTo100Ns(kernel) + FileTimeTo100Ns(user);
 		now.system_busy  = *now.system_total - FileTimeTo100Ns(idle);
 	}
@@ -164,6 +227,7 @@ std::string RegistryString(io_object_t service, CFStringRef key) {
 			result = buffer;
 		}
 	} else if (CFGetTypeID(value) == CFDataGetTypeID()) {
+		// Intel Macs store the model as NUL-terminated data.
 		const auto* data   = static_cast<CFDataRef>(value);
 		const auto* bytes  = reinterpret_cast<const char*>(CFDataGetBytePtr(data));
 		const auto  length = static_cast<size_t>(CFDataGetLength(data));
@@ -173,6 +237,7 @@ std::string RegistryString(io_object_t service, CFStringRef key) {
 	return result;
 }
 
+// IOAccelerator exposes whole-device statistics; there is no per-process figure.
 void SampleGpu(PlatformState& state, HostStats& stats) {
 	io_iterator_t iterator = 0;
 	if (IOServiceGetMatchingServices(MACH_PORT_NULL, IOServiceMatching("IOAccelerator"),
@@ -282,6 +347,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 		now.system_total    = busy + load.cpu_ticks[CPU_STATE_IDLE];
 	}
 
+	// Physical footprint is what Activity Monitor shows in its Memory column.
 	task_vm_info_data_t    vm_info {};
 	mach_msg_type_number_t vm_info_count = TASK_VM_INFO_COUNT;
 	if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info),
@@ -305,6 +371,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	if (host_page_size(state.host, &page) == KERN_SUCCESS &&
 	    host_statistics64(state.host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
 	                      &count) == KERN_SUCCESS) {
+		// Activity Monitor's "Memory Used": app memory + wired + compressed.
 		const uint64_t app       = vm.internal_page_count > vm.purgeable_count
 		                               ? vm.internal_page_count - vm.purgeable_count
 		                               : 0;
@@ -321,12 +388,14 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 		stats.swap_total = swap->xsu_total;
 	}
 
+	// 1 = normal, 2 = warning, 4 = critical, as reported to dispatch memory-pressure sources.
 	if (const auto level = SysctlValue<int>("kern.memorystatus_vm_pressure_level")) {
 		stats.memory_pressure = *level >= 4   ? MemoryPressure::Critical
 		                        : *level >= 2 ? MemoryPressure::Warning
 		                                      : MemoryPressure::Normal;
 	}
 
+	// 0 nominal, 1 moderate, 2 heavy, 3 trapping, 4 sleeping.
 	if (!state.thermal_ready) {
 		state.thermal_ready = notify_register_check("com.apple.system.thermalpressurelevel",
 		                                            &state.thermal_token) == NOTIFY_STATUS_OK;
@@ -348,6 +417,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 
 using ProcValues = std::unordered_map<std::string, uint64_t>;
 
+// Reads "<key>: <number> [kB]" lines; kB values are returned in bytes.
 ProcValues ReadProcValues(const char* path) {
 	ProcValues    values;
 	std::ifstream file(path);
@@ -386,13 +456,14 @@ void SampleThreads(HostStats& stats, Counters& now) {
 		std::string   stat;
 		uint64_t      id = 0;
 		if (!(stat_file >> id)) {
-			continue;
+			continue; // The thread may have exited during enumeration.
 		}
 		std::getline(stat_file, stat);
 		const auto close = stat.rfind(')');
 		if (close == std::string::npos) {
 			continue;
 		}
+		// Fields after the command name start at field 3 (state); utime and stime are 14 and 15.
 		std::istringstream fields(stat.substr(close + 2));
 		std::string        field;
 		for (int index = 3; index < 14 && fields >> field; index++) {
@@ -412,7 +483,7 @@ void SampleThreads(HostStats& stats, Counters& now) {
 	}
 }
 
-void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
+void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	SampleRusage(now);
 
 	std::ifstream cpu_file("/proc/stat");
@@ -423,7 +494,7 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 		uint64_t value = 0;
 		for (int index = 0; index < 8 && cpu_file >> value; index++) {
 			total += value;
-			if (index == 3 || index == 4) {
+			if (index == 3 || index == 4) { // idle, iowait
 				idle += value;
 			}
 		}
@@ -460,6 +531,7 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 		stats.swap_used  = *swap_total - *swap_free;
 	}
 
+	// Pressure stall information: share of the last 10 s some task waited on memory.
 	std::ifstream pressure("/proc/pressure/memory");
 	std::string   kind;
 	std::string   average;
@@ -484,7 +556,7 @@ void SamplePlatform(PlatformState& , HostStats& stats, Counters& now) {
 
 constexpr size_t BUSIEST_THREADS = 6;
 
-}
+} // namespace
 
 struct HostStatsSampler::Impl {
 	PlatformState state;
@@ -502,7 +574,7 @@ HostStats HostStatsSampler::Sample() {
 	stats.logical_cores = m_impl->logical_cores;
 
 	Counters now;
-	now.wall_ns = Common::SteadyNs();
+	now.wall_ns = WallNanoseconds();
 	SamplePlatform(m_impl->state, stats, now);
 
 	const auto& last    = m_impl->last;
@@ -533,6 +605,7 @@ HostStats HostStatsSampler::Sample() {
 		stats.disk_write_per_s       = rate(now.disk_write, last.disk_write);
 
 		for (const auto& [id, thread]: now.threads) {
+			// A thread missing from the last sample started during this interval.
 			const auto     previous = last.threads.find(id);
 			const uint64_t before   = previous != last.threads.end() ? previous->second.cpu_ns : 0;
 			if (thread.cpu_ns < before) {
@@ -554,4 +627,4 @@ HostStats HostStatsSampler::Sample() {
 	return stats;
 }
 
-}
+} // namespace Common

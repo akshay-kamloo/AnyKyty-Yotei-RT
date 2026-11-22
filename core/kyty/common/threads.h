@@ -2,94 +2,117 @@
 #define KYTY_COMMON_THREADS_H_
 
 #include "common/common.h"
+#include "common/gpuStageCores.h"
 
+#include <memory>
 #include <span>
-
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-#include <condition_variable>
-#include <mutex>
-#endif
+#include <string>
+#include <vector>
 
 namespace Common {
 
 void InitializeThreads();
 
+// CPU time (user + kernel) the calling thread has used, ns (0 where unknown).
+uint64_t CurrentThreadCpuNs();
+
+using thread_func_t    = void (*)(void*);
 using wait_poll_func_t = void (*)();
 
-namespace Thread {
+struct ThreadPrivate;
+struct MutexPrivate;
+struct CondVarPrivate;
 
-void SleepMicro(uint32_t micros);
-void SleepNano(uint64_t nanos);
-bool IsMainThread();
-int GetThreadIdUnique();
+class Thread {
+public:
+	Thread(thread_func_t func, void* arg);
+	~Thread();
 
-void RaiseCurrentPriority();
-void LowerCurrentPriority();
-void PinCurrent(int logical_cpu);
+	void Join();
+	void Detach();
 
-void ReserveCores(std::span<const int> logical_cpus);
-bool HasReservedCore();
+	// Once a thread has finished, the id may be reused by another thread.
+	[[nodiscard]] std::string GetId() const;
 
-#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-void KeepCurrentOnLargestCache();
-#endif
+	// The id is unique and can't be reused by another thread.
+	[[nodiscard]] int GetUniqueId() const;
 
-}
+	static void SleepMicro(uint32_t micros);
+	static void SleepNano(uint64_t nanos);
+	static bool IsMainThread();
+	// Current thread: raises its priority to "highest", and restricts it to one logical
+	// processor (when `logical_cpu` is not negative). No-ops where unsupported.
+	// Based on TheCruZ/KytyPS5-GTA 12ec19890 (threads.h), GPL-2.0.
+	static void RaiseCurrentPriority();
+	static void PinCurrent(int logical_cpu);
+	// Keeps the threads of the process that pick no processors themselves off the physical cores
+	// of `logical_cpus` (and their SMT siblings), for threads pinned there, when at least
+	// `min_other_cores` other physical cores remain. Returns what was done.
+	// Based on TheCruZ/KytyPS5-GTA dd7a6e008 (threads.h), GPL-2.0.
+	static std::string ReserveCores(std::span<const int> logical_cpus, size_t min_other_cores);
+	// The logical processors of group 0 with their physical core, efficiency class and last-level cache (empty where
+	// unknown).
+	static std::vector<LogicalCpu> SystemLogicalCpus();
+
+	// Get current thread id
+	// Once a thread has finished, the id may be reused by another thread.
+	static std::string GetThreadId();
+
+	// Get current thread id
+	// The id is unique and can't be reused by another thread.
+	static int GetThreadIdUnique();
+
+	// Names the calling thread for the OS tools (Windows: SetThreadDescription when available).
+	static void SetCurrentName(const char* name);
+	// The calling thread's name (SetCurrentName; Windows thread description), "" if none or unsupported.
+	[[nodiscard]] static std::string GetCurrentName();
+
+	KYTY_CLASS_NO_COPY(Thread);
+
+private:
+	std::unique_ptr<ThreadPrivate> m_thread;
+};
 
 class Mutex {
 public:
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Mutex();
 	~Mutex();
 
 	void Lock();
 	void Unlock();
+	bool TryLock();
+
+	friend class CondVar;
 
 	KYTY_CLASS_NO_COPY(Mutex);
 
 private:
-	alignas(8) unsigned char m_cs[40];
-#else
-	void Lock() { m_mutex.lock(); }
-	void Unlock() { m_mutex.unlock(); }
-
-private:
-	std::recursive_mutex m_mutex;
-#endif
-
-	friend class CondVar;
+	std::unique_ptr<MutexPrivate> m_mutex;
 };
 
 class CondVar {
 public:
-	CondVar() = default;
+	CondVar();
+	~CondVar();
 
 	void Wait(Mutex* mutex);
 	bool WaitFor(Mutex* mutex, uint32_t micros);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	void Signal();
 	void SignalAll();
-#else
-	void Signal() { m_cv.notify_one(); }
-	void SignalAll() { m_cv.notify_all(); }
-#endif
 
 	static void SetWaitPollCallback(wait_poll_func_t callback);
 
 	KYTY_CLASS_NO_COPY(CondVar);
 
 private:
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	void* m_cv = nullptr;
-#else
-	std::condition_variable_any m_cv;
-#endif
+	std::unique_ptr<CondVarPrivate> m_cond_var;
 };
 
 class LockGuard {
 public:
 	using mutex_type = Mutex;
 
+	// NOLINTNEXTLINE(google-runtime-references)
 	explicit LockGuard(mutex_type& m): m_mutex(m) { m_mutex.Lock(); }
 
 	~LockGuard() { m_mutex.Unlock(); }
@@ -100,6 +123,6 @@ private:
 	mutex_type& m_mutex;
 };
 
-}
+} // namespace Common
 
-#endif
+#endif /* KYTY_COMMON_THREADS_H_ */

@@ -5,24 +5,46 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
-#include "loader/timer.h"
+#include "loader/timer.h" // IWYU pragma: keep
+
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 
 #include <fmt/format.h>
 
+namespace Libs {
+// KYTY_PRINT_HLE=1 (diagnostic): every library's PRINT_NAME() on from the start (with a printf direction other than
+// Silent), so the HLE calls before a crash are in the log; compared 28.10 with chenxiao's fork running Ghost of Yotei.
+inline bool PrintHleNamesDefault() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PRINT_HLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+} // namespace Libs
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
 
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLE(flag) PRINT_NAME_ENABLED = flag;
 
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_DEFINE(name) void name(Loader::SymbolDatabase* s)
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_NAME(l, m)                                                                             \
-	[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = false;                          \
+	[[maybe_unused]] static thread_local bool PRINT_NAME_ENABLED = ::Libs::PrintHleNamesDefault();                          \
 	static constexpr char                     g_library[]        = l;                              \
 	static constexpr char                     g_module[]         = m;
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_VERSION(l, lv, m, mv1, mv2)                                                            \
 	LIB_NAME(l, m);                                                                                \
 	static constexpr int g_library_version      = lv;                                              \
 	static constexpr int g_module_version_major = mv1;                                             \
 	static constexpr int g_module_version_minor = mv2;
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_ADD(n, f, t)                                                                           \
 	{                                                                                              \
 		Loader::SymbolResolve sr {};                                                               \
@@ -37,22 +59,38 @@
 		const char* dbg_name    = "" #f;                                                           \
 		s->Add(sr, func, dbg_name);                                                                \
 	}
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_OBJECT(n, f) LIB_ADD(n, f, Loader::SymbolType::Object)
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define LIB_FUNC(n, f) LIB_ADD(n, f, Loader::SymbolType::Func)
 
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
-	if (PRINT_NAME_ENABLED) {                                                                      \
+	if (PRINT_NAME_ENABLED || Libs::TraceAllCalls()) {                                             \
 		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}
 
 namespace Loader {
 class SymbolDatabase;
-}
+} // namespace Loader
 
 namespace Libs {
 
+// KYTY_TRACE_HLE_CALLS=<count>: the first <count> library calls of every thread are logged
+// (PRINT_NAME otherwise covers only the thread that registered a library).
+[[gnu::noinline]] inline bool TraceAllCalls() {
+	static const int64_t budget = [] {
+		const char* value = std::getenv("KYTY_TRACE_HLE_CALLS");
+		return value != nullptr ? std::strtoll(value, nullptr, 10) : 0ll;
+	}();
+	if (budget <= 0) return false;
+	static std::atomic<int64_t> used {0};
+	return used.fetch_add(1, std::memory_order_relaxed) < budget;
+}
+
+// Keep the formatting path from inflating fiber functions' stack frames under LTO.
 [[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
-	if (!Log::IsSilent()) {
+	if (Log::GetDirection() != Log::Direction::Silent) {
 		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
 		const auto print_name_time = fmt::format(
 		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,
@@ -65,5 +103,5 @@ namespace Libs {
 
 void InitAll(Loader::SymbolDatabase* s);
 
-}
-#endif
+} // namespace Libs
+#endif /* EMULATOR_INCLUDE_EMULATOR_LIBS_LIBS_H_ */

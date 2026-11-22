@@ -19,6 +19,6 @@ ImageAddressComponent ImageAddressComponentLayout(uint32_t flags, ImageDimension
                                                   uint32_t component);
 uint32_t ImageAddressDwordCount(uint32_t flags, ImageDimension dimension, uint32_t components);
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler::Decoder
 
-#endif
+#endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_IMAGEOPS_H_ */

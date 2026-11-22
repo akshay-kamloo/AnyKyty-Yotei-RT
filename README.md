@@ -1,128 +1,195 @@
-> **AnyKyty** is AnyPS5 with the Kyty graphics core: **182.9 FPS** in Subnautica uncapped, against 112.4 for native Kyty on the same PC (Ryzen 9 7950X3D, RTX 4080 SUPER).
-> Linux and Windows, built from source. Contributors and game reports are welcome: **[the AnyKyty page](docs/user/ANYKYTY.md)** has the numbers, the build commands, the settings and how to contribute.
+# AnyKyty-Yotei-RT
 
-# AnyKyty
+**Windows AnyPS5 + Erlou KytyPS5-Yotei GPU backend port with native hardware Ray Tracing (`VK_KHR_ray_query`) and Big-O CPU/GPU optimizations for *Ghost of Yōtei* (`PPSA26344`).**
 
-**AnyKyty is this fork's branch: AnyPS5 running the Kyty graphics core as a second GPU backend.** It is experimental (v0). The upstream AnyPS5 README follows [below](#about).
+> **Source Code Only / Legal Notice:** This repository contains **source code only** — no compiled binaries, shader caches, game files, firmware, cryptographic keys, or copyrighted Sony/Sucker Punch material. You must supply your own legally obtained dump of the game. This project is not affiliated with or endorsed by Sony Interactive Entertainment or Sucker Punch Productions.
 
-## What changes
+## Overview & Key Changes
 
-AnyPS5 keeps everything it does today: the relinker, `libkernel`, every system library, the SDL window, input and audio, and `libSceAgc`, the AGC library games call. Only the GPU driver behind the AGC interface is swapped at configure time:
+This fork pairs [AnyPS5](https://github.com/boykopovar/AnyPS5) / [AnyKyty](https://github.com/simnJS/AnyPS5) (relinker, `libkernel`, system libraries, input, audio, `libSceAgc`) with the [Erlou93/KytyPS5-Yotei](https://github.com/Erlou93/KytyPS5-Yotei) Vulkan GPU backend (`core/kyty/` + `core/libs/prx/libSceAgcDriver/KytyShim/`) built as a ThinLTO + PGO `kyty_gpu.prx` DLL, plus:
 
-| | `-DANYPS5_GPU_BACKEND=anyps5` (default) | `-DANYPS5_GPU_BACKEND=kyty` (AnyKyty) |
-|---|---|---|
-| PM4 command processing | AnyPS5 driver (decode, finishers, committer, encoder) | Kyty command processor (`kytyGpu`) |
-| Draw preparation | AnyPS5 committer | Kyty resolve and execute threads, with the ordered resolution and compiled SRT walk |
-| Vulkan rendering and caches | AnyPS5 renderer | Kyty renderer, buffer, texture and pipeline caches, recorder thread |
-| Shader recompiler | AnyPS5 recompiler (`core/shader/recompiler`) | Kyty recompiler (`core/kyty/graphics/shader/recompiler`) |
-| GPU view of game memory | AnyPS5 imports and write tracking | Kyty model: every guest page has a second view, writes are tracked by page faults |
-| Presentation | AnyPS5 presentation | Kyty presenter and swapchain, on AnyPS5's window; AnyPS5's VideoOut still reserves, paces and presents the flips |
+- **Native Hardware Ray Tracing (`VK_KHR_ray_query`)** with BVH `MappedPrefix` handling.
+- **GPU Indirect Thread-Dimension Dispatch** (`core/kyty/graphics/host_gpu/shaders/dispatch_thread_dims.comp`): offloads `COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS` indirect compute dispatches to the GPU, eliminating `fault_gpu` stalls (from ~2,200–2,470 ms/5 s down to **0 ms**).
+- **Big-O CPU & Memory Optimizations**:
+  - 64-page hierarchical backed bitmap in `MemoryBacking.cpp` (`O(P/64)` `IsBacked()`).
+  - `O(1)` open-addressed epoch hash index in `RenderExecutor::PlanFlags()` and removal of hot `thread_local` scratch vectors.
+  - Precomputed `fusable_read` slots and memo-first `SrtTapeWalker::Eval()` in `SrtTape.cpp`.
+  - 2-level chunked B-tree `RangeSet` (`BlockCap=64`) with `O(1)` bounding-box fast-reject.
+  - `O(1)` hash indexing and bounding-box pruning in `BufferCache`.
 
-The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, maintained in this repository and derived from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0); the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported. AnyKyty also turns on by default two Kyty settings that native Kyty only enables in its launcher's Experiment mode, draw templates and grouped draw buffers (`KYTY_DRAW_TEMPLATES=2`, `KYTY_DRAW_BUFFERS=1`); setting either variable keeps the user's value. It also copies GPU-written images back at the GL2 write-backs the game requests rather than at the next suspend point (`KYTY_WRITE_BACK_IMAGES=0` restores KytyPS5's behaviour; see `docs/dev/THIRD_PARTY_KYTY.md`). Native ray tracing, which native Kyty's launcher turns on in its recommended settings, is on by default when the GPU supports it (`KYTY_NATIVE_RT`, see the runtime settings below).
+For full engineering history, benchmark logs, and next steps, see [`ERLOU_PORT_HANDOFF.md`](ERLOU_PORT_HANDOFF.md).
 
-## Why
+## Current Status & Benchmarks
 
-On the same PC and scene, native Kyty spent about a third of AnyPS5's CPU time per draw and a fifth of its GPU time per frame. Reworking the AnyPS5 driver towards that design piece by piece did not close the gap, so the whole graphics core was transplanted instead.
+Tested on **Windows 11**, **Intel Core Ultra 7 270K Plus**, **32 GB RAM**, **NVIDIA GeForce RTX 5070 (12 GB VRAM)** with *Ghost of Yōtei* (`PPSA26344`, v2.002):
 
-## Measurements
+| Build / Scenario | Resolution | Measured FPS | Notes |
+| :--- | :--- | :--- | :--- |
+| Village (Big-O v1 + PGO v2) | 1080p | **23.26 FPS** avg (26–32 FPS steady) | 43.0 ms/f avg |
+| Open World (`native-rt-v6`) | 900p (`1600×900`) | **19.4–25.3 FPS** | Stable across 9,518 frames |
+| Heavy Post-Fight Cutscene (`native-rt-v6`) | 900p (`1600×900`) | **8.1–11.1 FPS** | `fault_gpu = 0 ms` (up from 3.3–3.6 FPS at 1080p) |
+| Heavy Post-Fight Cutscene (`native-rt-v7`, current HEAD) | 900p (`1600×900`) | **~13–14 FPS** (71–77 ms/f) | **Experimental:** currently hits `graphicsRun.cpp:670` assert at ~4,433 frames |
 
-Subnautica (PPSA02453), Creative mode, inside the lifepod. Ryzen 9 7950X3D, RTX 4080 SUPER, Ubuntu 26.04, 17 Nov 2026. Busiest stage = the thread with the highest CPU cost per draw call.
+> **Stability Note:** Current `HEAD` includes the experimental `v7` adaptive BAR cap in `core/kyty/graphics/host_gpu/renderer/cache/bufferCache.cpp`, which is faster in cutscenes but can assert at `graphicsRun.cpp:670` (`!m_accepting`) during longer runs. If you want maximum stability right now, revert the `v7` BAR cap in `bufferCache.cpp` (back to `v6`).
 
-Capped at 60 Hz:
+## Requirements
 
-| | FPS | Busiest stage | GPU per frame |
-|---|---|---|---|
-| AnyPS5, default backend | 45.7 | 15.5 µs per draw (committer) | 12.2 ms |
-| AnyKyty (`e6dfd952b5`, before the fixes below) | 59.8 | 6.7 to 7.7 µs per draw (`kytyGpuExecute`) | 6.5 ms |
-| Kyty, native | 59.4 | 5.7 µs per draw | 5.7 ms |
+- **OS:** Windows 10 (1803+) or Windows 11, 64-bit.
+- **CPU:** x86-64 with AVX2 support.
+- **GPU:** Vulkan 1.3 capable GPU with current drivers (`VK_KHR_acceleration_structure`, `VK_KHR_ray_query`, and `VK_KHR_deferred_host_operations` required for native RT). Developed and tested on NVIDIA RTX; AMD/Intel GPUs are untested.
+- **RAM & Page File:** **32 GB RAM recommended** plus a **32–64 GB Windows page file** (the title allocates ~13.5 GiB of direct memory; a small automatic page file can hit Windows commit-limit errors).
+- **Disk Space:** Several GB free for shader and pipeline caches (`_PipelineCache`).
 
-Uncapped (`ANYPS5_VBLANK_HZ=360`, native Kyty with `KYTY_VBLANK_FREQUENCY=360`), two sessions each. Both sides ran with Kyty's default settings (its Original mode): these measurements predate the Experiment settings above, and native ray tracing was off on both sides, which makes no difference in Subnautica since it has no ray tracing pass.
+## Setup & Building from Source (Windows)
 
-| | FPS | Execute | Resolve | Record | GPU per frame |
-|---|---|---|---|---|---|
-| AnyKyty (`6155614613`) | 159.0 (157.2, 160.8) | 5.73 µs per draw | 5.14 µs | 3.54 µs | 3.9 ms |
-| Kyty, native | 112.4 (106.3, 118.6) | 7.23 µs | 6.26 µs | 4.00 µs | 5.0 ms |
-
-At a comparable draw count (911 against 863 per frame), every Kyty stage is 12 to 21 % lighter per draw on AnyKyty and the GPU 22 % lighter per frame. The latest gains come from the glue: inside the Kyty stages, the memory shim now sits in the ThinLTO object and TLS is initial-exec; on the game threads, guest memory copies no longer go through system calls and submissions no longer `msync`, which leaves more of the CPU to the stages. Native Kyty's presentation thread is replaced here by AnyPS5's VideoOut. Why AnyKyty now beats native Kyty is not fully attributed yet. Subnautica loads a slightly different world on each launch, and per-draw costs vary by about ±20 % between sessions; both sessions show the same trend. Loading the game from the Creative menu takes 3.5 s on AnyKyty, 4.0 s on native Kyty and 8.3 to 13.9 s on the default backend, with warm caches.
-
-## Status
-
-- Tested in game on Linux: Subnautica, Balatro and TCG Card Shop Simulator.
-- Known issue, inherited from the Kyty core: the street of TCG Card Shop Simulator stays almost black, as it does on native Kyty. Rendering differences against the default backend are being collected and will be fixed after performance work.
-- The Kyty backend is built and run on Linux. On Windows it builds, and an open-world AAA title reaches its prologue in game on an NVIDIA GPU; nothing else has been tested there.
-
-## Building AnyKyty
-
-Follow [BUILD](docs/dev/BUILD.md), then configure with:
-
-```
-cmake -B build -DANYPS5_GPU_BACKEND=kyty
+### 1. Clone with Submodules
+```powershell
+git clone --recursive https://github.com/akshay-kamloo/AnyKyty-Yotei-RT.git
+cd AnyKyty-Yotei-RT
 ```
 
-On Windows the rest of AnyPS5 is built with MinGW-w64 GCC as usual, and `clang`, `clang++` of an LLVM release (tested with 21.1.8) must be on `PATH`: they compile the Kyty core for the `x86_64-w64-windows-gnu` target against the headers and libstdc++ of that GCC (`ANYPS5_KYTY_SYSROOT`, by default the directory above the `bin` of `g++`). ThinLTO is off there, since lld cannot pre-link Windows objects, and Kyty's pipeline helper processes are not used.
+### 2. Toolchain Prerequisites
+The provided PowerShell build scripts expect portable toolchains under `_tools\` (or edit the paths at the top of `build-erlou-dll.ps1` / `build-erlou.ps1` to match your system installations):
+- **CMake 4.x + Ninja**: `_tools\cmake\cmake-4.5.1-windows-x86_64\bin\`
+- **MinGW-w64 GCC 15.x**: `_tools\winlibs\mingw64\bin\` (for AnyPS5 host/PRX libraries)
+- **llvm-mingw (Clang + `libc++` + `lld` + `llvm-profdata`)**: `_tools\llvm-mingw\bin\` (for the `kyty_gpu.prx` DLL build)
 
-The Kyty core does not build with GCC, so it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. It needs `clang`, `clang++` and an `ld.lld` of the same major version (tested with 21). It is built with ThinLTO and pre-linked into one object by default; `-DANYPS5_KYTY_THIN_LTO=OFF` turns that off.
+### 3. Build `kyty_gpu.prx` + System PRX Libraries (Recommended: ThinLTO DLL)
+```powershell
+# Standard Release + ThinLTO build (no PGO)
+.\build-erlou-dll.ps1 -Reconfigure
 
-Runtime settings: `ANYPS5_VBLANK_HZ` (30 to 360) sets the vblank rate, so `ANYPS5_VBLANK_HZ=240` lifts the 60 FPS cap of games that pace on vblank. The `KYTY_*` settings of the Kyty core are read from the environment, for example `KYTY_VBLANK_FREQUENCY` and `KYTY_PRESENT_MODE`.
+# Optional: PGO Generation build (collects .profraw while playing)
+.\build-erlou-dll.ps1 -Reconfigure -PgoMode GEN
 
-Native ray tracing (Kyty's `--native-rt`) is on by default when the Vulkan device has `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and `VK_KHR_deferred_host_operations`: the ray tracing passes whose BVH walk Kyty serves trace with the GPU's ray tracing hardware; on such a GPU a compute BVH walk Kyty does not serve runs empty (its rays miss and an `[RT]` line names its shader), and the BVH walks of pixel shaders stay emulated unless `KYTY_RT_ORACLE` has bit 8. A `[kyty] native ray tracing` line on the console says which way it went; on a GPU without these extensions it names what is missing and ray tracing runs emulated. `KYTY_NATIVE_RT=0` emulates all ray tracing; `KYTY_NATIVE_RT=1` stops with a message when the GPU cannot trace natively. `KYTY_RT_STATS=1` prints a `[RT]` summary every 10 s of the work native ray tracing leaves to the game. The acceleration structures Kyty builds take at most a quarter of the video memory, between 512 MiB and 4 GiB (2 GiB on an 8 GB card), allocated as needed; `KYTY_RT_ARENA_MB` sets another limit.
+# Optional: PGO Use build (after merging .profraw -> .profdata with llvm-profdata)
+.\build-erlou-dll.ps1 -Reconfigure -PgoMode USE -PgoProfile "D:\path\to\yotei.profdata"
+```
 
-## Branches
+Non-DLL fallback build (links Kyty statically into `libSceAgcDriver.prx`):
+```powershell
+.\build-erlou.ps1 -Reconfigure
+```
 
-- `AnyKyty` (default): AnyPS5 with the Kyty backend.
-- `feat/agc-draw-block`: the performance work on AnyPS5's own driver.
-- `main`: a copy of upstream AnyPS5.
+### 4. Deploy to Your Game Run Directory
+Copy the built libraries from `build-erlou-dll\core\libs\prx\...` into your relinked game folder's `libs\` directory (alongside your legally dumped & relinked `app.exe` and `app0\` data):
+- `libs\kyty_gpu.prx`
+- `libs\libSceAgcDriver.prx`
+- `libs\libkernel.prx` (and updated PRX targets from `libs`)
 
-## Credits and licence
+## Running on Different Settings & Resolutions
 
-The graphics core: `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0), itself built on Kyty by InoriRus; everything else is [AnyPS5](https://github.com/boykopovar/AnyPS5). The Kyty core is GPL-2.0 like AnyPS5; the original Kyty code by InoriRus is MIT. File by file origin and licences: [docs/dev/THIRD_PARTY_KYTY.md](docs/dev/THIRD_PARTY_KYTY.md).
+### Recommended Presets by GPU VRAM
+- **12 GB VRAM GPUs (e.g., RTX 5070):** Run at **900p (`1600×900`)** with DRS locked and `+48 MiB` RTGI pool headroom to avoid VRAM spillover during cutscenes and dense open-world areas, or **1080p (`1920×1080`)** with `+32 MiB` RTGI pool in lighter areas.
+- **16 GB+ VRAM GPUs (e.g., RTX 5070 Ti / 4080 / 4090 / 5080):** **1080p (`1920×1080`)** or **1440p (`2560×1440`)** works comfortably without hitting the Vulkan budget ceiling as quickly.
+- **In-Game Graphics Mode:** Use the game's **Performance** mode. Quality mode aggressively changes internal resolution and can cause flicker unless resolution/DRS is locked.
 
----
+### Clean Play Launch (Zero Tracing Overhead)
+Run from your game directory in PowerShell:
+```powershell
+$env:APS5_OUTPUT_RESOLUTION = "1600x900"   # or "1920x1080", "2560x1440"
+$env:ANYPS5_MOUSE_TOUCHPAD  = "1"          # enables mouse touchpad swipe support
 
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md) | [Polski](docs/user/README.pl.md) | [日本語](docs/user/README.ja.md) | [العربية](docs/user/README.ar.md)
+# Ensure diagnostic/trace overhead is off
+foreach ($v in @(
+  'KYTY_TRACE_FRAMETIME','KYTY_TRACE_SLOW_FRAMES','KYTY_TRACE_PERF',
+  'KYTY_TRACE_GPU_TIME','KYTY_TRACE_GPU_READ_WAITS','KYTY_TRACE_CALLER_WAITS',
+  'KYTY_VRAM_BUDGET_MB','APS5_PROFILE_DRAW','APS5_LOG_TIMESTAMPS'
+)) { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 
-# About
+.\app.exe
+```
 
-Tool for automatic executables porting to Linux and Windows.
+### Diagnostic / Benchmarking Launch
+Enable frame-time and GPU-time telemetry when measuring changes:
+```powershell
+$env:APS5_OUTPUT_RESOLUTION = "1600x900"
+$env:KYTY_TRACE_FRAMETIME   = "1"
+$env:KYTY_TRACE_PERF        = "1"
+$env:KYTY_TRACE_GPU_TIME    = "1"
+.\app.exe
+```
 
-The relinker-only build runs on macOS, including Apple silicon.
+### Controls, Input & Hotkeys
+- **Performance Overlay:** Press **`F2`** to toggle the performance panel; **`Shift+F2`** shows detailed breakdown (frame time, CPU/GPU waits, draw calls, shader compiles, and **Vulkan VRAM budget**).
+- **Touch Pad ("Swipe up" prompts):** A DualSense controller's touchpad works natively. With keyboard + mouse (when `ANYPS5_MOUSE_TOUCHPAD=1`), press **`F6`**, move the mouse to swipe, and press **`F6`** again to exit touchpad mode.
+- **Keyboard & Controller Mapping:** SDL-mapped controllers work out of the box; keyboard/mouse binds can be customized via `anyps5-input.ini` (see [`docs/user/INPUT_MAPPING.md`](docs/user/INPUT_MAPPING.md)).
 
-[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+## Important Environment Variables & Toggles
 
-![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
+Code defaults live in `core/kyty/common/envDefaults.h`. Any variable set in your shell overrides the default (`=0` disables it). Setting `KYTY_ENV_DEFAULTS=0` disables all built-in defaults for strict testing.
 
-Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
+### Display, Frame Pacing & Upscaling
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `APS5_OUTPUT_RESOLUTION` | *(auto)* | Output window/presentation resolution, e.g. `1600x900`, `1920x1080`, `2560x1440`. |
+| `ANYPS5_VBLANK_HZ` | `60` | Overrides virtual VBlank refresh rate (`30`–`360`; e.g. `240` lifts 60 FPS vblank caps). |
+| `KYTY_VBLANK_FREQUENCY` | *(auto)* | Kyty-side VBlank frequency override. |
+| `KYTY_PRESENT_MODE` | *(auto)* | Overrides Vulkan swapchain present mode. |
+| `ANYPS5_UPSCALE` | *(off)* | Enables host-side presentation upscaling (e.g. FSR). |
+| `ANYPS5_FSR_SHARPNESS` | *(default)* | Sharpness value when FSR upscaling is enabled. |
+| `ANYPS5_MOUSE_TOUCHPAD` | `0` | Set to `1` to enable mouse-driven PS5 touchpad emulation (`F6`). |
+| `KYTY_BORDERLESS` | `0` | Set to `1` for borderless window mode. |
 
-[**Discord**](https://discord.gg/x9naWVzC6A), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+### Performance, GPU & Ray Tracing
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `KYTY_NATIVE_RT` | `1` *(auto)* | Native Vulkan `VK_KHR_ray_query` hardware RT (`0` = emulate all RT, `1` = require native RT). |
+| `KYTY_RT_ARENA_MB` | `512`–`4096` | Overrides acceleration-structure VRAM arena limit (default: up to 1/4 of VRAM). |
+| `KYTY_RT_ORACLE` | `0` | Bitmask for RT oracle options (bit `8` enables pixel-shader native BVH walks). |
+| `KYTY_RT_STATS` | `0` | Set to `1` to print a `[RT]` summary every 10 seconds. |
+| `KYTY_SHADER_PRECOMPILE` | `1` | Precompiles known shaders on startup to reduce in-game stutter. |
+| `KYTY_SHADER_PRECOMPILE_THREADS` | `8` | Worker thread count for shader precompilation (tune to your CPU core count). |
+| `KYTY_GPU_THREAD_CPUS` | *(auto)* | Pins the 4 GPU pipeline threads to separate physical CPU cores (`off` disables pinning). |
+| `KYTY_BINDLESS` | `1` | Enables bindless texture heap translation (required for terrain/foliage materials). |
+| `KYTY_DRAW_TEMPLATES` | `2` | Draw template caching mode (AnyKyty default `2`). |
+| `KYTY_DRAW_BUFFERS` | `1` | Grouped draw buffers optimization. |
+| `KYTY_VRAM_BUDGET` | `1` | Enables Vulkan VRAM budget tracking and eviction. |
+| `KYTY_VRAM_BUDGET_MB` | *(auto)* | Manually caps VRAM budget in MiB (e.g. `10240` on 12 GB cards if needed). |
+| `KYTY_VRAM_GC_FIX` | `1` | Enables VRAM garbage-collection fix for long sessions. |
+| `KYTY_PERF_BDA_PROMOTE_KB` | `2048` | Window size (KiB) promoted on a BDA fallback miss (`0` disables window promotion). |
+| `KYTY_WRITE_BACK_IMAGES` | `1` | Copies GPU-written images back at GL2 write-backs (`0` restores stock KytyPS5 behaviour). |
 
-## Status
+### Compatibility & Workarounds (`envDefaults.h`)
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `KYTY_ENV_DEFAULTS` | `1` | Master switch for `envDefaults.h`. Set `=0` to disable all built-in Yōtei defaults. |
+| `KYTY_PIPELINE_CACHE_ANY_REVISION` | `1` | Reuses pipeline caches across minor build revisions. |
+| `KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL` | `1` | Clamps texture mip sampling to last valid level. |
+| `KYTY_FIX_RT_11_11_10_FLOAT` | `1` | Float `R11G11B10` render target handling. |
+| `KYTY_WORKAROUND_ALIAS_SYNC` | `1` | Synchronizes aliased image memory (`D4/D5`). |
+| `KYTY_WORKAROUND_STENCIL_PLANE_SYNC` | `2` | Stencil plane synchronization workaround (`D8`). |
+| `KYTY_WORKAROUND_DCC_FAST_CLEAR` | `1` | DCC fast-clear handling (`A5`). |
+| `KYTY_WORKAROUND_WATERFALL_POINTER_RECORD0` | `1` | Terrain shader waterfall pointer workaround (`M42`). |
+| `KYTY_SHADER_LOOP_LIMIT` | `65536` | Global shader loop watchdog preventing GPU hangs. |
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![RDNA2 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![gfx1013 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders-gfx1013.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![implemented in 7 days](https://boykopovar.github.io/AnyPS5/badge-week.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+### Diagnostics & Profiling (Keep Unset for Gameplay)
+| Variable | Description |
+| :--- | :--- |
+| `KYTY_TRACE_FRAMETIME=1` | Logs per-frame CPU/GPU timings. |
+| `KYTY_TRACE_PERF=1` | Prints 5-second periodic stage breakdown (`draw_op`, `disp_op`, `fence`, `fault_gpu`, etc.). |
+| `KYTY_TRACE_GPU_TIME=1` | Enables per-shader GPU timer telemetry. |
+| `KYTY_TRACE_SLOW_FRAMES=1` | Logs detailed breakdown for frames exceeding threshold. |
+| `KYTY_TRACE_CALLER_WAITS=1` | Traces CPU caller-wait / BAR readback stalls. |
+| `KYTY_PGO_WRITE_FRAME=<N>` | Flushes PGO `.profraw` data at frame `N` in `-PgoMode GEN` builds. |
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+## Known Issues & Troubleshooting
 
-[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
+- **First launch is slow / stutters:** Cold starts compile shaders and populate `_PipelineCache`. Subsequent launches reuse the cache and load much faster.
+- **Checkered or pixelated shadows after a stutter/cutscene:** Draws whose pipelines are still compiling are skipped for a few frames, which can temporarily corrupt temporal shadow/lighting buffers. **Workaround:** Quit to the main menu and reload your save (no full restart needed).
+- **VRAM grows over long sessions:** Watch **Vulkan budget** in `Shift+F2`. If it approaches your GPU's VRAM limit and FPS drops, save, quit, and restart.
+- **`Insufficient system resources` on boot:** Increase your Windows page file to **32–64 GB** so Windows can commit the game's 13.5 GiB direct memory allocation.
+- **`graphicsRun.cpp:670` (`!m_accepting`) crash on current `HEAD` (`v7`):** Known regression in `v7`'s experimental `bufferCache.cpp` BAR cap; revert `bufferCache.cpp` to `v6` if you hit it.
 
-<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
+## Upstream Projects & Credits
 
-Unsupported or unexpected states throw a C++ exception, usually `std::runtime_error`. An exception that nothing catches prints its `what()` to stderr and ends the process.
-
-The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
-
-## Compatibility
-
-Per-game status and test reports live in the [Game bring-up](https://github.com/boykopovar/AnyPS5/discussions/categories/game-bring-up) discussions, one thread per title.
-
-## Input mapping
-
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
-
-## Disclaimer
-
-This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.
-
-AnyPS5 is an independent project and is not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
+This repository builds on the work of the upstream PS5 emulation community:
+- **[boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5)** & **[Ghost of Yōtei Bring-Up Discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675)**
+- **[simnJS/AnyPS5 (`AnyKyty` branch)](https://github.com/simnJS/AnyPS5)**
+- **[Erlou93/KytyPS5-Yotei](https://github.com/Erlou93/KytyPS5-Yotei)** ([`README-YOTEI.md`](https://github.com/Erlou93/KytyPS5-Yotei/blob/main/README-YOTEI.md) and KytyPS5 Yōtei GPU backend)
+- **[Celegans12/AnyPS5-Ghost-of-Yotei (`yotei/best`)](https://github.com/Celegans12/AnyPS5-Ghost-of-Yotei/tree/yotei/best)**
+- **Original Kyty** by InoriRus (MIT License, notice preserved in `core/kyty/LICENSES/Kyty-MIT.txt`)
 
 ## License
 
-This project is licensed under the GNU General Public License version 2 only.
+Licensed under the **GNU General Public License v2.0 only (`GPL-2.0-only`)** — see [`LICENSE`](LICENSE). Third-party components in `3rdparty/` and submodules remain under their respective licenses.

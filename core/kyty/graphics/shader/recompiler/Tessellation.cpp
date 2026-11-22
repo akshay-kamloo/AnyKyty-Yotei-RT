@@ -1,30 +1,28 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
+#include "common/envRead.h"
+#include "common/shaderEnv.h"
 #include "common/logging/log.h"
+#include "common/workaroundHits.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <array>
-#if defined(ANYPS5_KYTY)
-#include <bit>
-#include <memory>
-#endif
-#include <optional>
+#include <atomic>
+#include <bitset>
+#include <string>
 #include <unordered_map>
-#if defined(ANYPS5_KYTY)
-#include <unordered_set>
-#include <vector>
-#endif
 #include <utility>
-
-#include <cstdio>
-#define TESS_LOG(...) do { LOGF(__VA_ARGS__); std::fprintf(stderr, "[tess] " __VA_ARGS__); } while (0)
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -34,27 +32,18 @@ struct TessellationAddress {
 	Kind     kind        = Kind::Unknown;
 	uint32_t coefficient = 0;
 	uint32_t constant    = 0;
-
-	bool operator==(const TessellationAddress&) const = default;
 };
 
-void ReflectTessellationLayout(const Decoder::Program& program, bool local,
-                               ShaderTessellationInputInfo& info) {
-	constexpr uint32_t scalars = IR::NumScalarRegs + 2u;
+uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
+                                   uint32_t control_points, uint32_t input_stride) {
 	using namespace Decoder;
-	using Address   = TessellationAddress;
-	using Kind      = Address::Kind;
-	using Registers = std::array<Address, IR::NumVectorRegs + scalars>;
-
-	const auto control_points = local ? info.input_control_points : info.output_control_points;
-	Registers  entry {}, registers;
-	entry[local ? 3u : 1u] =
+	using Address = TessellationAddress;
+	using Kind    = Address::Kind;
+	std::array<Address, IR::NumVectorRegs> registers {};
+	registers[local ? 3u : 1u] =
 	    local ? Address {Kind::Affine, 1u, 0u} : Address {Kind::PackedControlPoint};
 	const auto constant = [](uint32_t value) { return Address {Kind::Affine, 0u, value}; };
-	const bool single = !local && control_points == 1u;
-	const auto patch  = single ? Address {Kind::Affine, 1u, 0u} : constant(0u);
-	const auto point  = single ? constant(0u) : Address {Kind::Affine, 1u, 0u};
-	const auto read   = [&](const Operand& operand) -> Address {
+	const auto read     = [&](const Operand& operand) -> Address {
 		if (operand.absolute || operand.negate || operand.sdwa_sext || operand.op_sel ||
 		    operand.op_sel_hi || operand.negate_hi || operand.dpp)
 			return {};
@@ -64,10 +53,10 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			value = constant(operand.value);
 		} else if (operand.kind == OperandKind::Vgpr) {
 			value = registers.at(operand.reg);
-		} else if (uint32_t code = 0; CFG::ScalarOperandCode(operand, code) && code < scalars) {
-			value = registers[IR::NumVectorRegs + code];
 		}
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return patch;
+		// The native packed HS ID's low byte is the patch ordinal. The logical
+		// interface addresses one patch, as in the frontend's v1 initialization.
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -93,136 +82,169 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 		                             : Address {};
 	};
 	const auto low24 = [&](Address value) {
-		if (value.kind != Kind::Affine) return Address {};
-		if (value.coefficient == 0u) return constant(value.constant & 0xffffffu);
-		const uint64_t maximum = single ? 0xffu : control_points - 1u;
-		return value.coefficient * maximum + value.constant <= 0xffffffu ? value : Address {};
+		if (value.kind == Kind::Affine && value.coefficient == 0u)
+			return constant(value.constant & 0xffffffu);
+		return value.kind == Kind::Affine &&
+		               uint64_t {value.coefficient} * (control_points - 1u) + value.constant <=
+		                   0xffffffu
+		           ? value
+		           : Address {};
 	};
-	std::unordered_map<uint32_t, Registers> joins, loops;
-	const auto merge = [](Registers& into, const Registers& from) {
-		bool changed = false;
-		for (uint32_t index = 0; index < into.size(); index++) {
-			if (into[index] == from[index]) continue;
-			changed |= into[index] != Address {};
-			into[index] = {};
-		}
-		return changed;
+	uint32_t stride = 0;
+	// Data flow over the instructions: the register state at a branch target is the merge of the states of every path
+	// reaching it (equal definitions survive, others become unknown), iterated to a fixed point so forward branches and
+	// loops are handled; code after an unconditional branch is reached only through such a join. Branches to the last
+	// instruction (stage exits) preserve the active path's definitions, as before. The address checks run once over the
+	// converged states.
+	using Registers = std::array<Address, IR::NumVectorRegs>;
+	const auto same = [](const Address& a, const Address& b) {
+		return a.kind == b.kind && a.coefficient == b.coefficient && a.constant == b.constant;
 	};
-
-	uint32_t stride = 0, patch_begin = UINT32_MAX, patch_end = 0;
-	for (bool repeat = true; repeat;) {
-		repeat    = false;
-		registers = entry;
-		for (const auto& inst: program.instructions) {
-			if (const auto join = joins.find(inst.pc); join != joins.end()) {
-				merge(registers, join->second);
-				joins.erase(join);
-			}
-			if (const auto loop = loops.find(inst.pc); loop != loops.end())
-				merge(registers, loop->second);
-			if (IsDirectBranch(inst.opcode)) {
-				const bool back = inst.branch_target <= inst.pc;
-				const auto [join, inserted] =
-				    (back ? loops : joins).try_emplace(inst.branch_target, registers);
-				const bool changed = !inserted && merge(join->second, registers);
-				repeat |= back && (inserted || changed);
-			}
-			const bool local_store  = IsDsWriteOpcode(inst.opcode);
-			const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
-			                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
-			const bool control_store = !local && buffer_store &&
-			                           inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
-			if ((local && local_store) || control_store) {
-				const auto address = read(inst.src0);
-				if (address.kind != Kind::Affine) {
-					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
-					     local ? "LS" : "HS", inst.pc);
-				}
-				if (static_cast<int32_t>(address.coefficient) > 0) {
-					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
-					                     (stride != 0u && stride != address.coefficient));
-					stride = address.coefficient;
-				} else if (control_store) {
-					const auto begin = address.constant + inst.offset;
-					patch_begin      = std::min(patch_begin, begin);
-					patch_end        = std::max(patch_end, begin + 4u * inst.data_dwords);
+	const auto& insts = program.instructions;
+	const auto  exit_pc = insts.back().pc;
+	std::unordered_map<uint32_t, size_t> index_of;
+	for (size_t i = 0; i < insts.size(); i++) index_of.emplace(insts[i].pc, i);
+	std::vector<Registers> in(insts.size());
+	std::vector<bool>      reached(insts.size(), false), queued(insts.size(), false);
+	std::vector<size_t>    work;
+	const auto join_into = [&](size_t target, const Registers& state) {
+		if (!reached[target]) {
+			reached[target] = true;
+			in[target]      = state;
+		} else {
+			bool changed = false;
+			for (size_t r = 0; r < state.size(); r++) {
+				if (!same(in[target][r], state[r]) && in[target][r].kind != Kind::Unknown) {
+					in[target][r] = {};
+					changed       = true;
 				}
 			}
-			for (uint32_t code = 0; code < scalars; code++) {
-				auto& scalar = registers[IR::NumVectorRegs + code];
-				if (scalar != Address {} && CFG::MayWriteScalarRegister(inst, code, 64u))
-					scalar = {};
-			}
-			if (uint32_t code = 0; inst.opcode == Opcode::S_MOVK_I32 &&
-			                       CFG::ScalarOperandCode(inst.dst, code) && code < scalars)
-				registers[IR::NumVectorRegs + code] = constant(inst.src0.value);
-			if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) continue;
-			const auto lhs   = read(inst.src0);
-			const auto rhs   = read(inst.src1);
-			const auto third = read(inst.src2);
-			Address    value;
-			switch (inst.opcode) {
-				case Opcode::V_BFE_U32:
-					if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
-					    rhs.coefficient == 0u && third.kind == Kind::Affine &&
-					    third.coefficient == 0u) {
-						if (rhs.constant == 8u && third.constant == 5u) value = point;
-						if (rhs.constant == 0u && third.constant == 8u) value = patch;
-					}
-					break;
-				case Opcode::V_AND_B32: {
-					const auto mask = lhs.kind == Kind::PackedControlPoint ? rhs
-					                : rhs.kind == Kind::PackedControlPoint ? lhs
-					                                                       : Address {};
-					const bool low_byte = mask.kind == Kind::Affine && mask.coefficient == 0u &&
-					                      (mask.constant & ~0xffu) == 0u;
-					if (mask == constant(0xffu)) value = patch;
-					else if (low_byte && !single) value = constant(0u);
-					if (mask == constant(0x1f00u)) value = multiply(point, constant(256u));
-					break;
-				}
-				case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
-				case Opcode::V_MUL_LO_U32: value = multiply(lhs, rhs); break;
-				case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
-				case Opcode::V_MAD_U32_U24:
-					value = add(multiply(low24(lhs), low24(rhs)), third);
-					break;
-				case Opcode::V_LSHL_ADD_U32:
-					if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
-						value = add(multiply(lhs, constant(1u << rhs.constant)), third);
-					break;
-				case Opcode::V_LSHLREV_B32:
-					if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
-						value = multiply(rhs, constant(1u << lhs.constant));
-					break;
-				case Opcode::V_SUB_NC_U32:
-					if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
-					    lhs.constant >= rhs.constant)
-						value = {Kind::Affine, lhs.coefficient - rhs.coefficient,
-						         lhs.constant - rhs.constant};
-					break;
-				default: break;
-			}
-			if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
-			    inst.dst.dpp)
-				value = {};
-			for (uint32_t index = 0;
-			     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < IR::NumVectorRegs;
-			     index++) {
-				registers[inst.dst.reg + index] = {};
-			}
-			registers.at(inst.dst.reg) = value;
+			if (!changed) return;
 		}
+		if (!queued[target]) {
+			queued[target] = true;
+			work.push_back(target);
+		}
+	};
+	const auto step = [&](const Decoder::Instruction& inst, bool check) {
+		const bool local_store =
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
+		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
+		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX4;
+		const bool control_store =
+		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
+		const bool control_read =
+		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+		               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
+		if (check && ((local && local_store) || control_store || control_read)) {
+			const auto address = read(inst.src0);
+			if (address.kind != Kind::Affine) {
+				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
+				     inst.pc);
+			}
+			if (address.coefficient != 0u) {
+				const auto expected = control_read ? input_stride : stride;
+				EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
+				                     (expected != 0u && expected != address.coefficient));
+				if (!control_read) stride = address.coefficient;
+			}
+		}
+		// Store vdata is a source, despite occupying the decoder's dst field.
+		if (local_store || buffer_store || inst.dst.kind != OperandKind::Vgpr) return;
+		const auto lhs   = read(inst.src0);
+		const auto rhs   = read(inst.src1);
+		const auto third = read(inst.src2);
+		Address    value;
+		switch (inst.opcode) {
+			case Opcode::V_BFE_U32:
+				if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
+				    rhs.coefficient == 0u && third.kind == Kind::Affine &&
+				    third.coefficient == 0u) {
+					if (rhs.constant == 8u && third.constant == 5u) value = {Kind::Affine, 1u, 0u};
+					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
+				}
+				break;
+			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
+			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
+			case Opcode::V_LSHL_ADD_U32:
+				if (rhs.kind == Kind::Affine && rhs.coefficient == 0u && rhs.constant < 32u)
+					value = add(multiply(lhs, constant(1u << rhs.constant)), third);
+				break;
+			case Opcode::V_LSHLREV_B32:
+				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && lhs.constant < 32u)
+					value = multiply(rhs, constant(1u << lhs.constant));
+				break;
+			case Opcode::V_MOV_B32: value = lhs; break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
+			case Opcode::V_AND_B32:
+				// The packed HS ID's low byte (& 0xff) is the patch ordinal, 0 for the logical interface.
+				if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine && rhs.coefficient == 0u &&
+				     rhs.constant == 0xffu) ||
+				    (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine && lhs.coefficient == 0u &&
+				     lhs.constant == 0xffu)) {
+					value = constant(0u);
+				} else if ((lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine && rhs.coefficient == 0u &&
+				            rhs.constant == 0x1f00u) ||
+				           (rhs.kind == Kind::PackedControlPoint && lhs.kind == Kind::Affine && lhs.coefficient == 0u &&
+				            lhs.constant == 0x1f00u)) {
+					// Upstream 77458260f: the masked control-point field (& 0x1f00) is the control point times 256.
+					value = {Kind::Affine, 256u, 0u};
+				} else if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && rhs.kind == Kind::Affine &&
+				           rhs.coefficient == 0u) {
+					value = constant(lhs.constant & rhs.constant);
+				}
+				break;
+			case Opcode::V_OR_B32:
+				if (lhs.kind == Kind::Affine && lhs.coefficient == 0u && rhs.kind == Kind::Affine &&
+				    rhs.coefficient == 0u)
+					value = constant(lhs.constant | rhs.constant);
+				break;
+			case Opcode::V_SUB_NC_U32:
+				if (lhs.kind == Kind::Affine && rhs.kind == Kind::Affine &&
+				    lhs.coefficient >= rhs.coefficient && lhs.constant >= rhs.constant)
+					value = affine(lhs.coefficient - rhs.coefficient, lhs.constant - rhs.constant);
+				break;
+			default: break;
+		}
+		if (inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.omod || inst.dst.clamp ||
+		    inst.dst.dpp)
+			value = {};
+		for (uint32_t index = 0;
+		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size(); index++) {
+			registers[inst.dst.reg + index] = {};
+		}
+		registers.at(inst.dst.reg) = value;
+	};
+	join_into(0, registers);
+	while (!work.empty()) {
+		const auto i = work.back();
+		work.pop_back();
+		queued[i]          = false;
+		registers          = in[i];
+		const auto& inst   = insts[i];
+		bool        falls  = true;
+		if (IsDirectBranch(inst.opcode) && inst.branch_target != exit_pc) {
+			const auto target = index_of.find(inst.branch_target);
+			EXIT_NOT_IMPLEMENTED(target == index_of.end());
+			join_into(target->second, registers);
+			falls = inst.opcode != Opcode::S_BRANCH;
+		} else if (!IsDirectBranch(inst.opcode)) {
+			step(inst, false);
+		}
+		if (falls && i + 1 < insts.size()) join_into(i + 1, registers);
 	}
-	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
-	(local ? info.ls_stride : info.hs_stride) = stride;
-	if (patch_end != 0u) {
-		EXIT_NOT_IMPLEMENTED(patch_begin < stride * control_points);
-		info.patch_base = patch_begin;
-		info.patch_size = patch_end - patch_begin;
+	for (size_t i = 0; i < insts.size(); i++) {
+		if (!reached[i] || IsDirectBranch(insts[i].opcode)) continue;
+		registers = in[i];
+		step(insts[i], true);
 	}
+	EXIT_NOT_IMPLEMENTED(stride == 0u);
+	return stride;
 }
 
 const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
@@ -233,14 +255,6 @@ const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
 	                                                                                 : nullptr;
 }
 
-bool Implies(IR::Value predicate, IR::Value condition) {
-	predicate = predicate.Resolve();
-	if (predicate == condition.Resolve()) return true;
-	const auto* inst = predicate.TryInstruction();
-	return inst != nullptr && inst->GetOpcode() == IR::ValueOpcode::LogicalAnd &&
-	       (Implies(inst->Arg(0), condition) || Implies(inst->Arg(1), condition));
-}
-
 IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value value,
                         IR::Value predicate, std::unordered_map<IR::Inst*, IR::Value>& resolved) {
 	using namespace IR;
@@ -249,726 +263,304 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	if (source == nullptr) return value;
 	if (const auto found = resolved.find(source); found != resolved.end()) return found->second;
 	if (source->GetOpcode() == ValueOpcode::SelectU32) {
-		return Implies(predicate, source->Arg(0))
+		return source->Arg(0).Resolve() == predicate.Resolve()
 		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
 		           : value;
 	}
-	const auto opcode = source->GetOpcode();
-	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
-	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::BitFieldUExtract)
+	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
 		return value;
-	std::array<Value, 3> args;
-	bool                 changed = false;
-	for (size_t index = 0; index < source->NumArgs(); index++) {
-		args[index] = ActiveAddress(block, before, source->Arg(index), predicate, resolved);
-		changed |= args[index] != source->Arg(index).Resolve();
-	}
-	if (changed) {
-		const auto flags = source->Flags<uint64_t>();
-		const auto copy =
-		    source->NumArgs() == 2u
-		        ? block.PrependNewInst(before, opcode, {args[0], args[1]}, flags)
-		        : block.PrependNewInst(before, opcode, {args[0], args[1], args[2]}, flags);
-		value = Value(&*copy);
+	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
+	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
+	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
+		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
+		                                 source->Flags<uint64_t>());
+		value     = Value(&*copy);
 	}
 	resolved.emplace(source, value);
 	return value;
 }
 
-#if defined(ANYPS5_KYTY)
-struct MergedHullAddress {
-	bool     known       = false;
-	uint64_t coefficient = 0;
-	uint64_t constant    = 0;
-
-	[[nodiscard]] uint64_t Highest(uint32_t control_points) const {
-		return coefficient * (control_points - 1u) + constant;
-	}
-};
-
-class MergedHullAddresses {
-public:
-	MergedHullAddresses(uint32_t control_points, IR::Value predicate)
-	    : m_control_points(control_points), m_predicate(predicate) {}
-
-	MergedHullAddress Evaluate(IR::Value value) {
-		using Address = MergedHullAddress;
-		value         = value.Resolve();
-		if (value.IsImmediate()) {
-			return value.GetType() == IR::Type::U32 ? Address {true, 0u, value.U32()} : Address {};
-		}
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return {};
-		const auto [known, inserted] = m_known.try_emplace(inst);
-		if (!inserted) return known->second;
-		const auto result = Compute(*inst);
-		m_known[inst]     = result;
-		return result;
-	}
-
-private:
-	using Address = MergedHullAddress;
-
-	Address Bounded(uint64_t coefficient, uint64_t constant) const {
-		const Address result {true, coefficient, constant};
-		return coefficient <= UINT32_MAX && constant <= UINT32_MAX &&
-		               result.Highest(m_control_points) <= UINT32_MAX
-		           ? result
-		           : Address {};
-	}
-
-	static bool Multiple(const Address& value, uint32_t bits) {
-		const uint64_t low = (uint64_t {1u} << bits) - 1u;
-		return (value.coefficient & low) == 0u && (value.constant & low) == 0u;
-	}
-
-	static bool Same(const Address& lhs, const Address& rhs) {
-		return lhs.known && rhs.known && lhs.coefficient == rhs.coefficient &&
-		       lhs.constant == rhs.constant;
-	}
-
-	Address Compute(const IR::Inst& inst) {
-		using namespace IR;
-		const auto arg   = [&](size_t index) { return Evaluate(inst.Arg(index)); };
-		const auto shift = [&](size_t index, uint32_t& amount) {
-			const auto count = arg(index);
-			amount           = static_cast<uint32_t>(count.constant);
-			return count.known && count.coefficient == 0u && count.constant < 32u;
-		};
-		if (inst.GetOpcode() == ValueOpcode::Phi) {
-			if (inst.NumArgs() == 0u) return {};
-			if (!m_predicate.IsEmpty() && m_carried == nullptr) {
-				m_carried = std::make_unique<MergedHullAddresses>(m_control_points, Value {});
-			}
-			auto&      carried = m_predicate.IsEmpty() ? *this : *m_carried;
-			const auto first   = carried.Evaluate(inst.Arg(0));
-			for (size_t index = 1; index < inst.NumArgs(); index++) {
-				if (!Same(first, carried.Evaluate(inst.Arg(index)))) return {};
-			}
-			return first;
-		}
-		switch (inst.GetOpcode()) {
-			case ValueOpcode::LaneId: return {true, 1u, 0u};
-			case ValueOpcode::GetBuiltin:
-				return inst.Arg(0).U32() == static_cast<uint32_t>(StageInputKind::InvocationId)
-				           ? Address {true, 1u, 0u}
-				           : Address {};
-			case ValueOpcode::SelectU32: {
-				const auto condition = inst.Arg(0).Resolve();
-				if ((condition.IsImmediate() && condition.U1()) ||
-				    (!m_predicate.IsEmpty() && Implies(m_predicate, condition)))
-					return arg(1);
-				if (condition.IsImmediate()) return arg(2);
-				const auto lhs = arg(1);
-				return Same(lhs, arg(2)) ? lhs : Address {};
-			}
-			case ValueOpcode::IAdd32: {
-				const auto lhs = arg(0), rhs = arg(1);
-				return lhs.known && rhs.known
-				           ? Bounded(lhs.coefficient + rhs.coefficient, lhs.constant + rhs.constant)
-				           : Address {};
-			}
-			case ValueOpcode::ISub32: {
-				const auto lhs = arg(0), rhs = arg(1);
-				return lhs.known && rhs.known && lhs.coefficient >= rhs.coefficient &&
-				               lhs.constant >= rhs.constant
-				           ? Address {true, lhs.coefficient - rhs.coefficient,
-				                      lhs.constant - rhs.constant}
-				           : Address {};
-			}
-			case ValueOpcode::IMul32: {
-				auto lhs = arg(0), rhs = arg(1);
-				if (!lhs.known || !rhs.known) return {};
-				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
-				return rhs.coefficient == 0u
-				           ? Bounded(lhs.coefficient * rhs.constant, lhs.constant * rhs.constant)
-				           : Address {};
-			}
-			case ValueOpcode::ShiftLeftLogical32: {
-				const auto lhs = arg(0);
-				uint32_t   amount;
-				return lhs.known && shift(1, amount)
-				           ? Bounded(lhs.coefficient << amount, lhs.constant << amount)
-				           : Address {};
-			}
-			case ValueOpcode::ShiftRightLogical32:
-			case ValueOpcode::BitFieldUExtract: {
-				const auto lhs = arg(0);
-				uint32_t   amount, bits = 32u;
-				if (!lhs.known || !shift(1, amount)) return {};
-				if (inst.GetOpcode() == ValueOpcode::BitFieldUExtract && !shift(2, bits)) return {};
-				if (Multiple(lhs, std::min(amount + bits, 32u))) return {true, 0u, 0u};
-				if (!Multiple(lhs, amount) || (lhs.Highest(m_control_points) >> amount) >> bits != 0u)
-					return {};
-				return {true, lhs.coefficient >> amount, lhs.constant >> amount};
-			}
-			case ValueOpcode::BitwiseAnd32: {
-				auto lhs = arg(0), rhs = arg(1);
-				if (!lhs.known || !rhs.known) return {};
-				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
-				if (rhs.coefficient != 0u) return {};
-				if (lhs.coefficient == 0u) return {true, 0u, lhs.constant & rhs.constant};
-				const auto mask = static_cast<uint32_t>(rhs.constant);
-				if (mask == 0u || Multiple(lhs, static_cast<uint32_t>(std::bit_width(mask)))) {
-					return {true, 0u, 0u};
-				}
-				const auto low  = static_cast<uint32_t>(std::countr_zero(mask));
-				const auto bits = mask >> low;
-				return (bits & (bits + 1u)) == 0u && Multiple(lhs, low) &&
-				               lhs.Highest(m_control_points) <= mask
-				           ? lhs
-				           : Address {};
-			}
-			case ValueOpcode::BitwiseOr32: {
-				auto lhs = arg(0), rhs = arg(1);
-				if (!lhs.known || !rhs.known) return {};
-				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
-				if (rhs.coefficient != 0u) return {};
-				if (lhs.coefficient == 0u) return {true, 0u, lhs.constant | rhs.constant};
-				const uint64_t below = rhs.constant == 0u ? 0u : std::bit_ceil(rhs.constant + 1u) - 1u;
-				return (lhs.coefficient & below) == 0u && (lhs.constant & below) == 0u
-				           ? Bounded(lhs.coefficient, lhs.constant + rhs.constant)
-				           : Address {};
-			}
-			default: return {};
-		}
-	}
-
-	uint32_t                                             m_control_points;
-	IR::Value                                            m_predicate;
-	std::unordered_map<const IR::Inst*, MergedHullAddress> m_known;
-	std::unique_ptr<MergedHullAddresses>                   m_carried;
-};
-
-IR::Value MergedHullAddressValue(IR::Block& block, IR::Block::iterator before,
-                                 const MergedHullAddress& address) {
+// A ring address the constant propagation cannot fold is evaluated with the lane's predicated VGPR writes taken as
+// performed (the access runs under the EXEC of the lanes that wrote its address registers) through additions, 24-bit
+// multiplies, shifts and masks. The water hull shader c1a55c56c2e59361 stores its per-patch data at
+// 0x8000 - 0x60 * (patch ordinal + 1); unfolded, that address was taken as control-point data of invocation 0
+// (32672 % 80) and overwrote control point 0 (exploded water). Exact when every write taken as performed was made
+// by every accessing lane or leaves the same address either way (all cases in the game are the first);
+// an address that depends on the lane stops the translation.
+// `access_predicate` / `other_exec` (KYTY_TRACE_PERF, PERF workaround_hits tess_ring): set when a predicated write taken
+// as performed was made under another EXEC value than the access's (the case the evaluation cannot prove exact).
+bool EvaluateActiveAddress(IR::Value value, uint32_t& result, uint32_t depth = 0, const IR::Value* access_predicate = nullptr,
+                           bool* other_exec = nullptr) {
 	using namespace IR;
-	const auto constant = Value(static_cast<uint32_t>(address.constant));
-	if (address.coefficient == 0u) return constant;
-	auto scaled = Value(&*block.PrependNewInst(before, ValueOpcode::LaneId));
-	if (address.coefficient != 1u) {
-		scaled = Value(&*block.PrependNewInst(
-		    before, ValueOpcode::IMul32,
-		    {scaled, Value(static_cast<uint32_t>(address.coefficient))}));
-	}
-	return address.constant == 0u
-	           ? scaled
-	           : Value(&*block.PrependNewInst(before, ValueOpcode::IAdd32, {scaled, constant}));
-}
-
-void RequireMergedHullBarriers(const IR::Program& program) {
-	using namespace IR;
-	const auto walk = [](std::vector<const Block*> pending, const Block* barrier, auto&& visit) {
-		std::unordered_set<const Block*> seen;
-		while (!pending.empty()) {
-			const auto* block = pending.back();
-			pending.pop_back();
-			visit(block);
-			if (block == barrier || !seen.insert(block).second) continue;
-			const auto successors = block->ImmSuccessors();
-			pending.insert(pending.end(), successors.begin(), successors.end());
-		}
-	};
-	for (const auto* block: program.blocks) {
-		if (std::ranges::none_of(*block, [](const Inst& inst) {
-			    return inst.GetOpcode() == ValueOpcode::Barrier;
-		    }))
-			continue;
-		walk({program.blocks.front()}, block, [&](const Block* reached) {
-			if (reached != block && reached->ImmSuccessors().empty()) {
-				EXIT("the merged hull program has an s_barrier that some invocations do not "
-				     "reach, at pc 0x%08x\n",
-				     block->start_pc);
-			}
-		});
-		const auto successors = block->ImmSuccessors();
-		walk({successors.begin(), successors.end()}, block, [&](const Block* reached) {
-			if (reached == block) {
-				EXIT("the merged hull program has an s_barrier inside a loop, at pc 0x%08x\n",
-				     block->start_pc);
-			}
-		});
-	}
-}
-
-bool MergedHullOwnLaneMask(const IR::Inst& mask, std::unordered_set<const IR::Inst*>& seen) {
-	using namespace IR;
-	if (!seen.insert(&mask).second) return true;
-	const auto zero = [](Value value) {
-		value = value.Resolve();
-		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == 0u;
-	};
-	for (const auto& use: mask.Uses()) {
-		const auto& user = *use.user;
-		switch (user.GetOpcode()) {
-			case ValueOpcode::Identity:
-			case ValueOpcode::Phi:
-			case ValueOpcode::CompositeExtractU32x4:
-			case ValueOpcode::BitwiseAnd32:
-			case ValueOpcode::BitwiseOr32:
-			case ValueOpcode::BitwiseXor32:
-			case ValueOpcode::BitwiseNot32:
-				if (!MergedHullOwnLaneMask(user, seen)) return false;
-				break;
-			case ValueOpcode::SelectU32:
-				if (use.operand == 0u || !MergedHullOwnLaneMask(user, seen)) return false;
-				break;
-			case ValueOpcode::IEqual32:
-			case ValueOpcode::INotEqual32:
-				if (!zero(user.Arg(1u - use.operand))) return false;
-				break;
-			case ValueOpcode::ShiftRightLogical32: {
-				const auto* index = user.Arg(1).Resolve().TryInstruction();
-				if (use.operand != 0u || index == nullptr ||
-				    index->GetOpcode() != ValueOpcode::BitwiseAnd32) {
-					return false;
-				}
-				const auto* lane = index->Arg(0).Resolve().TryInstruction();
-				const auto  low  = index->Arg(1).Resolve();
-				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId ||
-				    !low.IsImmediate() || low.U32() != 31u) {
-					return false;
-				}
-				for (const auto& bit: user.Uses()) {
-					const auto one = bit.user->GetOpcode() == ValueOpcode::BitwiseAnd32
-					                     ? bit.user->Arg(1u - bit.operand).Resolve()
-					                     : Value {};
-					if (!one.IsImmediate() || one.GetType() != Type::U32 || one.U32() != 1u) {
-						return false;
-					}
-				}
-				break;
-			}
-			default: return false;
-		}
-	}
-	return true;
-}
-
-void LowerMergedHullLanes(IR::Program& program) {
-	using namespace IR;
-	for (auto* block: program.blocks) {
-		for (auto it = block->begin(); it != block->end(); ++it) {
-			auto& inst = *it;
-			switch (inst.GetOpcode()) {
-				case ValueOpcode::ReadLane:
-				case ValueOpcode::WriteLane:
-				case ValueOpcode::DppMoveU32:
-				case ValueOpcode::DppUpdateU32:
-				case ValueOpcode::Permlane16U32:
-				case ValueOpcode::SwizzleU32:
-				case ValueOpcode::PermuteU32:
-				case ValueOpcode::BpermuteU32:
-				case ValueOpcode::SubgroupUMinU32:
-				case ValueOpcode::SubgroupUMaxU32:
-				case ValueOpcode::SubgroupOrU32:
-					EXIT("the merged hull program reads or writes another lane's register, which "
-					     "its hull stage does not hold at one lane per invocation (block pc "
-					     "0x%08x)\n",
-					     block->start_pc);
-				case ValueOpcode::Ballot: {
-					std::unordered_set<const Inst*> seen;
-					if (!MergedHullOwnLaneMask(inst, seen)) {
-						EXIT("the merged hull program uses a lane mask other than its own lane's "
-						     "bit (block pc 0x%08x)\n",
-						     block->start_pc);
-					}
-					const auto lane = Value(&*block->PrependNewInst(it, ValueOpcode::LaneId));
-					const auto bit  = Value(&*block->PrependNewInst(
-					    it, ValueOpcode::ShiftLeftLogical32, {Value(1u), lane}));
-					const auto low  = Value(&*block->PrependNewInst(
-					    it, ValueOpcode::SelectU32, {inst.Arg(0), bit, Value(0u)}));
-					inst.ReplaceUsesWith(Value(&*block->PrependNewInst(
-					    it, ValueOpcode::CompositeConstructU32x4,
-					    {low, Value(0u), Value(0u), Value(0u)})));
-					break;
-				}
-				case ValueOpcode::ConditionRef:
-				case ValueOpcode::ReadFirstLane: inst.ReplaceUsesWith(inst.Arg(0)); break;
-				default: break;
-			}
-		}
-	}
-}
-
-void RequireMergedHullAligned(const MergedHullAddress& base, uint32_t offset, uint32_t pc) {
-	if (((base.coefficient | (base.constant + offset)) & 3u) != 0u) {
-		EXIT("the merged hull program uses an unaligned tessellation ring or LDS address at pc "
-		     "0x%08x\n",
-		     pc);
-	}
-}
-
-void RequireMergedHullRecord(const ShaderTessellationInputInfo& tess, IR::Value address,
-                             uint32_t offset, uint32_t components, bool write, uint32_t pc) {
-	const auto base   = MergedHullAddresses(tess.output_control_points, {}).Evaluate(address);
-	const auto stride = uint64_t {tess.ls_stride};
-	const auto begin  = base.constant + offset;
-	const auto end    = begin + 4u * uint64_t {components};
-	if (!base.known) {
-		EXIT("the merged hull program accesses LDS at pc 0x%08x through an address that is not a "
-		     "constant offset in a control point record of its patch\n",
-		     pc);
-	}
-	RequireMergedHullAligned(base, offset, pc);
-	if (write) {
-		if (base.coefficient != stride || end > stride) {
-			EXIT("the merged hull program writes LDS outside its own control point's record at "
-			     "pc 0x%08x\n",
-			     pc);
-		}
-	} else if ((base.coefficient != 0u && base.coefficient != stride) ||
-	           end + base.coefficient * (tess.output_control_points - 1u) >
-	               stride * tess.input_control_points) {
-		EXIT("the merged hull program reads LDS outside its patch's control point records at pc "
-		     "0x%08x\n",
-		     pc);
-	}
-}
-
-void RequireMergedHullRing(const ShaderTessellationInputInfo& tess, IR::Value address,
-                           uint32_t offset, uint32_t components, bool write, uint32_t pc) {
-	const auto base = MergedHullAddresses(tess.output_control_points, {}).Evaluate(address);
-	if (!base.known && write) {
-		EXIT("the merged hull program stores to the off-chip ring at pc 0x%08x through an address "
-		     "that is neither a constant nor an offset in its own control point's record\n",
-		     pc);
-	}
-	if (!base.known) {
-		EXIT("the merged hull program reads the off-chip ring at pc 0x%08x through an address "
-		     "that is neither a constant nor an offset in a control point's record\n",
-		     pc);
-	}
-	RequireMergedHullAligned(base, offset, pc);
-	const auto stride = uint64_t {tess.hs_stride};
-	const auto points = stride * tess.output_control_points;
-	const auto end    = base.constant + offset + 4u * uint64_t {components};
-	if (base.coefficient == 0u && base.constant >= points) {
-		if (base.constant + offset < tess.patch_base ||
-		    end > uint64_t {tess.patch_base} + tess.patch_size) {
-			EXIT("the merged hull program %s off-chip memory outside its control points and "
-			     "patch constants at pc 0x%08x\n",
-			     write ? "writes" : "reads", pc);
-		}
-	} else if (!write) {
-		if ((base.coefficient != 0u && base.coefficient != stride) ||
-		    end + base.coefficient * (tess.output_control_points - 1u) > points) {
-			EXIT("the merged hull program reads off-chip memory outside its patch's control "
-			     "points at pc 0x%08x\n",
-			     pc);
-		}
-	} else if (base.coefficient != 0u) {
-		if (base.coefficient != stride || end > stride) {
-			EXIT("the merged hull program stores to the off-chip ring outside its own control "
-			     "point's record at pc 0x%08x\n",
-			     pc);
-		}
-	} else if (tess.output_control_points != 1u || end > stride) {
-		EXIT("the merged hull program stores a control point's record at a constant off-chip "
-		     "address at pc 0x%08x, which only that control point's invocation can write\n",
-		     pc);
-	}
-}
-
-struct MergedHullTraffic {
-	const IR::Block* block;
-	uint32_t         order;
-	uint32_t         pc;
-	const IR::Inst*  inst = nullptr;
-};
-
-void RequireMergedHullBarrierOrder(std::span<const MergedHullTraffic> barriers,
-                                   std::span<const MergedHullTraffic> writes,
-                                   std::span<const MergedHullTraffic> reads) {
-	if (reads.empty()) return;
-	for (const auto& barrier: barriers) {
-		std::unordered_set<const IR::Block*> after;
-		const auto                           first = barrier.block->ImmSuccessors();
-		std::vector<const IR::Block*>        pending(first.begin(), first.end());
-		while (!pending.empty()) {
-			const auto* block = pending.back();
-			pending.pop_back();
-			if (!after.insert(block).second) continue;
-			const auto next = block->ImmSuccessors();
-			pending.insert(pending.end(), next.begin(), next.end());
-		}
-		const auto later = [&](const MergedHullTraffic& access) {
-			return after.contains(access.block) ||
-			       (access.block == barrier.block && access.order > barrier.order);
-		};
-		if (std::ranges::none_of(writes, later) && std::ranges::all_of(reads, later)) return;
-	}
-	EXIT("the merged hull program reads another control point's LDS record at pc 0x%08x, but no "
-	     "s_barrier has every LDS write before it and every such read after it\n",
-	     reads.front().pc);
-}
-
-void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTraffic> writes,
-                              std::span<const MergedHullTraffic> reads) {
-	using namespace IR;
-	if (reads.empty()) return;
-	const auto reached = [](std::span<Block* const> from, const Block* avoided) {
-		std::unordered_set<const Block*> seen;
-		std::vector<const Block*>        pending(from.begin(), from.end());
-		while (!pending.empty()) {
-			const auto* block = pending.back();
-			pending.pop_back();
-			if (block == avoided || !seen.insert(block).second) continue;
-			const auto next = block->ImmSuccessors();
-			pending.insert(pending.end(), next.begin(), next.end());
-		}
-		return seen;
-	};
-	const auto reads_in = [&](const std::unordered_set<const Block*>& blocks, bool inside) {
-		return std::ranges::any_of(reads, [&](const MergedHullTraffic& read) {
-			return blocks.contains(read.block) == inside;
-		});
-	};
-	Block* const                   entry = program.blocks.front();
-	const std::span<Block* const> start(&entry, 1u);
-	const auto                     live = reached(start, nullptr);
-	if (reads_in(live, false)) {
-		EXIT("the merged hull program reads another control point's off-chip output in a block "
-		     "no control point reaches, at pc 0x%08x\n",
-		     reads.front().pc);
-	}
-	Block* barrier = nullptr;
-	for (auto* candidate: program.blocks) {
-		if (!live.contains(candidate)) continue;
-		const auto before = candidate == entry ? std::unordered_set<const Block*> {}
-		                                       : reached(start, candidate);
-		if (std::ranges::any_of(before,
-		                        [](const Block* block) { return block->ImmSuccessors().empty(); }) ||
-		    reads_in(before, true) ||
-		    reached(candidate->ImmSuccessors(), nullptr).contains(candidate)) {
-			continue;
-		}
-		if (barrier == nullptr ||
-		    reached(barrier->ImmSuccessors(), nullptr).contains(candidate)) {
-			barrier = candidate;
-		}
-	}
-	if (barrier == nullptr) {
-		EXIT("the merged hull program reads another control point's off-chip output at pc "
-		     "0x%08x, but no block before the read is reached once by every invocation, so no "
-		     "barrier can order it after the writes\n",
-		     reads.front().pc);
-	}
-	const auto               after = reached(barrier->ImmSuccessors(), nullptr);
-	const MergedHullTraffic* first = nullptr;
-	for (const auto& read: reads) {
-		if (read.block == barrier && (first == nullptr || read.order < first->order)) first = &read;
-	}
-	for (const auto& write: writes) {
-		if (!live.contains(write.block)) continue;
-		if (first != nullptr && write.block == barrier ? write.order > first->order
-		                                               : after.contains(write.block)) {
-			EXIT("the merged hull program reads another control point's off-chip output, but its "
-			     "control point store at pc 0x%08x comes after the last block every invocation "
-			     "reaches before the read\n",
-			     write.pc);
-		}
-	}
-	auto position = barrier->end();
-	if (first != nullptr) {
-		position = std::ranges::find_if(*barrier,
-		                                [&](const Inst& inst) { return &inst == first->inst; });
-	}
-	barrier->PrependNewInst(position, ValueOpcode::Barrier);
-}
-
-bool MergedHullFirstInvocationOnly(IR::Value predicate, MergedHullAddresses& addresses,
-                                   std::unordered_set<const IR::Inst*>& path) {
-	using namespace IR;
-	predicate = predicate.Resolve();
-	if (predicate.IsImmediate()) return predicate.GetType() == Type::U1 && !predicate.U1();
-	const auto* inst = predicate.TryInstruction();
-	if (inst == nullptr) return false;
-	if (!path.insert(inst).second) return true;
-	const auto invocation = [&](size_t index) {
-		const auto value = addresses.Evaluate(inst->Arg(index));
-		return value.known && value.coefficient == 1u && value.constant == 0u;
-	};
-	const auto immediate = [&](size_t index, uint32_t expected) {
-		const auto value = inst->Arg(index).Resolve();
-		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
-	};
-	bool result = false;
-	switch (inst->GetOpcode()) {
-		case ValueOpcode::LogicalAnd:
-			result = MergedHullFirstInvocationOnly(inst->Arg(0), addresses, path) ||
-			         MergedHullFirstInvocationOnly(inst->Arg(1), addresses, path);
-			break;
-		case ValueOpcode::ULessThan32: result = invocation(0) && immediate(1, 1u); break;
-		case ValueOpcode::UGreaterThan32: result = immediate(0, 1u) && invocation(1); break;
-		case ValueOpcode::ULessThanEqual32: result = invocation(0) && immediate(1, 0u); break;
-		case ValueOpcode::UGreaterThanEqual32: result = immediate(0, 0u) && invocation(1); break;
-		case ValueOpcode::IEqual32:
-			result = (invocation(0) && immediate(1, 0u)) || (immediate(0, 0u) && invocation(1));
-			break;
-		case ValueOpcode::Phi:
-			result = inst->NumArgs() != 0u;
-			for (size_t index = 0; result && index < inst->NumArgs(); index++) {
-				result = MergedHullFirstInvocationOnly(inst->Arg(index), addresses, path);
-			}
-			break;
-		default: break;
-	}
-	path.erase(inst);
-	return result;
-}
-
-void RequireMergedHullFirstInvocation(const ShaderTessellationInputInfo& tess, IR::Value predicate,
-                                      uint32_t pc) {
-	if (tess.output_control_points == 1u) return;
-	MergedHullAddresses                 addresses(tess.output_control_points, predicate);
-	std::unordered_set<const IR::Inst*> path;
-	if (!MergedHullFirstInvocationOnly(predicate, addresses, path)) {
-		EXIT("the merged hull program's per-patch tessellation output at pc 0x%08x is not "
-		     "written by control point 0 alone\n",
-		     pc);
-	}
-}
-#endif
-
-}
-
-#if defined(ANYPS5_KYTY)
-void RequireMergedHullControlPoints(const ShaderTessellationInputInfo& info) {
-	if (info.input_control_points > info.output_control_points) {
-		EXIT("a merged hull program with more input (%u) than output (%u) control points runs "
-		     "its local part on lanes the hull stage does not have\n",
-		     info.input_control_points, info.output_control_points);
-	}
-}
-
-void RequireMergedHullLimits(const ShaderTessellationInputInfo& info,
-                             const TessellationLimits&          limits) {
-	const auto vectors    = [](uint32_t bytes) { return (bytes + 15u) / 16u; };
-	const auto patch      = vectors(info.patch_size);
-	const auto per_vertex = vectors(info.hs_stride) + vectors(info.ls_stride);
-	const auto locations  = per_vertex + patch;
-	const auto total      = 4u * (uint64_t {info.output_control_points} * per_vertex + patch);
-	if (4u * uint64_t {locations} > limits.per_vertex_output_components ||
-	    4u * uint64_t {patch} > limits.per_patch_output_components ||
-	    total > limits.total_output_components ||
-	    vectors(IR::MergedHullRecordBytes) * 4u > limits.per_vertex_input_components) {
-		EXIT("the merged hull program's outputs exceed the device's tessellation limits (LDS "
-		     "stride %u, control point stride %u, patch constants %u bytes: %u per-vertex "
-		     "locations, %u patch vectors, %" PRIu64 " components)\n",
-		     info.ls_stride, info.hs_stride, info.patch_size, locations, patch, total);
-	}
-}
-#endif
-
-bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
-                                 ShaderTessellationInputInfo& info) {
-#if defined(ANYPS5_KYTY)
-	if (info.merged_hull != 0) {
-		RequireMergedHullControlPoints(info);
-		Decoder::Program merged;
-		Decoder::DecodeProgram(control, merged);
-		ReflectTessellationLayout(merged, true, info);
-		ReflectTessellationLayout(merged, false, info);
-		LOGF("Merged hull tessellation interface: input_cp=%u output_cp=%u ls_stride=%u "
-		     "hs_stride=%u patch_base=0x%x patch_size=%u\n",
-		     info.input_control_points, info.output_control_points, info.ls_stride,
-		     info.hs_stride, info.patch_base, info.patch_size);
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != Type::U32) return false;
+		result = value.U32();
 		return true;
 	}
-#endif
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 48u) return false;
+	uint32_t a = 0, b = 0, c = 0;
+	const auto arg = [&](size_t index, uint32_t& out) {
+		return EvaluateActiveAddress(inst->Arg(index), out, depth + 1u, access_predicate, other_exec);
+	};
+	// (x << s) & m == 0 and BFE(x << s, offset, count) == 0 when the field lies below the shift (packed patch ordinal).
+	const auto shifted_below = [](const Inst* source, uint32_t limit) {
+		if (source == nullptr || source->GetOpcode() != ValueOpcode::ShiftLeftLogical32) return false;
+		const auto shift = source->Arg(1).Resolve();
+		return shift.IsImmediate() && shift.U32() < 32u && limit <= shift.U32();
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::SelectU32:
+			// A predicated VGPR write: Select(exec, new value, old value).
+			if (arg(1, a)) {
+				if (other_exec != nullptr && access_predicate != nullptr &&
+				    inst->Arg(0).Resolve() != access_predicate->Resolve()) {
+					// Still exact when every accessing lane made the write (the access's EXEC is a LogicalAnd chain with
+					// the write's) or when the old value is the same address; otherwise the address depends on the lane.
+					const auto implies = [&](auto&& self, Value p, Value q, uint32_t d) -> bool {
+						p = p.Resolve();
+						if (p == q) return true;
+						const auto* conj = p.TryInstruction();
+						return d < 8u && conj != nullptr && conj->GetOpcode() == ValueOpcode::LogicalAnd &&
+						       (self(self, conj->Arg(0), q, d + 1u) || self(self, conj->Arg(1), q, d + 1u));
+					};
+					uint32_t   old     = 0;
+					const bool covered = implies(implies, *access_predicate, inst->Arg(0).Resolve(), 0u);
+					const bool same    = !covered && arg(2, old) && old == a;
+					static std::atomic_uint logged {0};
+					if (logged.fetch_add(1) < 32u) {
+						std::fprintf(stderr, "TESS_RING_PREDICATE %s new=%u%s\n",
+						             covered ? "covered" : same ? "same_both" : "lane_dependent", a,
+						             same ? "" : covered ? "" : " (address depends on the lane)");
+					}
+					if (!covered && !same) *other_exec = true;
+				}
+				result = a;
+				return true;
+			}
+			return false;
+		case ValueOpcode::Phi: {
+			bool found = false;
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				if (!arg(i, a)) return false;
+				if (found && a != result) return false;
+				result = a;
+				found  = true;
+			}
+			return found;
+		}
+		case ValueOpcode::IAdd32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a + b;
+			return true;
+		case ValueOpcode::ISub32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a - b;
+			return true;
+		case ValueOpcode::IMul32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a * b;
+			return true;
+		case ValueOpcode::ShiftLeftLogical32:
+			if (!arg(0, a) || !arg(1, b) || b >= 32u) return false;
+			result = a << b;
+			return true;
+		case ValueOpcode::ShiftRightLogical32:
+			if (!arg(0, a) || !arg(1, b) || b >= 32u) return false;
+			result = a >> b;
+			return true;
+		case ValueOpcode::BitwiseOr32:
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a | b;
+			return true;
+		case ValueOpcode::BitwiseAnd32: {
+			for (size_t side = 0; side < 2u; side++) {
+				const auto mask = inst->Arg(side ^ 1u).Resolve();
+				if (mask.IsImmediate()) {
+					uint32_t width = 0;
+					while (width < 32u && (mask.U32() >> width) != 0u) width++;
+					if (shifted_below(inst->Arg(side).Resolve().TryInstruction(), width)) {
+						result = 0;
+						return true;
+					}
+				}
+			}
+			if (!arg(0, a) || !arg(1, b)) return false;
+			result = a & b;
+			return true;
+		}
+		case ValueOpcode::BitFieldUExtract: {
+			if (!arg(1, b) || !arg(2, c) || b > 32u || c > 32u - b) return false;
+			if (shifted_below(inst->Arg(0).Resolve().TryInstruction(), b + c)) {
+				result = 0;
+				return true;
+			}
+			if (!arg(0, a)) return false;
+			result = c == 0u ? 0u : c == 32u ? a : (a >> b) & ((1u << c) - 1u);
+			return true;
+		}
+		default: return false;
+	}
+}
+
+// The VGPRs the HS part of a split merged LS+HS program reads before writing them (ShaderTessellationInputInfo::
+// carried_vgprs). On the hardware one wave runs the LS part and then the HS part, so such a register still holds what
+// the LS part left in the lane: the 2.000 translucent-particle HS takes the particle's index, flags and camera-relative
+// position that way (v6-v9, v12, v13) instead of reading them back from LDS as the 1.x HS halves do.
+// The set may only err on the large side: a read counts every register its operand could cover, a write counts only
+// when it certainly replaces the whole register in every lane that later reads it, i.e. a full-width write in the
+// straight-line code after the entry sequence (EXEC = all, V_CMPX lane < HS threads, S_CBRANCH_EXECZ) and before the
+// first branch or other EXEC change (a write under a narrower EXEC keeps the LS value in the other lanes). An extra
+// register only costs one carried u32.
+std::array<uint32_t, 8> MergedHullCarriedVgprs(const Decoder::Program& control) {
+	using namespace Decoder;
+	std::bitset<IR::NumVectorRegs> defined, live;
+	defined.set(0); // the back half's own V_MBCNT lane index (SplitMergedHullProgram)
+	defined.set(1); // the packed HS IDs the frontend sets
+	bool entry    = true;
+	bool definite = true;
+	for (const auto& inst: control.instructions) {
+		const auto text  = InstructionToString(inst);
+		const auto colon = text.find(": ");
+		const auto start = colon == std::string::npos ? 0u : colon + 2u;
+		const auto name  = text.substr(start, text.find(' ', start) - start);
+		const auto has   = [&](const char* part) { return name.find(part) != std::string::npos; };
+		const bool memory = inst.family == Family::MUBUF || inst.family == Family::MTBUF ||
+		                    inst.family == Family::FLAT || inst.family == Family::DS || inst.family == Family::MIMG;
+		const bool load   = memory && !has("D16") &&
+		                  (has("LOAD") || name.starts_with("DS_READ") || has("SAMPLE") || has("GATHER"));
+		const bool valu   = inst.family == Family::VOP1 || inst.family == Family::VOP2 ||
+		                  inst.family == Family::VOP3 || inst.family == Family::VOP3P;
+		// Destinations that keep part of the old value (or read it): accumulators, lane writes, sub-dword writes.
+		const bool partial = has("MAC") || has("DOT2C") || has("DOT4C") || has("DOT8C") || has("WRITELANE") ||
+		                     has("MOVREL") || has("D16") || inst.dst.sdwa_sel != 6u || inst.dst.op_sel || inst.dst.dpp;
+		const auto read = [&](const Operand& operand, uint32_t width) {
+			if (operand.kind != OperandKind::Vgpr) return;
+			for (uint32_t index = 0; index < width && operand.reg + index < IR::NumVectorRegs; index++) {
+				if (!defined[operand.reg + index]) live.set(operand.reg + index);
+			}
+		};
+		const uint32_t source_width = memory ? std::max(inst.data_dwords, 4u)
+		                              : has("64")  ? 2u
+		                                           : 1u;
+		for (const auto* operand: {&inst.src0, &inst.src1, &inst.src2, &inst.src3}) read(*operand, source_width);
+		if (inst.family == Family::MIMG) {
+			read(inst.src0, std::max(inst.image_address_components, 4u));
+			for (uint32_t index = 0; index < inst.image_nsa_dwords && index < MaxImageNsaAddressComponents; index++) {
+				const Operand address {.kind = OperandKind::Vgpr, .reg = inst.image_nsa_addr[index]};
+				read(address, 1u);
+			}
+		}
+		if ((memory && !load) || ((valu || memory) && partial)) {
+			read(inst.dst, std::max(inst.data_dwords, 2u)); // store data, atomics, partial writes
+		}
+		if (entry) {
+			const bool entry_inst = inst.opcode == Opcode::V_MBCNT_LO_U32_B32 || inst.opcode == Opcode::V_MBCNT_HI_U32_B32 ||
+			                        inst.opcode == Opcode::S_MOV_B64 || inst.opcode == Opcode::V_CMPX_LT_U32 ||
+			                        inst.opcode == Opcode::S_BARRIER || inst.opcode == Opcode::S_INST_PREFETCH ||
+			                        inst.opcode == Opcode::S_WAITCNT || inst.opcode == Opcode::S_NOP;
+			if (inst.opcode == Opcode::S_CBRANCH_EXECZ || !entry_inst) entry = false;
+			if (entry || inst.opcode == Opcode::S_CBRANCH_EXECZ) continue;
+		}
+		if (IsDirectBranch(inst.opcode) || inst.opcode == Opcode::S_SETPC_B64 || inst.opcode == Opcode::S_SWAPPC_B64 ||
+		    inst.opcode == Opcode::S_ENDPGM || text.find("exec") != std::string::npos ||
+		    text.find("EXEC") != std::string::npos) {
+			definite = false;
+		}
+		if (!definite || inst.dst.kind != OperandKind::Vgpr || partial) continue;
+		if (valu) {
+			defined.set(inst.dst.reg);
+		} else if (load && (inst.family == Family::DS || inst.family == Family::MUBUF || inst.family == Family::MTBUF)) {
+			for (uint32_t index = 0; index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < IR::NumVectorRegs;
+			     index++) {
+				defined.set(inst.dst.reg + index);
+			}
+		} else if (load) {
+			defined.set(inst.dst.reg);
+		}
+	}
+	live.reset(0);
+	live.reset(1);
+	std::array<uint32_t, 8> mask {};
+	for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+		if (live[reg]) mask[reg / 32u] |= 1u << (reg % 32u);
+	}
+	return mask;
+}
+
+} // namespace
+
+
+void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+                                 ShaderTessellationInputInfo& info, bool merged) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
-	ReflectTessellationLayout(local_program, true, info);
-	ReflectTessellationLayout(control_program, false, info);
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
-	     "patch_base=0x%x patch_size=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
-	     info.patch_base, info.patch_size);
-	return true;
+	// KYTY_TRACE_SHADER_CODE_DIR=<dir> (diagnostic): the LS and HS code of every analysed pair, raw and decoded, named
+	// by an FNV-1a hash of the code (written before the analysis, so an unsupported pattern can be inspected).
+	if (const char* dir = Common::EnvRead::ShaderCodeDir(); dir != nullptr) {
+		const auto dump = [&](const char* stage, std::span<const uint32_t> code, const Decoder::Program& decoded) {
+			uint64_t hash = 0xcbf29ce484222325ull;
+			for (const auto word: code) hash = (hash ^ word) * 0x100000001b3ull;
+			const auto base = fmt::format("{}/tess_{}_{:016x}", dir, stage, hash);
+			if (FILE* f = std::fopen((base + ".bin").c_str(), "wb")) {
+				std::fwrite(code.data(), 1, code.size_bytes(), f);
+				std::fclose(f);
+			}
+			const auto text = Decoder::ProgramToString(decoded);
+			if (FILE* f = std::fopen((base + ".asm").c_str(), "w")) {
+				std::fwrite(text.data(), 1, text.size(), f);
+				std::fclose(f);
+			}
+			std::fprintf(stderr, "TESS_DUMP %s %s.bin (%zu dwords)\n", stage, base.c_str(), code.size());
+		};
+		dump("ls", local, local_program);
+		dump("hs", control, control_program);
+	}
+	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
+	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
+	                                           info.ls_stride);
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	info.carried_vgprs = {};
+	if (!merged) return;
+	info.carried_vgprs = MergedHullCarriedVgprs(control_program);
+	std::string list;
+	uint32_t    count = 0;
+	for (uint32_t reg = 0; reg < IR::NumVectorRegs; reg++) {
+		if (((info.carried_vgprs[reg / 32u] >> (reg % 32u)) & 1u) == 0u) continue;
+		list += fmt::format(" v{}", reg);
+		count++;
+	}
+	if (count == 0u) return;
+	// HS thread i of a patch ran the LS part for the patch's vertex i: the same lane only when the counts agree.
+	EXIT_NOT_IMPLEMENTED(info.input_control_points != info.output_control_points);
+	// The carried registers follow the LS outputs in the LS -> HS interface (Vulkan guarantees 64 components per
+	// vertex there, the GPUs this runs on offer 128).
+	const auto components = (info.ls_stride + 15u) / 16u * 4u + (count + 3u) / 4u * 4u;
+	if (components > 128u) {
+		EXIT("merged HS program carries %u VGPRs from its LS part: %u interface components (max 128):%s\n", count,
+		     components, list.c_str());
+	}
+	LOGF("Tessellation interface: the merged program's HS part carries %u VGPRs from its LS part:%s\n", count,
+	     list.c_str());
+	if (std::getenv("KYTY_TRACE_TESS_LOWERING") != nullptr) {
+		std::fprintf(stderr, "TESS_CARRIED count=%u%s\n", count, list.c_str());
+	}
 }
 
-bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
+void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
 	using namespace IR;
 	if (options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
 	    options.stage != ShaderType::TessellationEvaluation) {
-		return true;
+		return;
 	}
-	const auto unsupported = [&](const char* what) {
-		TESS_LOG("%s tessellation lowering does not model %s\n",
-		     options.stage == ShaderType::Local                 ? "LS"
-		     : options.stage == ShaderType::TessellationControl ? "HS"
-		                                                       : "TES",
-		     what);
-		return false;
-	};
 	const auto& tess = options.input_info.vertex->tess;
-#if defined(ANYPS5_KYTY)
-	const bool merged = options.stage == ShaderType::TessellationControl && tess.merged_hull != 0;
-	if (merged) {
-		RequireMergedHullControlPoints(tess);
-		RequireMergedHullBarriers(program);
-		LowerMergedHullLanes(program);
-		ConstantPropagationPass(program.blocks, program.wave_size);
-	}
-#endif
-	{
-		const auto shift_amount = [](const Value& value, uint32_t& amount) {
-			const auto* shl = value.Resolve().TryInstruction();
-			if (shl == nullptr || shl->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
-			    !shl->Arg(1).Resolve().IsImmediate())
-				return false;
-			amount = shl->Arg(1).Resolve().U32();
-			return amount < 32u;
-		};
-		for (auto* block: program.blocks) {
-			for (auto& inst: *block) {
-				uint32_t amount = 0;
-				if (inst.GetOpcode() == ValueOpcode::BitwiseAnd32) {
-					for (uint32_t side = 0; side < 2u; side++) {
-						const auto mask = inst.Arg(side).Resolve();
-						if (mask.IsImmediate() && shift_amount(inst.Arg(1u - side), amount) &&
-						    (mask.U32() >> amount) == 0u) {
-							inst.ReplaceUsesWith(Value(0u));
-							break;
-						}
-					}
-				} else if (inst.GetOpcode() == ValueOpcode::BitFieldUExtract &&
-				           inst.Arg(1).Resolve().IsImmediate() &&
-				           inst.Arg(2).Resolve().IsImmediate() &&
-				           shift_amount(inst.Arg(0), amount) &&
-				           inst.Arg(1).Resolve().U32() + inst.Arg(2).Resolve().U32() <= amount) {
-					inst.ReplaceUsesWith(Value(0u));
-				}
-			}
-		}
-	}
+	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
+	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
-#if defined(ANYPS5_KYTY)
-			if (merged) {
-				const bool lds =
-				    SharedAccessOf(it->GetOpcode()) != SharedAccess::None &&
-				    program.memory_info.at(it->Flags<MemoryFlags>().index).kind == ResourceKind::Lds;
-				if (lds || TessellationBufferBase(*it) != nullptr) {
-					const size_t index   = lds ? 0u : 2u;
-					const auto   address = MergedHullAddresses(tess.output_control_points,
-					                                           it->Arg(it->NumArgs() - 1u))
-					                           .Evaluate(it->Arg(index));
-					if (address.known) {
-						it->SetArg(index, MergedHullAddressValue(*block, it, address));
-						continue;
-					}
-					if (lds) {
-						std::unordered_map<Inst*, Value> active;
-						it->SetArg(0, ActiveAddress(*block, it, it->Arg(0),
-						                            it->Arg(it->NumArgs() - 1u), active));
-						continue;
-					}
-				}
-			}
-#endif
 			if (TessellationBufferBase(*it) == nullptr) continue;
 			std::unordered_map<Inst*, Value> resolved;
 			it->SetArg(
@@ -976,20 +568,10 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		}
 	}
 	ConstantPropagationPass(program.blocks, program.wave_size);
-	uint32_t reads = 0, writes = 0, factors = 0, patches = 0;
-#if defined(ANYPS5_KYTY)
-	std::vector<MergedHullTraffic> barriers, record_writes, record_reads, ring_writes, ring_reads;
-	uint32_t                       order = 0;
-#endif
+	uint32_t reads = 0, writes = 0, factors = 0;
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto&      inst   = *it;
-#if defined(ANYPS5_KYTY)
-			order++;
-			if (merged && inst.GetOpcode() == ValueOpcode::Barrier) {
-				barriers.push_back({block, order, block->start_pc});
-			}
-#endif
 			const auto shared = SharedAccessOf(inst.GetOpcode());
 			const auto buffer = BufferAccessOf(inst.GetOpcode());
 			if (shared == SharedAccess::None && buffer == BufferAccess::None) {
@@ -1002,36 +584,13 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			Value                 address, predicate;
 			if (shared != SharedAccess::None && memory.kind == ResourceKind::Lds) {
 				write = shared == SharedAccess::Write;
-#if defined(ANYPS5_KYTY)
-				if (merged) {
-					if (memory.data_bits != 32u ||
-					    (shared != SharedAccess::Read && shared != SharedAccess::Write)) {
-						return unsupported("this LDS access");
-					}
-					RequireMergedHullRecord(tess, inst.Arg(0), memory.offset,
-					                        SharedComponentCount(inst.GetOpcode()), write,
-					                        inst.Flags<MemoryFlags>().pc);
-					const bool own = MergedHullAddresses(tess.output_control_points, {})
-					                     .Evaluate(inst.Arg(0))
-					                     .coefficient != 0u;
-					if (write || !own) {
-						(write ? record_writes : record_reads)
-						    .push_back({block, order, inst.Flags<MemoryFlags>().pc});
-					}
-				} else
-#endif
-				if (memory.data_bits != 32u ||
-				    (options.stage == ShaderType::Local
-				         ? !write
-				         : options.stage != ShaderType::TessellationControl ||
-				               shared != SharedAccess::Read)) {
-					return unsupported("this LDS access");
-				}
+				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u ||
+				                     (options.stage == ShaderType::Local
+				                          ? !write
+				                          : options.stage != ShaderType::TessellationControl ||
+				                                shared != SharedAccess::Read));
 				kind       = write ? TessellationAttribute::LocalOutput
 				                   : TessellationAttribute::ControlInput;
-#if defined(ANYPS5_KYTY)
-				if (merged) kind = TessellationAttribute::ControlShared;
-#endif
 				components = SharedComponentCount(inst.GetOpcode());
 				address    = inst.Arg(0);
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
@@ -1040,53 +599,50 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				if (base == nullptr) {
 					continue;
 				}
-				if (memory.data_bits != 32u || memory.formatted || memory.idxen || !memory.offen ||
-				    buffer == BufferAccess::Atomic) {
-					return unsupported("this ring buffer access");
-				}
+				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u || memory.formatted || memory.idxen ||
+				                     !memory.offen || buffer == BufferAccess::Atomic);
 				write      = buffer == BufferAccess::Write;
 				components = BufferComponentCount(inst.GetOpcode());
 				address    = inst.Arg(2).Resolve();
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
-				if (base->Arg(0).U32() == 1u) {
-					if (!write || options.stage != ShaderType::TessellationControl) {
-						return unsupported("a tessellation factor access outside the HS");
+				if (bool other_exec = false; !address.IsImmediate()) {
+					if (uint32_t evaluated = 0; EvaluateActiveAddress(address, evaluated, 0, &predicate, &other_exec)) {
+						static std::atomic_uint logged {0};
+						if (other_exec || logged.fetch_add(1) < 16u) {
+							std::fprintf(stderr, "TESS_RING_ADDRESS stage=%u write=%d address=%u%s\n",
+							             static_cast<uint32_t>(options.stage), write ? 1 : 0, evaluated,
+							             other_exec ? " other_exec" : "");
+						}
+						address = Value(evaluated);
+						// KYTY_TRACE_PERF (PERF workaround_hits tess_ring): per translated program.
+						Common::WorkaroundHits::Note(Common::WorkaroundHits::Hit::TessRingEvaluated);
+						if (other_exec) {
+							EXIT("tessellation ring address %u depends on the lane (stage %u): a predicated write the access does not "
+							     "cover\n",
+							     evaluated, static_cast<uint32_t>(options.stage));
+						}
 					}
+				}
+				if (base->Arg(0).U32() == 1u) {
+					EXIT_NOT_IMPLEMENTED(!write ||
+					                     options.stage != ShaderType::TessellationControl);
 					kind = TessellationAttribute::Factor;
 					factors += components;
-#if defined(ANYPS5_KYTY)
-					if (merged) {
-						RequireMergedHullFirstInvocation(tess, predicate,
-						                                 inst.Flags<MemoryFlags>().pc);
-					}
-#endif
 				} else {
-					const bool output = options.stage == ShaderType::TessellationControl;
-					EXIT_NOT_IMPLEMENTED(
-					    !output && (write || options.stage != ShaderType::TessellationEvaluation));
-					kind = output ? TessellationAttribute::ControlOutput
-					              : TessellationAttribute::EvaluationInput;
-#if defined(ANYPS5_KYTY)
-					if (merged) {
-						RequireMergedHullRing(tess, address, memory.offset, components, write,
-						                      inst.Flags<MemoryFlags>().pc);
-					}
-#endif
+					kind = write ? TessellationAttribute::ControlOutput
+					             : TessellationAttribute::EvaluationInput;
+					EXIT_NOT_IMPLEMENTED(write
+					                         ? options.stage != ShaderType::TessellationControl
+					                         : options.stage != ShaderType::TessellationEvaluation);
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
-						const auto begin = address.U32() + memory.offset;
-						EXIT_NOT_IMPLEMENTED(begin < tess.patch_base ||
-						                     begin + 4u * components >
-						                         tess.patch_base + tess.patch_size);
-						kind = output ? TessellationAttribute::PatchOutput
-						              : TessellationAttribute::PatchInput;
-#if defined(ANYPS5_KYTY)
-						if (merged && write) {
-							RequireMergedHullFirstInvocation(tess, predicate,
-							                                 inst.Flags<MemoryFlags>().pc);
+						if (!write) {
+							EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::TessellationEvaluation);
+							kind = TessellationAttribute::PatchInput;
+						} else {
+							EXIT_NOT_IMPLEMENTED(!write);
+							kind = TessellationAttribute::PatchOutput;
 						}
-#endif
-						if (write || !output) patches += components;
 					}
 				}
 			} else {
@@ -1131,37 +687,26 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					                   {values[0], values[1], values[2], values[3]});
 				inst.ReplaceUsesWith(replacement);
 			}
-#if defined(ANYPS5_KYTY)
-			if (merged && kind == TessellationAttribute::ControlOutput &&
-			    tess.output_control_points != 1u) {
-				const auto pc = inst.Flags<MemoryFlags>().pc;
-				if (write) {
-					ring_writes.push_back({block, order, pc});
-				} else if (MergedHullAddresses(tess.output_control_points, {})
-				               .Evaluate(address)
-				               .coefficient == 0u) {
-					ring_reads.push_back({block, order, pc, values[0].TryInstruction()});
-				}
-			}
-#endif
 			inst.Invalidate();
 		}
 	}
-#if defined(ANYPS5_KYTY)
-	RequireMergedHullBarrierOrder(barriers, record_writes, record_reads);
-	OrderMergedHullRingReads(program, ring_writes, ring_reads);
-#endif
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
-	EXIT_NOT_IMPLEMENTED(options.stage == ShaderType::TessellationControl &&
-	                     tess.patch_size != 0u && patches == 0u);
-	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u patches=%u\n",
+	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"
 	                                                       : "TES",
-	     reads, writes, factors, patches);
-	return true;
+	     reads, writes, factors);
+	// KYTY_TRACE_TESS_LOWERING (diagnostic): the same summary on stderr, with the program and its layout.
+	if (std::getenv("KYTY_TRACE_TESS_LOWERING") != nullptr) {
+		std::fprintf(stderr, "TESS_LOWERING %s hash=0x%016llx reads=%u writes=%u factors=%u ls_stride=%u hs_stride=%u cp=%u/%u\n",
+		             options.stage == ShaderType::Local                 ? "LS"
+		             : options.stage == ShaderType::TessellationControl ? "HS"
+		                                                               : "TES",
+		             static_cast<unsigned long long>(options.shader_hash), reads, writes, factors, tess.ls_stride,
+		             tess.hs_stride, tess.input_control_points, tess.output_control_points);
+	}
 }
 
-}
+} // namespace Libs::Graphics::ShaderRecompiler

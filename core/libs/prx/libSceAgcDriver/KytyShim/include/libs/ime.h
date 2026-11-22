@@ -169,6 +169,6 @@ bool        HostAccept(uint64_t generation);
 bool        HostCancel(uint64_t generation);
 bool        HostQueueExternalInput(uint64_t generation, ExternalInput input);
 
-}
+} // namespace Libs::Ime
 
-#endif
+#endif // EMULATOR_INCLUDE_EMULATOR_LIBS_IME_H_

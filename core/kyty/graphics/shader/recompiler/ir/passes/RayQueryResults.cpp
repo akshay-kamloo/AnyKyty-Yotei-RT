@@ -989,17 +989,6 @@ private:
 				}
 				return nullptr;
 			}
-			case Op::LoadDeviceAddressU32:
-				for (uint32_t lane = 0; lane < m_wave; ++lane) {
-					if ((a(3, lane) & 1u) == 0) {
-						At(out, lane) = 0;
-						continue;
-					}
-					const auto address = (u32(a(0, lane)) | u32(a(1, lane)) << 32u) + u32(a(2, lane));
-					At(out, lane)      = Memory(address);
-					if (m_tracking && m_walk) m_taint[out] |= MemoryTaint(address);
-				}
-				return nullptr;
 			case Op::LoadSharedU32:
 			case Op::LoadSharedU32x2:
 			case Op::LoadSharedU32x3:

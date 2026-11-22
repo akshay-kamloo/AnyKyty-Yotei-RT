@@ -1,6 +1,11 @@
+#include "graphics/host_gpu/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/drawCoverage.h"
 
 #include "common/assert.h"
+
+#include <chrono>
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
@@ -14,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <fmt/format.h>
 #include <xxhash.h>
 
@@ -21,8 +27,13 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Defined at the end of the file (windows.h stays out of the rest): the calling thread's return addresses as
+// offsets into the executable, for resolving with the link map.
+void PrintHostBacktrace();
+
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
 	switch (type) {
+		case Prospero::ImageType::kColor1D: return vk::ImageType::e1D;
 		case Prospero::ImageType::kColor3D: return vk::ImageType::e3D;
 		case Prospero::ImageType::kColor2D: return vk::ImageType::e2D;
 		default: EXIT("non-base image type: %u\n", static_cast<uint32_t>(type));
@@ -104,7 +115,7 @@ void ValidateOptionalRange(GuestRange range, const char* name) {
 	}
 }
 
-}
+} // namespace
 
 vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	switch (format) {
@@ -120,50 +131,53 @@ vk::ImageAspectFlags Image::FullAspectMask(vk::Format format) noexcept {
 	}
 }
 
-static bool AttachmentKeepsShaderRead(vk::ImageLayout layout, vk::AccessFlags2 access,
-                                      vk::ImageLayout destination_layout,
-                                      vk::AccessFlags2 destination_access) {
-	constexpr auto attachment = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-	                            vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-	return layout == destination_layout &&
-	       (layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal ||
-	        layout == vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal) &&
-	       (access & attachment) == attachment && (destination_access & attachment) == attachment &&
-	       (access ^ destination_access) == vk::AccessFlagBits2::eShaderRead;
-}
 
 Image::Barriers Image::GetBarriers(vk::ImageLayout                      destination_layout,
                                    vk::AccessFlags2                     destination_access,
                                    vk::PipelineStageFlags2              destination_stage,
                                    std::optional<ImageSubresourceRange> range) {
-	constexpr vk::AccessFlags2 WriteAccess =
-	    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
-	    vk::AccessFlagBits2::eColorAttachmentWrite |
-	    vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
-	    vk::AccessFlagBits2::eHostWrite | vk::AccessFlagBits2::eMemoryWrite;
-	if (destination_access & WriteAccess) {
-		write_count++;
-	}
 	auto& state              = backing.state;
 	auto& subresource_states = backing.subresource_states;
+	// A watched image's layout change is published when this returns.
+	struct LayoutWatch {
+		const Image&          image;
+		const vk::ImageLayout before;
+		~LayoutWatch() {
+			if (image.bindless_watched && image.backing.state.layout != before) {
+				g_bindless_layout_epoch.fetch_add(1, std::memory_order_relaxed);
+				if (g_bindless_layout_log_on.load(std::memory_order_relaxed)) { // bindless table refresh events
+					std::scoped_lock lock(g_bindless_layout_log.mutex);
+					g_bindless_layout_log.ids.push_back(image.self_id);
+				}
+			}
+		}
+	} layout_watch {*this, state.layout};
 	if (range && info.IsVolume()) {
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
+	// The host image's levels: fewer than the guest's when the guest declares levels past the complete chain
+	// (ImageInfo::HostLevels; a view, copy or clear of those stops the emulator).
+	const uint32_t levels = backing.mip_levels;
+	if (range && levels < info.resources.levels) {
+		range->base_level  = std::min(range->base_level, levels - 1u);
+		range->level_count = std::min(range->level_count, levels - range->base_level);
+	}
 
 	const bool partial =
-	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	    range && (range->base_level != 0 || range->level_count != levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
+
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
-			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+			subresource_states.resize(levels * info.resources.layers, state);
 		}
 
 		const uint32_t base_level  = partial ? range->base_level : 0;
-		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
+		const uint32_t level_count = partial ? range->level_count : levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
@@ -177,12 +191,6 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 				                              vk::AccessFlagBits2::eMemoryWrite;
 				const bool     repeated_write =
 				    static_cast<bool>(subresource_state.access_mask & write_access);
-				if (AttachmentKeepsShaderRead(subresource_state.layout, subresource_state.access_mask,
-				                              destination_layout, destination_access)) {
-					subresource_state.access_mask |= destination_access;
-					subresource_state.pl_stage |= destination_stage;
-					continue;
-				}
 				if (subresource_state.layout != destination_layout ||
 				    subresource_state.access_mask != destination_access || repeated_write) {
 					vk::ImageMemoryBarrier2 barrier {};
@@ -218,12 +226,6 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		    !repeated_write) {
 			return {};
 		}
-		if (AttachmentKeepsShaderRead(state.layout, state.access_mask, destination_layout,
-		                              destination_access)) {
-			state.access_mask |= destination_access;
-			state.pl_stage |= destination_stage;
-			return {};
-		}
 
 		vk::ImageMemoryBarrier2 barrier {};
 		barrier.srcStageMask                    = state.pl_stage;
@@ -243,24 +245,36 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
+	// Resident heaps sample their images in the read state; only leaving it invalidates them.
 	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
 		    return barrier.oldLayout == ReadLayout() &&
 		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
 	    })) {
 		HeapChanged();
-	} else if (state.layout != destination_layout || state.access_mask != destination_access ||
-	           std::ranges::any_of(barriers, [](const vk::ImageMemoryBarrier2& barrier) {
-		           return barrier.oldLayout != barrier.newLayout ||
-		                  barrier.srcAccessMask != barrier.dstAccessMask;
-	           })) {
-		StateChanged();
 	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer) {
+                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+	// KYTY_TRACE_TARGET_REPEAT (diagnostic): this call's time and barrier, by the draw phase it runs in
+	struct TraceScope {
+		bool                                  on = TargetTrace::On();
+		std::chrono::steady_clock::time_point start;
+		bool                                  barrier = false;
+		TraceScope() {
+			if (on) start = std::chrono::steady_clock::now();
+		}
+		~TraceScope() {
+			if (!on) return;
+			const int p = TargetTrace::t_phase;
+			TargetTrace::t_calls[p]++;
+			TargetTrace::t_ns[p] += static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+			if (barrier) TargetTrace::t_barriers[p]++;
+		}
+	} trace_scope;
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
@@ -277,11 +291,16 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 	if (barriers.empty()) {
 		return;
 	}
+	trace_scope.barrier = true;
+	DrawCoverage::t_barriers++; // KYTY_TRACE_PEEK_CENSUS (way B W0 Table B)
 	m_scheduler.EndRendering();
 	vk::DependencyInfo dependency {};
 	dependency.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
 	dependency.pImageMemoryBarriers    = barriers.data();
+	const bool label = GpuTimer::LabelsEnabled(); // KYTY_TRACE_VK_LABELS
+	if (label) GpuTimer::LabelEmu(command_buffer, "image transition");
 	command_buffer.pipelineBarrier2(dependency);
+	if (label) GpuTimer::LabelEnd(command_buffer);
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
@@ -309,6 +328,7 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 266u);
 	command.copyBufferToImage(buffer, backing.image, vk::ImageLayout::eTransferDstOptimal,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eTransfer;
@@ -319,6 +339,8 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 	dependency.imageMemoryBarrierCount = 0;
 	dependency.pImageMemoryBarriers    = nullptr;
 	command.pipelineBarrier2(dependency);
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
@@ -347,6 +369,7 @@ void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buf
 	dependency.pImageMemoryBarriers     = image_barriers.data();
 	auto command                        = m_scheduler.Current().Handle();
 	command.pipelineBarrier2(dependency);
+	GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 306u);
 	command.copyImageToBuffer(backing.image, vk::ImageLayout::eTransferSrcOptimal, buffer,
 	                          static_cast<uint32_t>(copies.size()), copies.data());
 	buffer_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eCopy;
@@ -373,9 +396,9 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 	}
 	if (source_type == destination_type) {
 		source_layers = destination_layers = std::min(source_layers, destination_layers);
-	} else if (source_type == vk::ImageType::e2D) {
+	} else if (source_type == vk::ImageType::e2D && destination_type == vk::ImageType::e3D) {
 		source_layers = depth;
-	} else {
+	} else if (source_type == vk::ImageType::e3D && destination_type == vk::ImageType::e2D) {
 		destination_layers = depth;
 	}
 	return {source_layers, destination_layers};
@@ -385,26 +408,27 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	uint32_t       base_depth = source.backing.extent.depth;
-	if (source.backing.image_type == backing.image_type) {
-		base_depth = std::min(base_depth, backing.extent.depth);
-	} else if (backing.image_type == vk::ImageType::e3D) {
-		base_depth = backing.extent.depth;
-	}
-	const auto source_aspect =
+	const uint32_t base_depth = source.backing.image_type == backing.image_type
+	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
+	                            : backing.image_type == vk::ImageType::e3D
+	                                ? backing.extent.depth
+	                                : source.backing.extent.depth;
+	const auto     source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
-	std::array<vk::ImageCopy, std::tuple_size_v<decltype(ImageInfo::mip_layout)>> copies {};
+	std::vector<vk::ImageCopy> copies;
+	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
+		// Overlapping cache images can differ in size; copying the source extent into a smaller
+		// destination writes out of bounds and loses the device.
 		const auto width  = std::min(std::max(source.backing.extent.width >> level, 1u),
 		                             std::max(backing.extent.width >> level, 1u));
 		const auto height = std::min(std::max(source.backing.extent.height >> level, 1u),
 		                             std::max(backing.extent.height >> level, 1u));
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
-
-		auto& copy          = copies[level];
+		vk::ImageCopy copy {};
 		copy.srcSubresource = {source_aspect, level, 0, 1};
 		copy.dstSubresource = {destination_aspect, level, 0, 1};
 		if (source.backing.image_type == backing.image_type) {
@@ -422,13 +446,21 @@ void Image::CopyImage(Image& source) {
 			copy.dstSubresource.layerCount = destination_layers;
 			copy.extent                    = {width, height, destination_layers};
 		}
+		copies.push_back(copy);
+	}
+	if (copies.empty()) {
+		return;
 	}
 	auto command = m_scheduler.Current().Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 387u);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
-	                  vk::ImageLayout::eTransferDstOptimal, levels, copies.data());
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
+	                  copies.data());
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
@@ -475,6 +507,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         resolved_destination_range.base_level,
 		                         resolved_destination_range.base_layer, layers};
 		region.extent         = resolve_extent;
+		GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 438u);
 		command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 		                  vk::ImageLayout::eTransferDstOptimal, region);
 	} else {
@@ -520,7 +553,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 
 	vk::BufferMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferRead;
 	barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.buffer              = buffer.Handle();
@@ -573,6 +608,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
 				command.pipelineBarrier2(dependency);
+				GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 538u);
 				command.copyImageToBuffer(source.backing.image,
 				                          vk::ImageLayout::eTransferSrcOptimal, buffer.Handle(),
 				                          source_copy);
@@ -589,11 +625,14 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 					barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
 					command.pipelineBarrier2(dependency);
 				}
+				GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 554u);
 				command.copyBufferToImage(buffer.Handle(), backing.image,
 				                          vk::ImageLayout::eTransferDstOptimal, destination_copy);
 			}
 		}
 	}
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
@@ -603,7 +642,12 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
 	const auto depth  = std::max(backing.extent.depth >> mip, 1u);
-	EXIT_IF(width != source.backing.extent.width || height != source.backing.extent.height);
+	// A block-compressed level taken over from an uncompressed block-texel alias: copies between compressed and
+	// uncompressed formats count the source's texels (one per block here).
+	const bool block_alias   = info.IsBlock() && !source.info.IsBlock();
+	const auto source_width  = block_alias ? (width + 3u) / 4u : width;
+	const auto source_height = block_alias ? (height + 3u) / 4u : height;
+	EXIT_IF(source_width != source.backing.extent.width || source_height != source.backing.extent.height);
 	const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 	const auto aspects                             = FullAspectMask(source.backing.format);
 	EXIT_IF(aspects != FullAspectMask(backing.format));
@@ -617,14 +661,17 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 		auto& copy          = copies[copy_count++];
 		copy.srcSubresource = {aspect, 0, 0, source_layers};
 		copy.dstSubresource = {aspect, mip, layer, destination_layers};
-		copy.extent         = {width, height, depth};
+		copy.extent         = {source_width, source_height, depth};
 	}
 	auto command = m_scheduler.Current().Handle();
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
+	GpuCheckpoints::Mark(command, 0xFEED000000000000ull | (6ull << 16u) | 590u);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
 namespace ImageOps {
@@ -636,6 +683,7 @@ void Validate(const ImageInfo& info) {
 	if (info.pixel_format == vk::Format::eUndefined) {
 		const bool metadata_empty =
 		    info.metadata.range.Empty() && info.metadata.kind == ImageMetadataKind::None &&
+		    info.metadata.control == 0 &&
 		    info.metadata.compression == VideoOutCompression::Uncompressed &&
 		    !info.metadata.stencil_compressed;
 		if (info.data.Empty() || info.HasStencil() || !metadata_empty || info.extent.width == 0 ||
@@ -656,6 +704,11 @@ void Validate(const ImageInfo& info) {
 	}
 
 	switch (info.type) {
+		case Prospero::ImageType::kColor1D:
+			if (info.extent.height != 1 || info.extent.depth != 1) {
+				EXIT("invalid 1D image shape\n");
+			}
+			break;
 		case Prospero::ImageType::kColor3D:
 			if (info.resources.layers != 1) {
 				EXIT("3D images cannot have array layers\n");
@@ -677,7 +730,7 @@ void Validate(const ImageInfo& info) {
 	}
 	switch (info.metadata.kind) {
 		case ImageMetadataKind::None:
-			if (!info.metadata.range.Empty() ||
+			if (!info.metadata.range.Empty() || info.metadata.control != 0 ||
 			    info.metadata.compression != VideoOutCompression::Uncompressed ||
 			    info.metadata.stencil_compressed) {
 				EXIT("metadata-free image has metadata state\n");
@@ -711,7 +764,7 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 	}
 }
 
-}
+} // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
     : info(image_info),
@@ -730,7 +783,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.flags         = ImageCreateFlags(graphics, info, create.usage);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
-	create.mipLevels     = info.resources.levels;
+	create.mipLevels     = info.HostLevels();
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
@@ -750,6 +803,16 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	if (!graphics.CreateImage(create, backing)) {
+		std::fprintf(stderr,
+		             "IMAGE_CREATE_FAILED address=0x%016llx size=0x%llx guest_format=%d type=%d tile_mode=%d "
+		             "pitch=%u slice_stride=0x%llx metadata=%d samples=%u\n",
+		             static_cast<unsigned long long>(info.data.address),
+		             static_cast<unsigned long long>(info.data.size), static_cast<int>(info.guest_format),
+		             static_cast<int>(info.type), static_cast<int>(info.tile_mode), info.pitch,
+		             static_cast<unsigned long long>(info.tiled_slice_stride),
+		             static_cast<int>(info.metadata.kind), info.samples);
+		PrintHostBacktrace();
+		std::fflush(stderr);
 		EXIT("failed to create image: extent=%ux%ux%u format=%d layers=%u levels=%u\n",
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
@@ -763,7 +826,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 }
 
 uint64_t Image::HashGuestEdges() const {
-	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes;
+	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
 	const uint64_t head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
@@ -784,11 +847,44 @@ uint64_t Image::HashGuestEdges() const {
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
 	for (const auto& cached: views) {
-		m_graphics.device.destroyImageView(cached.view, nullptr);
+		if (cached.view != nullptr) {
+			m_graphics.device.destroyImageView(cached.view, nullptr);
+		}
 	}
 	if (backing.image != nullptr) {
 		m_graphics.DeleteImage(backing);
 	}
 }
 
+} // namespace Libs::Graphics
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h> // IWYU pragma: keep
+
+namespace Libs::Graphics {
+namespace {
+void PrintHostBacktrace() {
+	void*      frames[48] {};
+	const auto count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+	const auto base  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	for (USHORT i = 0; i < count; i++) {
+		const auto address = reinterpret_cast<uint64_t>(frames[i]);
+		std::fprintf(stderr, "  host frame %u: exe+0x%llx (0x%016llx)\n", static_cast<unsigned>(i),
+		             static_cast<unsigned long long>(address - base), static_cast<unsigned long long>(address));
+	}
 }
+} // namespace
+} // namespace Libs::Graphics
+#else
+namespace Libs::Graphics {
+namespace {
+void PrintHostBacktrace() {}
+} // namespace
+} // namespace Libs::Graphics
+#endif

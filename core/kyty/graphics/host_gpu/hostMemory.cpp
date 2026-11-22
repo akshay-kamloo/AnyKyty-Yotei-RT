@@ -4,7 +4,12 @@
 #include <cstdio>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef min
+#undef max
 #endif
 
 namespace Libs::Graphics {
@@ -22,7 +27,7 @@ bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 }
 #endif
 
-}
+} // namespace
 
 bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAccess access,
                           uint64_t& accessible_size) {
@@ -87,6 +92,10 @@ bool HostMemoryQueryReadable(uint64_t addr, uint64_t requested_size, uint64_t& r
 	return HostMemoryQueryRange(addr, requested_size, HostMemoryAccess::Read, readable_size);
 }
 
+bool HostMemoryIsReadable(uint64_t addr) {
+	return HostMemoryRangeIsReadable(addr, 1);
+}
+
 bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
 	if (addr == 0 || size == 0 || UINT64_MAX - addr < size) {
 		return false;
@@ -95,9 +104,4 @@ bool HostMemoryRangeIsReadable(uint64_t addr, uint64_t size) {
 	return HostMemoryQueryReadable(addr, size, readable_size) && readable_size >= size;
 }
 
-bool HostMemoryIsReadable(uint64_t addr) {
-	uint64_t readable_size = 0;
-	return HostMemoryQueryReadable(addr, 1, readable_size);
-}
-
-}
+} // namespace Libs::Graphics

@@ -90,15 +90,32 @@ Run from your game directory in PowerShell:
 $env:APS5_OUTPUT_RESOLUTION = "1600x900"   # or "1920x1080", "2560x1440"
 $env:ANYPS5_MOUSE_TOUCHPAD  = "1"          # enables mouse touchpad swipe support
 
-# Ensure diagnostic/trace overhead is off
+# Ensure diagnostic/trace and one-time precompile flags are off
 foreach ($v in @(
   'KYTY_TRACE_FRAMETIME','KYTY_TRACE_SLOW_FRAMES','KYTY_TRACE_PERF',
   'KYTY_TRACE_GPU_TIME','KYTY_TRACE_GPU_READ_WAITS','KYTY_TRACE_CALLER_WAITS',
-  'KYTY_VRAM_BUDGET_MB','APS5_PROFILE_DRAW','APS5_LOG_TIMESTAMPS'
+  'KYTY_VRAM_BUDGET_MB','APS5_PROFILE_DRAW','APS5_LOG_TIMESTAMPS',
+  'APS5_TRACE_AUDIOOUT2','APS5_TRACE_AJM',
+  'KYTY_IMPORT_HINTS','KYTY_EXPORT_HINTS','KYTY_PRECOMPILE_ONLY','KYTY_PRECOMPILE_THREADS'
 )) { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 
 .\app.exe
 ```
+
+### Upfront Shader Precompilation (`.kyhints`)
+To avoid first-visit shader compilation stutters when entering new areas, you can precompile known shaders/pipelines into `_PipelineCache` once before playing.
+
+> **Note:** `.kyhints` files are **not** bundled in this repository. Download the matching `v02.002.000` `.kyhints` file (e.g., `PPSA26344.kyhints`) from **[Erlou93/KytyPS5-Yotei Releases](https://github.com/Erlou93/KytyPS5-Yotei/releases)** and place it in your game run directory (next to `app.exe`).
+
+1. **Run the one-time headless precompile** (populates `_PipelineCache` and exits automatically):
+```powershell
+$env:KYTY_IMPORT_HINTS       = "PPSA26344.kyhints"
+$env:KYTY_PRECOMPILE_ONLY    = "1"
+$env:KYTY_PRECOMPILE_THREADS = "12"   # tune to your CPU core count
+.\app.exe
+```
+
+2. **Launch normally afterward:** Open a fresh PowerShell window (or clear `KYTY_IMPORT_HINTS`, `KYTY_PRECOMPILE_ONLY`, and `KYTY_PRECOMPILE_THREADS` as shown in *Clean Play Launch* above) and start `.\app.exe` (or `.\run-play.ps1`).
 
 ### Diagnostic / Benchmarking Launch
 Enable frame-time and GPU-time telemetry when measuring changes:
@@ -178,15 +195,17 @@ Code defaults live in `core/kyty/common/envDefaults.h`. Any variable set in your
 | `KYTY_TRACE_GPU_TIME=1` | Enables per-shader GPU timer telemetry. |
 | `KYTY_TRACE_SLOW_FRAMES=1` | Logs detailed breakdown for frames exceeding threshold. |
 | `KYTY_TRACE_CALLER_WAITS=1` | Traces CPU caller-wait / BAR readback stalls. |
+| `APS5_TRACE_AUDIOOUT2=1` | Logs `libSceAudioOut` (`AudioOut2`) port creation, channel formats, attributes, and mix stats. |
+| `APS5_TRACE_AJM=1` | Logs `libSceAjm` audio decoder jobs (AT9/Opus/AAC/MP3/PCM). |
 | `KYTY_PGO_WRITE_FRAME=<N>` | Flushes PGO `.profraw` data at frame `N` in `-PgoMode GEN` builds. |
 
 ## Known Issues & Troubleshooting
 
-- **First launch is slow / stutters:** Cold starts compile shaders and populate `_PipelineCache`. Subsequent launches reuse the cache and load much faster.
+- **First launch is slow / stutters:** Cold starts compile shaders and populate `_PipelineCache`. Subsequent launches reuse the cache and load much faster. For upfront precompilation, see **[Upfront Shader Precompilation (`.kyhints`)](#upfront-shader-precompilation-kyhints)** above (download `.kyhints` from [Erlou93/KytyPS5-Yotei Releases](https://github.com/Erlou93/KytyPS5-Yotei/releases) — not included in this repo).
 - **Checkered or pixelated shadows after a stutter/cutscene:** Draws whose pipelines are still compiling are skipped for a few frames, which can temporarily corrupt temporal shadow/lighting buffers. **Workaround:** Quit to the main menu and reload your save (no full restart needed).
 - **VRAM grows over long sessions:** Watch **Vulkan budget** in `Shift+F2`. If it approaches your GPU's VRAM limit and FPS drops, save, quit, and restart.
 - **`Insufficient system resources` on boot:** Increase your Windows page file to **32–64 GB** so Windows can commit the game's 13.5 GiB direct memory allocation.
-- **Upfront `.kyhints` precompilation (zero first-visit stutter):** Drop a matching `v02.002.000` `.kyhints` file into your game folder and run once with `='PPSA26344.kyhints'; ='1'; ='12'; .\app.exe` to precompile all known shaders/pipelines into `_PipelineCache` before playing.
+- **Missing character voices in cutscenes (under investigation):** Try switching the in-game **Audio Settings** output mode to **Headphones** or **TV Speakers (Stereo)**. When reporting or debugging audio issues, run with `$env:APS5_TRACE_AUDIOOUT2 = "1"` to capture audio port/channel logs.
 
 ## Upstream Projects & Credits
 

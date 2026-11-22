@@ -58,6 +58,8 @@ The provided PowerShell build scripts expect portable toolchains under `_tools\`
 - **llvm-mingw (Clang + `libc++` + `lld` + `llvm-profdata`)**: `_tools\llvm-mingw\bin\` (for the `kyty_gpu.prx` DLL build)
 
 ### 3. Build `kyty_gpu.prx` + System PRX Libraries (Recommended: ThinLTO DLL)
+
+> **Note:** Inherited upstream CI workflows (.github/workflows/) and Dependabot are removed on this fork; build locally on Windows using the scripts below.
 ```powershell
 # Standard Release + ThinLTO build (no PGO)
 .\build-erlou-dll.ps1 -Reconfigure

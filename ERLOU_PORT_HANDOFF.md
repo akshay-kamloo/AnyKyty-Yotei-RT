@@ -102,3 +102,20 @@
    - Capture a fresh PGO profile covering both cutscenes and open world, then rebuild `kyty_gpu.prx` with `-PgoMode USE`.
 5. **Repo Hygiene Reminder**:
    - Always update `README.md` on every GitHub push, never commit `.kyhints` files (link users to `https://github.com/Erlou93/KytyPS5-Yotei/releases`), and keep `3rdparty/ZArchive` unstaged.
+
+## 8. Session Summary & Next-Session Handoff (v15–v21, 2026-11-22)
+- **Shipped & Verified (`AnyKyty` HEAD, compiled with `yotei-v3.profdata` PGO):**
+  - **`v15-pipeline-bindless-opt`**: Throttled `PipelineCache::SaveIfDue()` clock checks (`& 4095`), guarded `StartBackgroundCompiles()`, added 256-slot `O(1)` `m_compute_fast` cache in `GetComputePipeline()`, 64-slot `O(1)` `m_table_fast` cache in `BindlessTable::FindOrCreateTable()`, and 1-field record-table fast path in `PrepareBindlessTable()`.
+  - **`v16-eager-dma-prefetch`**: Added `PrefetchEagerReadbacks()` before `BufferFlush()`/`BufferFlushForInterrupt()` (`O(1)` hot bounding-box + reentrancy guard), expanded `RecordHotRead` to `<=64 KiB`, and batched `direct_plan.chunks` `vkCmdPipelineBarrier` (`download -31.5%`, `fence -20.0%`).
+  - **`v17-commands-batch-drain`**: `O(1)` `std::deque::swap` batch-drain of `m_commands` under a single lock acquisition in `GuestGpu::ProcessCommands()` and `RunCommandsWhileWaiting()` (`commands -22.6%`, `idle -13.8%`).
+  - **`v19-rebind-dedup-opt` + `v20-global-epoch-everywhere`**: Added `DrawRepeat::g_image_page_global_epoch` `O(1)` fast-path guard across `PeekProofFail`, `ObtainMemo`, `TableSet`, `ImageReplaySlot`, `BindlessTable::TableSlotInfo`, and `TargetReplaySlot`, plus a 64-slot per-tick `NativeUpload` content-dedup cache (`<=256 B`, exact CPU-RAM `memcmp`, `StreamBuffer::WrapEpoch()` guarded). Steady 3D (`draws>=1000`, `1600x900`): `42.06 ms/f` (23.8 FPS), RTX 5070 GPU util `61–64%` (`84–87.6 W`).
+  - **`v21-wddm-pure-vram`**: On Windows WDDM, skips persistently-mapped BAR allocation for guest `DeviceLocal` buffers `<256 MiB` unless `KYTY_BAR_READS=1`, routing 100% of guest buffers into pure `DEVICE_LOCAL` VRAM. Steady 3D: **`41.75 ms/f` (24.0 FPS)** across 73.6% of frames, `idle -17.7%` (`6.83 -> 5.62 ms/f`), zero BAR probe stalls, `PIPELINE_TIME=0`.
+- **Tested & Reverted (Do Not Re-Apply Without Redesign):**
+  - `v18` (4 Resolve Helpers): regressed `claim` (`0.48 -> 1.69 ms`, 3.5x) and `rebind_buf` (`6.77 -> 8.62 ms`, +27%) due to shared `BufferCache`/L3 contention.
+  - `v21` helper P-core pinning (CPUs 13 & 22): those cores were NOT excluded from `ReserveCores`, so game threads preempted helpers (`claim` `0.46 -> 7.32 ms`, `idle` `6.83 -> 17.58 ms`). If revisited later, helper cores MUST be reserved via `ReserveCores` too.
+- **Backups in `build-erlou-dll\` (Untouched):**
+  - `kyty_gpu.native-rt-v15-pipeline-bindless-opt.prx.bak`, `v16-eager-dma-prefetch`, `v17-commands-batch-drain`, `v17-pgo3`, `v18-resolve-helpers-4t`, `v19-rebind-dedup-opt`, `v20-global-epoch-everywhere`, `v21-wddm-pure-vram`.
+- **Next-Session Priorities:**
+  1. **Fresh PGO (`yotei-v4.profdata`)**: Re-capture PGO profile over `v15`–`v21` changes (`CommitBindings`, `RebindBuffers`, `NativeUpload` dedup, pure VRAM) and rebuild with `-PgoMode USE`.
+  2. **Single-Thread CPU Wall (`disp_op 11.7 ms`, `draw_op 9.7 ms`, `rebind_buf 6.5 ms`, `prep_today 5.7 ms`, `bindless 2.3 ms`)**: Profile `CommitBindings` (`1.8 ms`), `RebindImages` (`1.7 ms`), and `PrepareBindlessTable` (`2.3 ms`) for further `O(1)` / dirty-bit pruning to push RTX 5070 utilization from `61–64%` toward `80–90%`.
+  3. **Windows WDDM Submit Batching**: Audit `CommandScheduler::Submit` / `FlushForInterrupt` frequency (`fence=6.73 ms / ~150 waits/frame`) to reduce WDDM kernel submit roundtrips.

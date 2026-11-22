@@ -106,7 +106,17 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	// (~95 ms per clear instead of ~0.03 ms; 5-7 fps in the Snake fight after its cutscene, map §3w, 4.11.2026). Measured:
 	// that fight 6.6 -> 13.2 fps, the 2.002 gate 14.3 -> 15.0 fps, same image.
 	constexpr uint64_t BigBufferBytes = 256ull << 20u;
-	if (usage == MemoryUsage::DeviceLocal && cpu_address != 0 && size < BigBufferBytes) {
+	// v21-wddm-vram-pcore-fix: on Windows WDDM, BAR reads are disabled (12-28 MB/s), so allocating guest buffers in
+	// persistently-mapped DEVICE_LOCAL|HOST_VISIBLE BAR memory only wastes BAR aperture and risks bus-speed GPU write stalls.
+	static const bool allow_bar_alloc = [] {
+		const char* value = std::getenv("KYTY_BAR_READS");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return value != nullptr && value[0] == '1';
+#else
+		return value == nullptr || value[0] != '0';
+#endif
+	}();
+	if (allow_bar_alloc && usage == MemoryUsage::DeviceLocal && cpu_address != 0 && size < BigBufferBytes) {
 		// Device-local and host-visible (resizable BAR), persistently mapped; falls back to plain
 		// device-local memory when none is left.
 		auto bar           = allocation_info;

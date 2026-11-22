@@ -64,6 +64,12 @@
 - **`bufferCache.cpp`**: Added adaptive BAR cap (`EffectiveBarMaxBytes`, 64 KiB cap at 30–200 MB/s) and page-level fallback in `PlanCallerWait`.
 - **Known Regression**: Hits `Error: condition (!m_accepting) is true in core/kyty/graphics/guest_gpu/graphicsRun.cpp:670` during long runs (frame 4,433). Needs root-cause fix or revert of `bufferCache.cpp` back to `v6` for stability.
 
+### Phase 8: Shutdown Race Fix, Async Graphics Variants & `.kyhints` Precompilation (`v8`–`v9`)
+- **`v8` (`aec635b16c`)**: Eliminated `graphicsRun.cpp:670` (`!m_accepting`) crash on shutdown by unhooking the fault chain/write filter before `ShutdownGpu()` in `EntryGpu.cpp`, adding `GuestGpu::TryPostCommand` in `graphicsRun.h/.cpp`, and guarding `ReadMemory` with `IsStopping()` in `bufferCache.cpp`.
+- **`v9` (`native-rt-v9-async-variants-hints`)**:
+  - **Clean-exit `HasGpu()` guard**: Added `RenderContext::HasGpu()` (`renderContext.h`) and guarded `bufferCache.cpp` caller-wait checks so closing the window no longer hits `renderContext.cpp:94` (`m_gpu == nullptr`).
+  - **Async graphics shader variant compilation (`KYTY_ASYNC_GRAPHICS_VARIANTS`, default `1`)**: Offloads first-time non-writing graphics stage permutation compiles (`TranslateProgram` + `CompileProgram` + `vkCreateShaderModule`) onto `TableCompileWorkers` in `pipelineCache.cpp`, skipping only those draws in `RenderExecutor::PrepareDrawRenderState` (`renderDraw.cpp`) until ready (eliminating 100–465 ms `SlowFrame::Variant` freezes in brand-new open-world areas).
+  - **`.kyhints` import/export & upfront precompile-only mode**: Wired `KYTY_IMPORT_HINTS`, `KYTY_EXPORT_HINTS`, `KYTY_GAME_DIR` (auto-detects `./app0`), `KYTY_PRECOMPILE_ONLY`, `KYTY_PRECOMPILE_THREADS`, and `KYTY_SHADER_PRECOMPILE_WAIT_SEC` in `KytyShim/src/Config.cpp`, `EntryGpu.cpp`, and `pipelineCache.cpp`.
 ## 6. Upstream & Community References (Checked 2026-11-21 Evening)
 - **`boykopovar/AnyPS5` Discussion #675**: https://github.com/boykopovar/AnyPS5/discussions/675 (RTX 3080 Laptop ~9.5 FPS, RTX 4090 + i9-13900K ~15 FPS at 1080p on `yotei/best`; ray tracing not served upstream yet).
 - **`Celegans12/AnyPS5-Ghost-of-Yotei` (`yotei/best`)**: https://github.com/Celegans12/AnyPS5-Ghost-of-Yotei/tree/yotei/best (commit `655282b091` on 2026-11-21 evening, based on `AnyKyty 70f1d69fb6c` + 19 Yōtei commits: cloth wave64 fix, stencil storage, helper lanes, idle image write-back, in-place label deferral).

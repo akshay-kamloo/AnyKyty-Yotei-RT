@@ -1501,7 +1501,7 @@ static std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX>
 	return target_export_mapping;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	KYTY_PROFILER_BLOCK("Draw::RefreshShaders");
 	// KYTY_TRACE_CLEAN_DRAWS: the draw's program lookup time (step K1).
@@ -1530,6 +1530,13 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 		CleanDraws::t_front_parts.programs_ns += static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c0_start).count());
 	}
+	if (state.ps_active && !state.programs.pixel) return false;
+	const uint32_t expected_vertex_stages =
+	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kPatch ? 3u : 1u;
+	for (uint32_t i = 0; i < expected_vertex_stages; i++) {
+		if (!state.programs.vertex[i]) return false;
+	}
+	return true;
 }
 
 // Missing graphics pipelines are created in the background (28.10; tested in Snake's house with a cold pipeline cache:
@@ -1949,7 +1956,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	std::optional<DispatchSubTimer> census_programs(std::in_place, DispatchSub::DrawPrograms); // KYTY_TRACE_DRAW_CENSUS
-	if (!std::exchange(m_state_resolved, false)) RefreshShaders(buffer, draw, color_output_mask, state);
+	if (!std::exchange(m_state_resolved, false)) {
+		if (!RefreshShaders(buffer, draw, color_output_mask, state)) {
+			state.drop_reason = "async shader variant";
+			m_async_skipped_draws++;
+			return false;
+		}
+	}
 	census_programs.reset();
 	uint32_t mrt_mask     = 0;
 	uint32_t objprim_mask = 0;

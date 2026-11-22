@@ -143,6 +143,14 @@ void Initialize() {
     auto& presenter = WindowInit(width, height);
     KytyShim::ReportNativeRayTracing(presenter.Renderer().GetGraphics());
     if (hostReport) KytyShim::Entry::ReportKytyHost(presenter.Renderer().GetGraphics());
+    if (Config::PrecompileOnly()) {
+        std::atomic<bool> stop{false};
+        const int rc = presenter.Renderer().GetPipelineCache().RunPrecompileOnly(Config::GetPrecompileThreads(), stop, presenter.Renderer().GetMutex());
+        WindowShutdown();
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::exit(rc);
+    }
     auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
     g_renderer = &presenter.Renderer();
     g_renderer->InitializeGpu(&video_out);

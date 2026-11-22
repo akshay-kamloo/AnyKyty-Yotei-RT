@@ -42,6 +42,7 @@ public:
 	[[nodiscard]] GraphicContext&           GetGraphics() const noexcept { return m_graphics; }
 	void                                    InitializeGpu(VideoOut::VideoOutDriver* video_out);
 	void                                    ShutdownGpu();
+	[[nodiscard]] bool                      HasGpu() const noexcept { return m_gpu != nullptr; }
 	[[nodiscard]] GuestGpu&                 GetGpu() const;
 	[[nodiscard]] VideoOut::VideoOutDriver& GetVideoOut() const;
 

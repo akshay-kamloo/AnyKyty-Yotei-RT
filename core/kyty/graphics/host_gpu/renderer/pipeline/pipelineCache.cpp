@@ -786,9 +786,65 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	static bool AsyncGraphicsVariantsEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_ASYNC_GRAPHICS_VARIANTS");
+			return value == nullptr || value[0] != '0';
+		}();
+		return enabled;
+	}
+
+	static bool StagePlanWritesMemory(const ShaderRecompiler::IR::ResourcePlan& plan,
+	                                  const ShaderRecompiler::IR::ResourceSnapshot& resources) {
+		if (!plan.resource_tracking_complete) return true;
+		if (std::ranges::any_of(plan.info.buffers, [](const auto& b) { return b.written; })) return true;
+		if (std::ranges::any_of(plan.info.images, [](const auto& img) { return img.written; })) return true;
+		return std::ranges::any_of(resources.indirect_ranges, [](const auto& r) { return r.written; });
+	}
+
+	struct PendingVariantJob {
+		const char*                                    stage_name = nullptr;
+		const char*                                    label = nullptr;
+		ShaderType                                     stage = ShaderType::Unknown;
+		uint64_t                                       shader_hash = 0;
+		std::vector<uint32_t>                          code;
+		std::vector<uint32_t>                          back_code;
+		std::vector<uint32_t>                          user_data;
+		ShaderVertexInputInfo                          vertex_input {};
+		ShaderPixelInputInfo                           pixel_input {};
+		ShaderRecompiler::IR::ResourceSpecialization   specialization;
+		std::optional<ShaderRecompiler::TranslateResult> translated;
+		uint32_t                                       push_data_start = 0;
+		bool                                           dump_ir = false;
+		bool                                           emit_debug_info = false;
+		bool                                           native_ray_tracing = false;
+		bool                                           ray_stats = false;
+		uint32_t                                       rt_oracle = 0;
+		Permutation                                    permutation;
+		double                                         compile_ms = 0.0;
+		double                                         module_ms = 0.0;
+		size_t                                         spirv_words = 0;
+		uint64_t                                       spirv_hash = 0;
+		std::atomic<bool>                              done {false};
+	};
+
+	static void ReportAsyncVariants(uint64_t queued, uint64_t ready, uint64_t skipped, size_t pending) {
+		static std::atomic<int64_t> last_ms {0};
+		if (!Common::EnvRead::PerfLines()) return;
+		const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                     std::chrono::steady_clock::now().time_since_epoch()).count();
+		int64_t prev = last_ms.load(std::memory_order_relaxed);
+		if (now - prev < 5000 || !last_ms.compare_exchange_strong(prev, now, std::memory_order_relaxed)) return;
+		std::fprintf(stderr, "PERF async_graphics_variants queued=%llu ready=%llu skipped=%llu pending=%zu\n",
+		             static_cast<unsigned long long>(queued), static_cast<unsigned long long>(ready),
+		             static_cast<unsigned long long>(skipped), pending);
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor,
+	                  bool allow_async = false,
+	                  const std::function<void(std::function<void()>)>& enqueue_async = {}) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -1096,6 +1152,137 @@ struct PipelineCache::ProgramCache {
 		                        precompiler->TakeReusedCompile(precompile_key, reuse_identity, compile_push_start,
 		                                                       entry->second.specialization, queued_dropped, reused);
 		const bool skip_translation = use_reused && !translated.has_value();
+		// Async graphics shader variant compilation (KYTY_ASYNC_GRAPHICS_VARIANTS, default 1):
+		// Offload first-time non-writing graphics stage variant compilation to background workers so
+		// brand-new open-world areas do not stall the GPU execution thread for 100-465 ms.
+		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (allow_async && enqueue_async && !use_reused && !entry->second.call_source &&
+			    !StagePlanWritesMemory(entry->second.resource_plan, entry->second.Resources())) {
+				const uint64_t variant_key = precompile_key != 0
+				    ? precompile_key
+				    : PrecompileKey(stage, params.hash, params.user_data_count,
+				                    static_cast<uint32_t>(params.code.size()), lookup_key.static_state,
+				                    push_data_cursor, entry->second.specialization);
+				if (auto pending_it = pending_variants.find(variant_key); pending_it != pending_variants.end()) {
+					auto& job = *pending_it->second;
+					if (!job.done.load(std::memory_order_acquire)) {
+						async_variant_skipped++;
+						ReportAsyncVariants(async_variant_queued, async_variant_ready, async_variant_skipped,
+						                    pending_variants.size());
+						return {};
+					}
+					ShaderRecompiler::IR::NoteNullShareVariant(entry->second.resource_plan,
+					                                           entry->second.specialization);
+					job.permutation.handle.id = ++next_shader_id;
+					last_compile_ms           = job.compile_ms;
+					last_module_ms            = job.module_ms;
+					last_spirv_words          = job.spirv_words;
+					last_spirv_hash           = job.spirv_hash;
+					ChunkCensus::t_shaders++;
+					{
+						std::unique_lock append_lock(programs_mutex);
+						entry->second.permutations.push_back(std::move(job.permutation));
+					}
+					pending_variants.erase(pending_it);
+					async_variant_ready++;
+					ReportAsyncVariants(async_variant_queued, async_variant_ready, async_variant_skipped,
+					                    pending_variants.size());
+					const auto& permutation = entry->second.permutations.back();
+					input_info.stage = {.program = &permutation.program, .resources = &entry->second.Resources()};
+					permutation.program.bindings.AdvancePushData(push_data_cursor);
+					if (precompile_key != 0) {
+						RecordPrecompileStage(stage, params, input_info, compile_push_start, permutation,
+						                      precompile_key);
+					}
+					return permutation.handle;
+				}
+				auto job                = std::make_shared<PendingVariantJob>();
+				job->stage_name         = stage_name;
+				job->label              = label;
+				job->stage              = stage;
+				job->shader_hash        = params.hash;
+				job->code.assign(params.code.begin(), params.code.end());
+				job->back_code.assign(params.back_code.begin(), params.back_code.end());
+				job->user_data.assign(user_data.begin(), user_data.end());
+				if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+					job->vertex_input       = input_info;
+					job->vertex_input.stage = {};
+				} else {
+					job->pixel_input       = input_info;
+					job->pixel_input.stage = {};
+				}
+				job->specialization     = entry->second.specialization;
+				job->push_data_start    = push_data_cursor;
+				job->dump_ir            = options.dump_ir;
+				job->emit_debug_info    = options.emit_debug_info;
+				job->native_ray_tracing = options.native_ray_tracing;
+				job->ray_stats          = options.ray_stats;
+				job->rt_oracle          = options.rt_oracle;
+				if (translated.has_value()) {
+					job->translated = std::move(*translated);
+				}
+				pending_variants.emplace(variant_key, job);
+				async_variant_queued++;
+				async_variant_skipped++;
+				ReportAsyncVariants(async_variant_queued, async_variant_ready, async_variant_skipped,
+				                    pending_variants.size());
+				const auto* prof_ptr   = &profile;
+				const auto  vk_dev     = device;
+				const bool  want_hash  = precompiler != nullptr;
+				enqueue_async([job, prof_ptr, vk_dev, want_hash] {
+					ShaderRecompiler::CompileOptions opts;
+					opts.stage              = job->stage;
+					opts.profile            = prof_ptr;
+					opts.shader_hash        = job->shader_hash;
+					opts.user_data          = job->user_data;
+					opts.back_code          = job->back_code;
+					opts.dump_ir            = job->dump_ir;
+					opts.early_dump         = job->dump_ir;
+					opts.emit_debug_info    = job->emit_debug_info;
+					opts.native_ray_tracing = job->native_ray_tracing;
+					opts.ray_stats          = job->ray_stats;
+					opts.rt_oracle          = job->rt_oracle;
+					opts.dump_label         = job->label;
+					if (job->stage == ShaderType::Pixel) {
+						opts.input_info.pixel = &job->pixel_input;
+					} else {
+						opts.input_info.vertex = &job->vertex_input;
+					}
+					SetStageCompileOptions(opts);
+					if (!job->translated.has_value()) {
+						job->translated = ShaderRecompiler::TranslateProgram(job->code, opts);
+					}
+					const auto compile_begin = std::chrono::steady_clock::now();
+					auto       result        = ShaderRecompiler::CompileProgram(
+                        std::move(*job->translated), opts, job->specialization, job->push_data_start);
+					job->translated.reset();
+					auto program     = std::move(result.program).TakeCompiledInfo();
+					job->compile_ms  = MillisecondsSince(compile_begin);
+					job->spirv_words = result.spirv.size();
+					if (want_hash) {
+						job->spirv_hash = XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+					}
+					if (!PipelineTrace::ValidateShaderSpirv(opts.dump_label, opts.shader_hash, result.spirv,
+					                                        opts.profile->maintenance8)) {
+						PipelineTrace::DumpShaderSpirv(job->stage_name, opts.shader_hash, result.spirv);
+						EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", opts.dump_label,
+						     opts.shader_hash);
+					}
+					const auto module_begin = std::chrono::steady_clock::now();
+					const auto module       = CompileSPV(result.spirv, vk_dev);
+					job->module_ms          = MillisecondsSince(module_begin);
+					EXIT_IF(module == nullptr);
+					job->permutation = {
+					    .function_code  = {},
+					    .specialization = job->specialization,
+					    .program        = std::move(program),
+					    .handle         = {.id = 0, .module = module},
+					};
+					job->done.store(true, std::memory_order_release);
+				});
+				return {};
+			}
+		}
 		if (!use_reused && !translated.has_value()) {
 			translate();
 		}
@@ -1386,6 +1573,13 @@ struct PipelineCache::ProgramCache {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
+		for (auto& [key, job]: pending_variants) {
+			(void)key;
+			if (job->done.load(std::memory_order_acquire) && job->permutation.handle.module != nullptr) {
+				graphics.device.destroyShaderModule(job->permutation.handle.module, nullptr);
+			}
+		}
+		pending_variants.clear();
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
@@ -1418,7 +1612,11 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, PrecompileStage> precompile_stages;
 	// Inserts into `programs` and appends to a program's permutations take it exclusively (execution thread), the resolve
 	// thread's finds and permutation searches shared. The execution thread's own reads are unlocked: it is the only writer.
-	std::shared_mutex                                           programs_mutex;
+	std::unordered_map<uint64_t, std::shared_ptr<PendingVariantJob>> pending_variants;
+	uint64_t                                                         async_variant_queued  = 0;
+	uint64_t                                                         async_variant_ready   = 0;
+	uint64_t                                                         async_variant_skipped = 0;
+	std::shared_mutex                                                programs_mutex;
 };
 
 // KYTY_PERF_TABLE_ASYNC: one queued pipeline creation (GetGraphicsPipelineAsync). Its inputs are copies (the draw's
@@ -1555,13 +1753,17 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 			                             summary);
 			return;
 		}
-		if (const auto& hints = Config::GetPrecompileImportHints(); Config::PrecompileOnly() && !hints.empty()) {
-			// --import-hints: the records found are added to the journals before the precompiler loads them.
+		if (const auto& hints = Config::GetPrecompileImportHints(); !hints.empty()) {
+			// --import-hints / KYTY_IMPORT_HINTS: the records found are added to the journals before the precompiler loads them.
 			std::string summary;
 			m_hints_failed = !PrecompileHintsImport(m_graphics, hints, Config::GetGameDir(), journal, graphics_journal,
 			                                        summary);
 			m_hints_line   = fmt::format("PRECOMPILE_HINTS kind=import status={} {}", m_hints_failed ? "failed" : "ok",
 			                             summary);
+			if (!Config::PrecompileOnly()) {
+				std::fprintf(stderr, "%s\n", m_hints_line.c_str());
+				std::fflush(stderr);
+			}
 		}
 		m_precompiler = std::make_unique<ShaderPrecompiler>(m_graphics, m_driver_cache, journal, graphics_journal,
 		                                                    m_precompiled_since_save, m_warm.get());
@@ -1585,8 +1787,14 @@ void PipelineCache::StartBackgroundCompiles() {
 		return value == nullptr || value[0] != '0';
 	}();
 	if (!wait) return;
+	static const int64_t wait_limit_sec = [] {
+		const char* value = std::getenv("KYTY_SHADER_PRECOMPILE_WAIT_SEC");
+		if (value == nullptr || value[0] == '\0') return int64_t {180};
+		const long long parsed = std::strtoll(value, nullptr, 10);
+		return parsed > 0 ? static_cast<int64_t>(parsed) : int64_t {180};
+	}();
 	const auto begin = std::chrono::steady_clock::now();
-	while (m_precompiler->Busy() && std::chrono::steady_clock::now() - begin < std::chrono::seconds(180)) {
+	while (m_precompiler->Busy() && std::chrono::steady_clock::now() - begin < std::chrono::seconds(wait_limit_sec)) {
 		const auto progress = GetPrecompileProgress();
 		const int  percent  = progress.queued != 0 ? static_cast<int>(std::min<uint64_t>(99u, uint64_t {progress.finished} * 100u / progress.queued)) : 0;
 		g_precompile_wait_percent.store(percent, std::memory_order_relaxed);
@@ -2215,6 +2423,8 @@ static void GraphicsProgramInputs(const GraphicContext& graphics, const HW::Vert
 	    pixel_active ? ShaderRecompiler::IR::PushData::FromEndCursor(push_data_cursor, end) : push_data_cursor;
 }
 
+namespace { uint32_t TableAsyncThreads(); }
+
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
@@ -2229,11 +2439,22 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	GraphicsPrograms  result;
 	KYTY_PROFILER_BLOCK("GraphicsPrograms::Get");
+	const bool allow_async = ProgramCache::AsyncGraphicsVariantsEnabled() && !m_table_workers_stopped;
+	const auto enqueue_async = [this](std::function<void()> fn) {
+		if (m_table_workers == nullptr) {
+			m_table_workers = std::make_unique<TableCompileWorkers>(TableAsyncThreads());
+			std::fprintf(stderr, "PERF_TABLE_ASYNC workers=%u\n", TableAsyncThreads());
+		}
+		m_table_workers->Push(std::move(fn));
+	};
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor, allow_async, enqueue_async);
+		if (!result.pixel) return result;
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
-		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		result.vertex[i] =
+		    m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor, allow_async, enqueue_async);
+		if (!result.vertex[i]) return result;
 	}
 	return result;
 }

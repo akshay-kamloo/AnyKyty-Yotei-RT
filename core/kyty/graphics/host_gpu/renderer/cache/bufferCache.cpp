@@ -1451,9 +1451,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			if (!census.downloaded) census.path = RingCensus::Path::NoCopy; // KYTY_TRACE_RING_CENSUS
 			if (is_write) mark_cpu_written();
 		};
-		if (m_scheduler.Context().GetGpu().IsStopping()) break;
+		if (!m_scheduler.Context().HasGpu() || m_scheduler.Context().GetGpu().IsStopping()) break;
 		m_scheduler.Context().GetGpu().SendCommandSync(std::move(request));
-		if (defer_tick == 0 || m_scheduler.Context().GetGpu().IsStopping()) break;
+		if (defer_tick == 0 || !m_scheduler.Context().HasGpu() || m_scheduler.Context().GetGpu().IsStopping()) break;
 		// Handed back; the tick is submitted. Wait here, not on the GPU thread.
 		if (attempt == 0) m_caller_stats.deferred.fetch_add(1, std::memory_order_relaxed);
 		m_caller_stats.deferrals.fetch_add(1, std::memory_order_relaxed);
@@ -1463,7 +1463,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_scheduler.GetMasterSemaphore().Wait(defer_tick);
 			m_scheduler.WaitPriorityOperations(defer_tick);
 		}
-		if (m_scheduler.Context().GetGpu().IsStopping()) break;
+		if (!m_scheduler.Context().HasGpu() || m_scheduler.Context().GetGpu().IsStopping()) break;
 		const auto caller_wait_ns = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - wait_start).count());
 		m_caller_stats.caller_wait_ns.fetch_add(caller_wait_ns, std::memory_order_relaxed);

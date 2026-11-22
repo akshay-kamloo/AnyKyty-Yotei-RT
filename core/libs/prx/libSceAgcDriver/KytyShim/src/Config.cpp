@@ -52,6 +52,7 @@ constexpr Flag Flags[] = {
     {"KYTY_SYNC_RAW_IMAGE_BUFFERS", &Options::sync_raw_image_buffers},
     {"KYTY_PERF_OVERLAY", &Options::perf_overlay_enabled},
     {"KYTY_RT_STATS", &Options::rt_stats_enabled},
+    {"KYTY_PRECOMPILE_ONLY", &Options::precompile_only},
 };
 
 struct Number {
@@ -66,6 +67,7 @@ constexpr Number Numbers[] = {
     {"KYTY_RT_CHECK", &Options::rt_check_period, 0, 0xffffffffu},
     {"KYTY_RT_CHECK_PPM", &Options::rt_check_ppm, 0, 1000000u},
     {"KYTY_RT_CHECK_STRIKES", &Options::rt_check_strikes, 1, 1000u},
+    {"KYTY_PRECOMPILE_THREADS", &Options::precompile_threads, 0, 64u},
 };
 
 struct Path {
@@ -77,6 +79,9 @@ constexpr Path Paths[] = {
     {"KYTY_SHADER_LOG_FOLDER", &Options::shader_log_folder},
     {"KYTY_COMMAND_BUFFER_DUMP_FOLDER", &Options::command_buffer_dump_folder},
     {"KYTY_PRINTF_OUTPUT_FILE", &Options::printf_output_file},
+    {"KYTY_IMPORT_HINTS", &Options::precompile_import_hints},
+    {"KYTY_EXPORT_HINTS", &Options::precompile_export_hints},
+    {"KYTY_GAME_DIR", &Options::game_dir},
 };
 
 const char* Read(const char* variable, std::string& applied) {
@@ -168,6 +173,15 @@ Options OptionsFromEnvironment(std::string& applied) {
         if (text == "1" && (options.rt_oracle & 7u) != 0) options.rt_oracle |= 32u;
     }
     if (options.gpu_assisted_validation_enabled) options.vulkan_validation_enabled = true;
+    if (options.game_dir.empty() && !options.precompile_import_hints.empty()) {
+        std::error_code ec;
+        const auto app0 = std::filesystem::current_path(ec) / "app0";
+        if (!ec && std::filesystem::is_directory(app0, ec)) {
+            options.game_dir = app0;
+        } else {
+            options.game_dir = std::filesystem::current_path(ec);
+        }
+    }
     return options;
 }
 

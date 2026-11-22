@@ -28,9 +28,9 @@ Tested on **Windows 11**, **Intel Core Ultra 7 270K Plus**, **32 GB RAM**, **NVI
 | Village (Big-O v1 + PGO v2) | 1080p | **23.26 FPS** avg (26–32 FPS steady) | 43.0 ms/f avg |
 | Open World (`native-rt-v6`) | 900p (`1600×900`) | **19.4–25.3 FPS** | Stable across 9,518 frames |
 | Heavy Post-Fight Cutscene (`native-rt-v6`) | 900p (`1600×900`) | **8.1–11.1 FPS** | `fault_gpu = 0 ms` (up from 3.3–3.6 FPS at 1080p) |
-| Heavy Post-Fight Cutscene (`native-rt-v7`, current HEAD) | 900p (`1600×900`) | **~13–14 FPS** (71–77 ms/f) | **Experimental:** currently hits `graphicsRun.cpp:670` assert at ~4,433 frames |
+| Heavy Post-Fight Cutscene / Open World (`native-rt-v9`, current HEAD) | 900p (`1600×900`) | **15.2–18.8 FPS** open world (53–66 ms/f) | `v8` shutdown fix + `v9` async graphics variants + `.kyhints` import |
 
-> **Stability Note:** Current `HEAD` includes the experimental `v7` adaptive BAR cap in `core/kyty/graphics/host_gpu/renderer/cache/bufferCache.cpp`, which is faster in cutscenes but can assert at `graphicsRun.cpp:670` (`!m_accepting`) during longer runs. If you want maximum stability right now, revert the `v7` BAR cap in `bufferCache.cpp` (back to `v6`).
+> **v9 Highlights:** Includes the `v8`/`v9` clean-exit fixes (eliminating `graphicsRun.cpp:670` and `renderContext.cpp:94`), **async graphics shader variant compilation** (`KYTY_ASYNC_GRAPHICS_VARIANTS=1` by default), and **`.kyhints` upfront shader precompilation** (`KYTY_IMPORT_HINTS` / `KYTY_PRECOMPILE_ONLY=1`).
 
 ## Requirements
 
@@ -140,6 +140,13 @@ Code defaults live in `core/kyty/common/envDefaults.h`. Any variable set in your
 | `KYTY_RT_STATS` | `0` | Set to `1` to print a `[RT]` summary every 10 seconds. |
 | `KYTY_SHADER_PRECOMPILE` | `1` | Precompiles known shaders on startup to reduce in-game stutter. |
 | `KYTY_SHADER_PRECOMPILE_THREADS` | `8` | Worker thread count for shader precompilation (tune to your CPU core count). |
+| `KYTY_ASYNC_GRAPHICS_VARIANTS` | `1` | Offloads first-time non-writing graphics shader variant compiles to background workers so new areas don't freeze (set `0` for sync). |
+| `KYTY_IMPORT_HINTS` | *(unset)* | Path to a `.kyhints` file (e.g., from Erlou's release) to import shader records against `app0` before precompiling. |
+| `KYTY_EXPORT_HINTS` | *(unset)* | Path to export your local shader journals as a shareable `.kyhints` file (requires `KYTY_PRECOMPILE_ONLY=1`). |
+| `KYTY_PRECOMPILE_ONLY` | `0` | Set to `1` to run headless upfront shader/pipeline precompilation, save `_PipelineCache`, and exit without starting the game. |
+| `KYTY_PRECOMPILE_THREADS` | `0` | Thread count for `KYTY_PRECOMPILE_ONLY=1` (`0` uses `KYTY_SHADER_PRECOMPILE_THREADS`; max `64`). |
+| `KYTY_GAME_DIR` | `./app0` | Game directory scanned during `KYTY_IMPORT_HINTS` (auto-detects `./app0` if unset). |
+| `KYTY_SHADER_PRECOMPILE_WAIT_SEC` | `180` | Max seconds to wait on startup precompile during a normal launch (when `KYTY_SHADER_PRECOMPILE_WAIT=1`). |
 | `KYTY_GPU_THREAD_CPUS` | *(auto)* | Pins the 4 GPU pipeline threads to separate physical CPU cores (`off` disables pinning). |
 | `KYTY_BINDLESS` | `1` | Enables bindless texture heap translation (required for terrain/foliage materials). |
 | `KYTY_DRAW_TEMPLATES` | `2` | Draw template caching mode (AnyKyty default `2`). |
@@ -179,7 +186,7 @@ Code defaults live in `core/kyty/common/envDefaults.h`. Any variable set in your
 - **Checkered or pixelated shadows after a stutter/cutscene:** Draws whose pipelines are still compiling are skipped for a few frames, which can temporarily corrupt temporal shadow/lighting buffers. **Workaround:** Quit to the main menu and reload your save (no full restart needed).
 - **VRAM grows over long sessions:** Watch **Vulkan budget** in `Shift+F2`. If it approaches your GPU's VRAM limit and FPS drops, save, quit, and restart.
 - **`Insufficient system resources` on boot:** Increase your Windows page file to **32–64 GB** so Windows can commit the game's 13.5 GiB direct memory allocation.
-- **`graphicsRun.cpp:670` (`!m_accepting`) crash on current `HEAD` (`v7`):** Known regression in `v7`'s experimental `bufferCache.cpp` BAR cap; revert `bufferCache.cpp` to `v6` if you hit it.
+- **Upfront `.kyhints` precompilation (zero first-visit stutter):** Drop a matching `v02.002.000` `.kyhints` file into your game folder and run once with `='PPSA26344.kyhints'; ='1'; ='12'; .\app.exe` to precompile all known shaders/pipelines into `_PipelineCache` before playing.
 
 ## Upstream Projects & Credits
 

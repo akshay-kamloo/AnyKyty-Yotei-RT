@@ -37,6 +37,7 @@ public:
 	// Always through the queue: it runs at a packet boundary, also when sent from the GPU thread (from a fault handler there,
 	// where running in place would run under whatever the thread holds, before the faulting instruction runs again).
 	void               PostCommand(Common::UniqueFunction<void>&& command);
+	bool               TryPostCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 	// Retries blocked submissions now instead of after the 100 ms stall timeout.
 	void               Wake();

@@ -151,11 +151,11 @@ void Initialize() {
 
 void Shutdown() {
     if (g_renderer == nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Shutdown without Initialize");
+    KytyShim::RemoveFaultChain();
+    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(nullptr);
     g_renderer->ShutdownGpu();
     VideoOut::VideoOutShutdown();
     WindowShutdown();
-    KytyShim::RemoveFaultChain();
-    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(nullptr);
     g_renderer = nullptr;
 }
 

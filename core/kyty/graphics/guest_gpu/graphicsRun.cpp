@@ -664,15 +664,22 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	PostCommand(std::move(command));
 }
 
-void GuestGpu::PostCommand(Common::UniqueFunction<void>&& command) {
+bool GuestGpu::TryPostCommand(Common::UniqueFunction<void>&& command) {
 	EXIT_IF(!command);
 	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
+	if (!m_accepting) {
+		return false;
+	}
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_acq_rel);
 	m_work_epoch.fetch_add(1, std::memory_order_release);
 	m_work_available.Signal();
 	RingExecution();
+	return true;
+}
+
+void GuestGpu::PostCommand(Common::UniqueFunction<void>&& command) {
+	(void)TryPostCommand(std::move(command));
 }
 
 void GuestGpu::Wake() {
@@ -711,10 +718,12 @@ void GuestGpu::SendCommandSync(Common::UniqueFunction<void>&& command) {
 		return;
 	}
 	std::binary_semaphore done {0};
-	SendCommand([operation = std::move(command), &done]() mutable {
-		operation();
-		done.release();
-	});
+	if (!TryPostCommand([operation = std::move(command), &done]() mutable {
+		    operation();
+		    done.release();
+	    })) {
+		return;
+	}
 	done.acquire();
 }
 
@@ -2548,7 +2557,9 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
 	Common::LockGuard lock(m_queue_mutex);
-	EXIT_IF(!m_accepting);
+	if (!m_accepting) {
+		return;
+	}
 	// The game frame whose data-ring half each submission writes (DropDeadRingBytes). Frame F ends with its
 	// SuspendPoint, then the context kicks and the graphics submission of frame F;
 	// everything after that graphics submission is frame F+1. Counted under the queue lock, so a kick another thread

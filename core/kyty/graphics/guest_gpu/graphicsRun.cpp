@@ -1816,6 +1816,34 @@ bool GuestGpu::WriteLanded(GuestWrite& write, uint64_t executed, uint64_t publis
 	return write.tick <= known_tick;
 }
 
+static constexpr uint32_t PendingPageSlot(uint64_t page) noexcept {
+	return static_cast<uint32_t>(((page * 0x9E3779B97F4A7C15ull) >> 56u) & 255u);
+}
+static void PendingBloomAdd(std::array<uint64_t, 4>& bloom, uint64_t addr, uint64_t size) noexcept {
+	if (size == 0u) return;
+	const uint64_t first = addr >> 12u;
+	const uint64_t last  = (addr + size - 1u) >> 12u;
+	if (last - first >= 64u) {
+		bloom.fill(~uint64_t {0});
+		return;
+	}
+	for (uint64_t p = first; p <= last; ++p) {
+		const uint32_t bit = PendingPageSlot(p);
+		bloom[bit >> 6u] |= uint64_t {1} << (bit & 63u);
+	}
+}
+static bool PendingBloomMayHit(const std::array<uint64_t, 4>& bloom, uint64_t addr, uint64_t size) noexcept {
+	if (size == 0u) return false;
+	const uint64_t first = addr >> 12u;
+	const uint64_t last  = (addr + size - 1u) >> 12u;
+	if (last - first >= 64u) return (bloom[0] | bloom[1] | bloom[2] | bloom[3]) != 0u;
+	for (uint64_t p = first; p <= last; ++p) {
+		const uint32_t bit = PendingPageSlot(p);
+		if ((bloom[bit >> 6u] & (uint64_t {1} << (bit & 63u))) != 0u) return true;
+	}
+	return false;
+}
+
 void GuestGpu::ForgetExecutedWrites() {
 	if (m_pending_count == 0) {
 		return;
@@ -1838,10 +1866,27 @@ void GuestGpu::ForgetExecutedWrites() {
 		}
 		m_pending_ticked++;
 	}
+	uint32_t dropped = 0;
 	while (m_pending_count != 0 && WriteLanded(m_pending_writes[m_pending_first], executed, published, known_tick)) {
-		m_pending_first = (m_pending_first + 1) % PendingWriteCapacity;
+		m_pending_first = (m_pending_first + 1u) & (PendingWriteCapacity - 1u);
 		m_pending_count--;
 		if (m_pending_ticked != 0) m_pending_ticked--;
+		dropped++;
+	}
+	if (m_pending_count == 0u) {
+		m_pending_page_bloom.fill(0u);
+		m_pending_bloom_drops = 0u;
+	} else if (dropped != 0u) {
+		m_pending_bloom_drops += dropped;
+		if (m_pending_bloom_drops >= 64u) {
+			std::array<uint64_t, 4> bloom {};
+			for (size_t i = 0; i < m_pending_count; ++i) {
+				const auto& w = m_pending_writes[(m_pending_first + i) & (PendingWriteCapacity - 1u)];
+				PendingBloomAdd(bloom, w.address, w.size);
+			}
+			m_pending_page_bloom  = bloom;
+			m_pending_bloom_drops = 0u;
+		}
 	}
 }
 
@@ -1889,6 +1934,7 @@ void GuestGpu::NoteGuestWrite(uint64_t sequence, uint64_t address, uint64_t size
 		write.known = true;
 		std::memcpy(write.value, value, size);
 	}
+	PendingBloomAdd(m_pending_page_bloom, address, size);
 }
 
 void GuestGpu::NoteDeferredWrite(uint64_t sequence, uint64_t address, uint64_t size, const void* value) {
@@ -1899,6 +1945,7 @@ void GuestGpu::NoteDeferredWrite(uint64_t sequence, uint64_t address, uint64_t s
 	write.known      = true;
 	write.at_publish = true;
 	std::memcpy(write.value, value, size);
+	PendingBloomAdd(m_pending_page_bloom, address, size);
 }
 
 void GuestGpu::NoteStreamWrite(uint64_t sequence, uint64_t address, uint32_t value) {
@@ -1909,13 +1956,15 @@ void GuestGpu::NoteStreamWrite(uint64_t sequence, uint64_t address, uint32_t val
 	write.stream   = true;
 	write.known    = true;
 	std::memcpy(write.value, &value, sizeof(value));
+	PendingBloomAdd(m_pending_page_bloom, address, sizeof(value));
 }
 
 void GuestGpu::WaitForPendingWrites(uint64_t address, uint64_t size, bool unknown_only) {
+	if (m_pending_count == 0u || !PendingBloomMayHit(m_pending_page_bloom, address, size)) return;
 	const auto executed = m_executed.Load();
 	uint64_t   last     = 0;
 	for (size_t i = 0; i < m_pending_count; i++) {
-		const auto& write = m_pending_writes[(m_pending_first + i) % PendingWriteCapacity];
+		const auto& write = m_pending_writes[(m_pending_first + i) & (PendingWriteCapacity - 1u)];
 		if (write.at_publish || write.sequence <= executed || write.address >= address + size ||
 		    write.address + write.size <= address || (unknown_only && write.known)) {
 			continue;
@@ -1940,10 +1989,15 @@ void GuestGpu::ApplyPendingWrites(const volatile void* address, void* value, siz
                                   bool* covered) {
 	EXIT_IF(size > 8u);
 	ForgetExecutedWrites();
+	const auto begin = reinterpret_cast<uint64_t>(address);
+	if (m_pending_count == 0u || !PendingBloomMayHit(m_pending_page_bloom, begin, size)) {
+		if (g_gpu_stage_stats) g_stage_stats.journal_reads.fetch_add(1, std::memory_order_relaxed);
+		if (covered != nullptr) *covered = false;
+		return;
+	}
 	const uint64_t known_tick = m_renderer.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick();
 	const uint64_t executed   = m_executed.Load();
 	const uint64_t published  = m_published.load(std::memory_order_acquire);
-	const auto     begin      = reinterpret_cast<uint64_t>(address);
 	const auto     end        = begin + size;
 	const uint32_t all        = (1u << size) - 1u;
 	uint32_t       decided    = 0; // bytes a newer write decided
@@ -1954,7 +2008,7 @@ void GuestGpu::ApplyPendingWrites(const volatile void* address, void* value, siz
 	}
 	// The newest write of a byte decides, also when it is in guest memory already.
 	for (size_t i = m_pending_count; i-- > 0 && decided != all;) {
-		auto& write = m_pending_writes[(m_pending_first + i) % PendingWriteCapacity];
+		auto& write = m_pending_writes[(m_pending_first + i) & (PendingWriteCapacity - 1u)];
 		if (write.address >= end || write.address + write.size <= begin) {
 			continue;
 		}

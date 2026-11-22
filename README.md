@@ -29,9 +29,10 @@ Tested on **Windows 11**, **Intel Core Ultra 7 270K Plus**, **32 GB RAM**, **NVI
 | Open World (`native-rt-v6`) | 900p (`1600×900`) | **19.4–25.3 FPS** | Stable across 9,518 frames |
 | Heavy Post-Fight Cutscene (`native-rt-v6`) | 900p (`1600×900`) | **8.1–11.1 FPS** | `fault_gpu = 0 ms` (up from 3.3–3.6 FPS at 1080p) |
 | Heavy Post-Fight Cutscene / Open World (`native-rt-v9`) | 900p (`1600×900`) | **15.2–18.8 FPS** open world (53–66 ms/f) | `v8` shutdown fix + `v9` async graphics variants + `.kyhints` import |
-| **Open World / Heavy Gameplay (`native-rt-v12-pgo-v3`, current HEAD)** | 900p (`1600×900`) | **Heavy `74.69 ms/f`** (-7.7% vs `v9` `80.94 ms/f`) | `v10` `BufferCache` O(1) hot-read/BAR pruning + `v11` 64-bit queue bitmask & 1024-slot snapshot ring + `v12` descriptor/BDA churn cuts + fresh 19-snapshot `yotei-v3.profdata` PGO |
+| Open World / Heavy Gameplay (`native-rt-v12-pgo-v3`) | 900p (`1600×900`) | **Heavy `74.69 ms/f`** (-7.7% vs `v9` `80.94 ms/f`) | `v10`–`v12` Big-O/pruning + fresh 19-snapshot `yotei-v3.profdata` PGO |
+| **Open World / Heavy Gameplay (`native-rt-v13-parallel-v1`, current HEAD)** | 900p (`1600×900`) | **Heavy frames `40.1% → 14.7%` (-63%)**, `download 10.86 ms/f` (-40% vs `v9`) | `BarDisableMbps=100` (deterministic GPU DMA copies on slow Windows WDDM BARs), 4-thread multi-span `BarCopyPool`, 256-bit `m_pending_page_bloom`, gated `MaterializeResources` walk clocks |
 
-> **v12-pgo-v3 Highlights:** Cuts heavy-frame `download` (-16.1%), `idle` (-26.5%), `rebind_img` (-15.1%), `claim` (-36.0%), and steady-frame `draw_op` (-32.8%), `prep_today` (-29.6%), `download` (-21.5%), and `bindless` (-25.3%), plus adds dedicated keyboard **Swing/Hammer** motion controls (**`B`** = lift/pitch up, **`V`** = swing/strike down) in `libSceVideoOut` / `libScePad`.
+> **v13-parallel-v1 Highlights:** On Windows WDDM + RTX 5070, uncached PCIe BAR reads (`28–75 MB/s`) stall the CPU render thread; raising `BarDisableMbps` from `30` → `100 MB/s` deterministically routes downloads through GPU DMA copies into cached host memory (cutting heavy `download` from `18.04 → 10.86 ms/f` and heavy >50 ms frames from `40.1% → 14.7%`, while fast >100 MB/s ReBAR systems still use BAR). Also adds a 4-thread multi-span `BarCopyPool`, a 256-bit 4 KiB page bloom filter in `GuestGpu::ApplyPendingWrites`, and dedicated keyboard **Swing/Hammer** motion controls (**`B`** = lift/pitch up, **`V`** = swing/strike down).
 
 ## Requirements
 

@@ -807,7 +807,7 @@ static bool SkipReadbackCeiling() {
 // timed: below BarSlowMbps the downloads take the GPU copy into cached host memory instead (the path larger reads and
 // not yet finished writes take today; the same bytes). KYTY_BAR_READS=0 never reads the mapping, =1 always does.
 namespace {
-constexpr double   BarDisableMbps = 30.0;
+constexpr double   BarDisableMbps = 100.0;
 constexpr double   BarSlowMbps    = 200.0;
 constexpr uint64_t BarSmallMaxBytes = uint64_t {64} << 10u;
 constexpr uint64_t BarProbeCalls  = 512;
@@ -4495,7 +4495,7 @@ void CopyFromWriteCombinedImpl(uint8_t* dst, const uint8_t* src, uint64_t size);
 // A read of GPU memory of 256 KiB or more is split into 64 KiB-aligned parts copied by the caller and BarCopyThreads
 // helper threads at once (one core keeps only a few PCIe reads in flight). The same bytes go to the same places; the
 // caller returns when every part is copied. The helpers spin ~50 us after a copy, then sleep.
-constexpr uint32_t BarCopyThreads = 2;
+constexpr uint32_t BarCopyThreads = 4;
 
 struct BarCopyPool {
 	struct Part {
@@ -4534,20 +4534,41 @@ struct BarCopyPool {
 			}
 		}
 	}
+	void CopyParts(const Part* items, uint32_t total_parts) {
+		if (total_parts == 0u) return;
+		if (total_parts == 1u) {
+			CopyFromWriteCombinedImpl(items[0].dst, items[0].src, items[0].size);
+			return;
+		}
+		std::scoped_lock lock(mutex);
+		const uint32_t   count = std::min<uint32_t>(total_parts - 1u, BarCopyThreads);
+		for (uint32_t i = 0; i <= count; i++) {
+			parts[i] = items[i];
+		}
+		helpers = count;
+		remaining.store(count, std::memory_order_release);
+		generation.fetch_add(1, std::memory_order_acq_rel);
+		generation.notify_all();
+		CopyFromWriteCombinedImpl(parts[0].dst, parts[0].src, parts[0].size);
+		while (remaining.load(std::memory_order_acquire) != 0) _mm_pause();
+	}
 	void Copy(uint8_t* dst, const uint8_t* src, uint64_t size) {
 		std::scoped_lock lock(mutex);
-		const uint32_t   count = BarCopyThreads;
-		// Parts of whole 64 KiB blocks; the caller's part takes the rest.
-		const uint64_t block = 65536;
-		const uint64_t per   = (size / (count + 1u)) / block * block;
+		const uint64_t   block = 16384;
+		const uint32_t   max_h = static_cast<uint32_t>(std::min<uint64_t>(BarCopyThreads, (size / block) > 1u ? (size / block) - 1u : 0u));
+		if (max_h == 0u) {
+			CopyFromWriteCombinedImpl(dst, src, size);
+			return;
+		}
+		const uint64_t per    = (size / (max_h + 1u)) / block * block;
 		uint64_t       offset = 0;
-		for (uint32_t i = 1; i <= count; i++) {
+		for (uint32_t i = 1; i <= max_h; i++) {
 			parts[i] = {dst + offset, src + offset, per};
 			offset += per;
 		}
 		parts[0] = {dst + offset, src + offset, size - offset};
-		helpers  = count;
-		remaining.store(count, std::memory_order_release);
+		helpers  = max_h;
+		remaining.store(max_h, std::memory_order_release);
 		generation.fetch_add(1, std::memory_order_acq_rel);
 		generation.notify_all();
 		CopyFromWriteCombinedImpl(parts[0].dst, parts[0].src, parts[0].size);
@@ -4564,7 +4585,7 @@ void CopyFromWriteCombined(uint8_t* dst, const uint8_t* src, uint64_t size) {
 	const bool probing = g_bar_reads.load(std::memory_order_relaxed) == -1;
 	const bool timed   = probing || PerfEnabled();
 	const auto start   = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-	if (size >= 262144u) {
+	if (size >= 65536u) {
 		GetBarCopyPool().Copy(dst, src, size);
 	} else {
 		CopyFromWriteCombinedImpl(dst, src, size);
@@ -4762,8 +4783,32 @@ void BufferCache::BarBatchRead(const uint8_t* mapped, uint64_t base,
 	if (staging.size() < total) staging.resize(total);
 	{
 		KYTY_PROFILER_BLOCK("Download::BarRead");
-		for (const auto& span: spans) {
-			CopyFromWriteCombined(staging.data() + span.staging, mapped + (span.start - base), span.end - span.start);
+		const bool probing = g_bar_reads.load(std::memory_order_relaxed) == -1;
+		if (!probing && spans.size() >= 2u && total >= 16384u) {
+			constexpr uint32_t MaxBatch = BarCopyThreads + 1u;
+			std::array<BarCopyPool::Part, MaxBatch> batch {};
+			size_t idx = 0;
+			while (idx < spans.size()) {
+				uint32_t n = 0;
+				while (idx < spans.size() && n < MaxBatch) {
+					const auto& sp = spans[idx++];
+					const uint64_t len = sp.end - sp.start;
+					if (len >= 65536u && n == 0u) {
+						GetBarCopyPool().Copy(staging.data() + sp.staging, mapped + (sp.start - base), len);
+						break;
+					}
+					if (len >= 65536u) {
+						--idx;
+						break;
+					}
+					batch[n++] = {staging.data() + sp.staging, mapped + (sp.start - base), len};
+				}
+				if (n > 0u) GetBarCopyPool().CopyParts(batch.data(), n);
+			}
+		} else {
+			for (const auto& span: spans) {
+				CopyFromWriteCombined(staging.data() + span.staging, mapped + (span.start - base), span.end - span.start);
+			}
 		}
 	}
 	if (PerfEnabled()) {

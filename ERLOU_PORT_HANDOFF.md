@@ -37,7 +37,8 @@
 - `kyty_gpu.native-rt-v10-download-opt.prx.bak` (`208,100,864` B) — `BufferCache` O(1) hot-read tracking, BAR pending bounding-box pruning, granule memoization, and perf-gated BAR timing.
 - `kyty_gpu.native-rt-v11-exec-idle-opt.prx.bak` (`207,559,168` B) — `v10` + 64-bit queue bitmask scheduler, 1024-slot `SnapshotRing`, cache-line isolated execution bell, and gated `StallWatch`.
 - `kyty_gpu.native-rt-v12-bind-churn-opt.prx.bak` (`207,457,792` B) — `v11` + `descriptors.cpp` / `renderContext.cpp` binding & BDA churn cuts (pre-PGO v3).
-- `kyty_gpu.native-rt-v12-pgo-v3.prx.bak` (`209,879,552` B, **currently deployed to `run-PPSA26344\libs\kyty_gpu.prx`**) — **New verified baseline**: `v12` rebuilt with fresh 19-snapshot `yotei-v3.profdata` (`8.14 MB`). Heavy frames `80.94 -> 74.69 ms/f` (`-7.7%`), steady `draw_op -32.8%`, `prep_today -29.6%`, `download -21.5%`, `bindless -25.3%`.
+- `kyty_gpu.native-rt-v12-pgo-v3.prx.bak` (`209,879,552` B) — `v12` rebuilt with fresh 19-snapshot `yotei-v3.profdata` (`8.14 MB`). Heavy frames `80.94 -> 74.69 ms/f` (`-7.7%`), steady `draw_op -32.8%`, `prep_today -29.6%`, `download -21.5%`, `bindless -25.3%`.
+- `kyty_gpu.native-rt-v13-parallel-v1.prx.bak` (**currently deployed to `run-PPSA26344\libs\kyty_gpu.prx`**) — **New verified baseline**: raises `BarDisableMbps` (`30 -> 100 MB/s`) so slow Windows WDDM BARs (`28–75 MB/s` on RTX 5070) deterministically use GPU DMA copies into cached host memory instead of stalling `ExecutionThread`, plus 4-thread multi-span `BarCopyPool` (`64 KiB` threshold), 256-bit 4 KiB page bloom filter in `GuestGpu::ApplyPendingWrites`, and perf-gated `MaterializeResources` walk clocks. Cut heavy (>50 ms) frame share from **`40.1% -> 14.7%` (-63%)**, heavy `download` from **`18.04 -> 10.86 ms/f` (-40% vs `v9`)**, and `execution_idle` by ~50% (`1,530 -> 606–884 ms/5s`).
 
 ## 4. Verified Performance Progression
 | Milestone / Build | Scene / Resolution | FPS | ms/f | Key Notes |
@@ -52,7 +53,8 @@
 | `native-rt-v6-gpu-indirect-td-fix` | **Open world (900p)** | **19.4–25.3** | **39.5–51.5** | **Stable across 9,518 frames** |
 | `native-rt-v7-smart-bar-callerwait` | Post-fight cutscene (900p) | ~13.0–14.1 | 71–77 | `fence` dropped to 0–6 ms, but asserted at frame 4,433 (`graphicsRun.cpp:670`) |
 | `native-rt-v9-async-variants-hints` | Open world / Cutscene (900p) | 15.2–18.8 (open world) | 53–66 | Verified clean exit (`393.1 s`, `exitCode: 0`); async gfx variants + `.kyhints` precompile active |
-| `native-rt-v12-pgo-v3` | **Heavy / Steady Gameplay (900p)** | **Heavy `13.4` (+8.4%), Steady `29.1`** | **74.7 / 34.3** | `v10`–`v12` Big-O/pruning + fresh `yotei-v3.profdata`; heavy `download -16.1%`, `idle -26.5%`, steady `draw_op -32.8%` |
+| `native-rt-v12-pgo-v3` | Heavy / Steady Gameplay (900p) | Heavy `13.4` (+8.4%), Steady `29.1` | 74.7 / 34.3 | `v10`–`v12` Big-O/pruning + fresh `yotei-v3.profdata`; heavy `download -16.1%`, `idle -26.5%`, steady `draw_op -32.8%` |
+| `native-rt-v13-parallel-v1` | **Heavy / Steady Gameplay (900p)** | **66.3% steady, only 14.7% heavy (-63%)** | **download `10.86 ms`** | **`BarDisableMbps=100` (Windows WDDM GPU DMA copies)** + 4-thread `BarCopyPool` + 256-bit `m_pending_page_bloom` + gated `MaterializeResources` clocks |
 
 ## 5. Completed Optimizations Summary
 ### Phases 1–3: Erlou Backend Port & Native RT

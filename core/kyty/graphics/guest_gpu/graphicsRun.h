@@ -225,9 +225,11 @@ private:
 	// A ring, oldest first. It holds more writes than the host GPU has in flight.
 	static constexpr size_t PendingWriteCapacity = 16384;
 	std::unique_ptr<GuestWrite[]> m_pending_writes;
-	size_t                        m_pending_first = 0;
-	size_t                        m_pending_count = 0;
-	size_t                        m_pending_ticked = 0; // writes from the oldest on that had their chance at a tick
+	size_t                        m_pending_first       = 0;
+	size_t                        m_pending_count       = 0;
+	size_t                        m_pending_ticked      = 0; // writes from the oldest on that had their chance at a tick
+	std::array<uint64_t, 4>       m_pending_page_bloom {}; // 256-bit bloom over 4 KiB pages currently in m_pending_writes
+	uint32_t                      m_pending_bloom_drops = 0;
 	void                          ForgetExecutedWrites();
 	[[nodiscard]] bool            WriteLanded(GuestWrite& write, uint64_t executed, uint64_t published, uint64_t known_tick);
 	GuestWrite&                   NewWrite();

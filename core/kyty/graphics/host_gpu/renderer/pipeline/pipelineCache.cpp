@@ -922,16 +922,19 @@ struct PipelineCache::ProgramCache {
 				}
 				if (!resolved) {
 					KYTY_PROFILER_BLOCK("MaterializeResources");
-					const auto walk_begin = std::chrono::steady_clock::now(); // PERF_RESOLVE_STAGES
+					const bool perf_walk  = Common::EnvRead::PerfLines();
+					const auto walk_begin = perf_walk ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 					EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(entry->second.resource_plan, runtime, out_resources,
 					                                                    out_specialization));
-					const size_t kind = std::is_same_v<InputInfo, ShaderComputeInputInfo> ? 1u : 0u;
-					g_resolve_stats.walks[kind][static_cast<size_t>(take)].fetch_add(1, std::memory_order_relaxed);
-					g_resolve_stats.walk_ns[kind][static_cast<size_t>(take)].fetch_add(
-					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-					                              std::chrono::steady_clock::now() - walk_begin)
-					                              .count()),
-					    std::memory_order_relaxed);
+					if (perf_walk) {
+						const size_t kind = std::is_same_v<InputInfo, ShaderComputeInputInfo> ? 1u : 0u;
+						g_resolve_stats.walks[kind][static_cast<size_t>(take)].fetch_add(1, std::memory_order_relaxed);
+						g_resolve_stats.walk_ns[kind][static_cast<size_t>(take)].fetch_add(
+						    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+						                              std::chrono::steady_clock::now() - walk_begin)
+						                              .count()),
+						    std::memory_order_relaxed);
+					}
 				}
 				if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) { // KYTY_TRACE_DISPATCH_CENSUS
 					t_compute_program_path = resolved ? 3u : 2u;

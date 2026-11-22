@@ -1776,7 +1776,8 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 // The renderer is complete once the GPU thread asks for a pipeline (the bindless table is built after this cache).
 void PipelineCache::StartBackgroundCompiles() {
-	if (m_precompiler == nullptr) return;
+	if (m_background_started || m_precompiler == nullptr) return;
+	m_background_started = true;
 	m_precompiler->Start();
 	// KYTY_SHADER_PRECOMPILE_WAIT (default 1, 11.11): the first time, the game waits here until the precompile of the
 	// recorded shaders is done (the window title shows its percent), so gameplay never starts while the workers still
@@ -2078,6 +2079,10 @@ void PipelineCache::InitializeDriverCache() {
 // session that ends abnormally keeps its compiled pipelines.
 void PipelineCache::SaveIfDue() {
 	if (m_driver_cache == nullptr) {
+		return;
+	}
+	// v15-pipeline-bindless-opt: throttle steady_clock::now() on the 70k+/s pipeline lookup hot path.
+	if ((++m_save_check_calls & 4095u) != 0u) {
 		return;
 	}
 	const auto now = std::chrono::steady_clock::now();
@@ -3283,11 +3288,21 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	EXIT_IF(!compute_program);
 
+	// v15-pipeline-bindless-opt: O(1) 256-slot direct-mapped fast path before unordered_map lookup.
+	auto& fast_slot = m_compute_fast[static_cast<size_t>((compute_program.id * 11400714819323198485ull) >> 56)];
+	if (fast_slot.pipe != nullptr && fast_slot.id == compute_program.id) {
+		auto& found     = *fast_slot.pipe;
+		found.last_used = static_cast<uint32_t>(DebugPresentCount().load(std::memory_order_relaxed));
+		if (found.pipeline == nullptr) [[unlikely]] RecreateComputePipeline(found, input_info, compute_program);
+		return found;
+	}
+
 	if (auto iter = m_compute_pipelines.find(compute_program.id);
 	    iter != m_compute_pipelines.end()) {
 		auto& found     = *iter->second;
-		found.last_used = static_cast<uint32_t>(DebugPresentCount().load());
-		if (found.pipeline == nullptr) RecreateComputePipeline(found, input_info, compute_program);
+		fast_slot       = {compute_program.id, &found};
+		found.last_used = static_cast<uint32_t>(DebugPresentCount().load(std::memory_order_relaxed));
+		if (found.pipeline == nullptr) [[unlikely]] RecreateComputePipeline(found, input_info, compute_program);
 		return found;
 	}
 
@@ -3318,6 +3333,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	cached->last_used     = static_cast<uint32_t>(DebugPresentCount().load());
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	fast_slot = {compute_program.id, iter->second.get()};
 	// (Upstream 959bee479 checkpoints the driver cache here; ours saves it with SaveIfDue, m_pipelines_since_save.)
 
 	return *iter->second;

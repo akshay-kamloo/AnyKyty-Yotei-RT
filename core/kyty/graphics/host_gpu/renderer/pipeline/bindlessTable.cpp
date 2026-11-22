@@ -1140,12 +1140,17 @@ void BindlessTable::OnImageUnregistered(ImageId id, const char* reason) {
 
 BindlessTable::Table& BindlessTable::FindOrCreateTable(const TableKey& key,
                                                        const ShaderRecompiler::IR::ImageResource& resource) {
+	auto& slot = m_table_fast[TableKeyHash {}(key) & 63u];
+	if (slot.table != nullptr && slot.key == key) {
+		return *slot.table;
+	}
 	auto [found, inserted] = m_tables.try_emplace(key);
 	if (inserted) {
 		found->second.resource = resource;
 		found->second.base     = key.base;
 		found->second.view     = key.view;
 	}
+	slot = {key, &found->second};
 	return found->second;
 }
 
@@ -1363,6 +1368,7 @@ bool BindlessTable::EvictIdleTable(const Table* keep) {
 	FreeTableRange(victim->second.region, victim->second.region_size);
 	DetachTable(victim->second); // the slot journal
 	m_tables.erase(victim);
+	m_table_fast.fill({});
 	m_table_stats.evicted++;
 	return true;
 }
@@ -1404,6 +1410,7 @@ void BindlessTable::EvictStaleTables(uint64_t frame) {
 		m_table_stats.evicted++;
 		DetachTable(table); // the slot journal
 		it = m_tables.erase(it);
+		m_table_fast.fill({});
 	}
 	ReclaimTableRanges();
 }

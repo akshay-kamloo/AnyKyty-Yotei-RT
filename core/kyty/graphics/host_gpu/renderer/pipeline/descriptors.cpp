@@ -2691,25 +2691,35 @@ bool RenderExecutor::PrepareBindlessTable(uint64_t shader_hash, const ShaderReco
 	// KYTY_PERF_BINDLESS_CLASSES: every field remembers the frame a draw last asked for it (TranslateBindlessTable lets
 	// unasked ones go) and what its records held (float tables: LearnBindlessClass).
 	const bool classes = bindless.ClassesEnabled();
-	for (const auto& field: m_table_fields) {
-		const auto known = std::ranges::find_if(table.fields, [&](const BindlessTable::TableField& other) {
-			return other.stride == field.stride && other.offset == field.offset;
-		});
-		if (known == table.fields.end()) {
-			table.fields.push_back(field);
-			if (classes) {
-				table.field_frames.resize(table.fields.size() - 1u, frame);
-				table.field_frames.push_back(frame);
-				table.field_tallies.resize(table.fields.size());
-			}
-			fields_changed = true;
-			continue;
+	// v15-pipeline-bindless-opt: fast path for single-field record tables (vast majority of bindless uses).
+	if (m_table_fields.size() == 1u && !table.fields.empty() &&
+	    table.fields[0].stride == m_table_fields[0].stride && table.fields[0].offset == m_table_fields[0].offset) {
+		if (classes && !table.field_frames.empty()) table.field_frames[0] = frame;
+		if (table.fields[0].end < m_table_fields[0].end) {
+			table.fields[0].end = m_table_fields[0].end;
+			fields_changed      = true;
 		}
-		if (classes && static_cast<size_t>(known - table.fields.begin()) < table.field_frames.size())
-			table.field_frames[known - table.fields.begin()] = frame;
-		if (known->end < field.end) {
-			known->end     = field.end;
-			fields_changed = true;
+	} else {
+		for (const auto& field: m_table_fields) {
+			const auto known = std::ranges::find_if(table.fields, [&](const BindlessTable::TableField& other) {
+				return other.stride == field.stride && other.offset == field.offset;
+			});
+			if (known == table.fields.end()) {
+				table.fields.push_back(field);
+				if (classes) {
+					table.field_frames.resize(table.fields.size() - 1u, frame);
+					table.field_frames.push_back(frame);
+					table.field_tallies.resize(table.fields.size());
+				}
+				fields_changed = true;
+				continue;
+			}
+			if (classes && static_cast<size_t>(known - table.fields.begin()) < table.field_frames.size())
+				table.field_frames[known - table.fields.begin()] = frame;
+			if (known->end < field.end) {
+				known->end     = field.end;
+				fields_changed = true;
+			}
 		}
 	}
 	// Within a presented frame a table only grows (draws reading other fields or more records of it); a new frame

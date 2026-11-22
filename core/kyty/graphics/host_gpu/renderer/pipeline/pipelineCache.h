@@ -363,6 +363,15 @@ private:
 	// helper's FindGraphicsPipeline holds it shared. The execution thread's own reads need no lock (it is the only writer).
 	mutable std::shared_mutex m_pipelines_mutex;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// v15-pipeline-bindless-opt: 256-slot O(1) direct-mapped cache over m_compute_pipelines
+	// (unique_ptr<Pipeline> entries are never erased until ~PipelineCache, so raw pointers stay valid).
+	struct ComputeFastSlot {
+		uint64_t  id   = 0;
+		Pipeline* pipe = nullptr;
+	};
+	std::array<ComputeFastSlot, 256> m_compute_fast {};
+	uint32_t                         m_save_check_calls   = 0;
+	bool                             m_background_started = false;
 	// KYTY_PERF_TABLE_ASYNC: the workers (started at the first queued creation) and the creations queued, running,
 	// finished but not taken yet, or refused (kept: their draws stay on today's path).
 	std::unique_ptr<TableCompileWorkers> m_table_workers;

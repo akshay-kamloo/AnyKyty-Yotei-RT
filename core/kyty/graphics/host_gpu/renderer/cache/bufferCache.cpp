@@ -963,14 +963,21 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (direct) {
 		uint64_t bytes = 0;
 		for (const auto& item: direct_plan.items) bytes += item.size;
+		// v16-eager-dma-prefetch: issue all chunk copies first, then one batched pipelineBarrier.
+		std::vector<vk::BufferMemoryBarrier> direct_barriers;
+		direct_barriers.reserve(direct_plan.chunks.size());
 		for (auto& [target, regions]: direct_plan.chunks) {
 			native.copyBuffer(buffer.Handle(), target->Handle(), static_cast<uint32_t>(regions.size()), regions.data());
-			after.buffer = target->Handle();
-			after.offset = 0;
-			after.size   = target->Size();
+			auto barrier   = after;
+			barrier.buffer = target->Handle();
+			barrier.offset = 0;
+			barrier.size   = target->Size();
+			direct_barriers.push_back(barrier);
+		}
+		if (!direct_barriers.empty()) {
 			native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 			                       vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost, {}, 0,
-			                       nullptr, 1, &after, 0, nullptr);
+			                       nullptr, static_cast<uint32_t>(direct_barriers.size()), direct_barriers.data(), 0, nullptr);
 		}
 		g_dtb.direct.fetch_add(1, std::memory_order_relaxed);
 		g_dtb.direct_kb.fetch_add(bytes >> 10u, std::memory_order_relaxed);
@@ -1378,7 +1385,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 				return vaddr < entry.end && entry.start < vaddr + size;
 			});
 			if (pending) ApplyEagerReadbacks(vaddr, size, true);
-			if (!is_write && size == 1u) RecordHotRead(vaddr);
+			if (!is_write && size <= 64u * 1024u) RecordHotRead(vaddr);
 			if (!m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 				PerfCount(pending ? PerfKind::EagerWait : PerfKind::EagerHit);
 				if (pending) ReadbackBurn(); // KYTY_DIAG_GPU_BURN_AT=readback (measurement only)
@@ -4295,9 +4302,16 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 	RecomputeEagerBounds();
 }
 
-void BufferCache::IssueEagerReadbacks() {
+void BufferCache::IssueEagerReadbacks(bool advance_clock) {
+	if (m_in_eager_readbacks) return;
+	m_in_eager_readbacks = true;
 	ApplyEagerReadbacks(0, 0, false);
-	++m_hot_clock;
+	if (advance_clock) ++m_hot_clock;
+	if (m_hot_reads.empty() || m_hot_min_start >= m_hot_max_end ||
+	    !m_gpu_modified_ranges.Intersects(m_hot_min_start, m_hot_max_end - m_hot_min_start)) {
+		m_in_eager_readbacks = false;
+		return;
+	}
 	for (const auto& hot: m_hot_reads) {
 		if (hot.hits < 2u || m_hot_clock - hot.last_use > 256u) continue;
 		if (!m_gpu_modified_ranges.Intersects(hot.start, hot.end - hot.start)) continue;
@@ -4324,6 +4338,7 @@ void BufferCache::IssueEagerReadbacks() {
 		if (hot.start < m_eager_min_start) m_eager_min_start = hot.start;
 		if (hot.end > m_eager_max_end) m_eager_max_end = hot.end;
 	}
+	m_in_eager_readbacks = false;
 }
 
 // Three skips in the bookkeeping of obtained buffers, each leaving every answer as without it:

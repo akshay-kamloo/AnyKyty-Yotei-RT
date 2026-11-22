@@ -755,6 +755,12 @@ private:
 	uint32_t                                          m_region_limit    = ShaderRecompiler::IR::WatchdogReportBase;
 	uint32_t                                          m_table_arena_end = 0; // 0 = no arena (bindless off)
 	std::unordered_map<TableKey, Table, TableKeyHash> m_tables;
+	// v15-pipeline-bindless-opt: 64-slot O(1) direct-mapped cache over m_tables (cleared on erase).
+	struct TableFastSlot {
+		TableKey key {};
+		Table*   table = nullptr;
+	};
+	std::array<TableFastSlot, 64> m_table_fast {};
 	std::vector<Table*>                               m_draw_tables;  // read by the draw being prepared
 	std::vector<std::pair<uint32_t, uint32_t>>        m_table_free;   // {start, length}, sorted, merged
 	std::vector<RetiringRange>                        m_table_retiring; // regions freed once their tick completed

@@ -692,18 +692,23 @@ void GuestGpu::Wake() {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread());
+	// v17-commands-batch-drain: O(1) swap-drain of m_commands under a single lock acquisition.
+	std::deque<Common::UniqueFunction<void>> batch;
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
-		Common::UniqueFunction<void> command;
+		batch.clear();
 		{
 			Common::LockGuard lock(m_queue_mutex);
-			EXIT_IF(m_commands.empty());
-			command = std::move(m_commands.front());
-			m_commands.pop_front();
-			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+			if (m_commands.empty()) break;
+			batch.swap(m_commands);
+			const auto count = static_cast<uint32_t>(batch.size());
+			EXIT_IF(m_pending_commands.fetch_sub(count, std::memory_order_acq_rel) < count);
 			m_commands_running = true;
 		}
-		if (DrawStateObserverOn()) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
-		command();
+		const bool observer = DrawStateObserverOn();
+		for (auto& command: batch) {
+			if (observer) DrawStateObserver::Invalidate(DrawStateObserver::Cause(DrawStateObserver::CauseInvalidate, DrawStateObserver::InvalidateCommand)); // the draw-state observer (DrawStateObserverOn)
+			command();
+		}
 	}
 }
 
@@ -1773,19 +1778,23 @@ void GuestGpu::RunCommandsWhileWaiting() {
 	if (gpu == nullptr || !IsGpuThread()) {
 		return;
 	}
+	// v17-commands-batch-drain: O(1) swap-drain under a single lock acquisition.
+	std::deque<Common::UniqueFunction<void>> batch;
 	while (gpu->m_pending_commands.load(std::memory_order_acquire) != 0) {
-		Common::UniqueFunction<void> command;
+		batch.clear();
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			if (gpu->m_commands.empty()) {
 				return;
 			}
-			command = std::move(gpu->m_commands.front());
-			gpu->m_commands.pop_front();
-			EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
+			batch.swap(gpu->m_commands);
+			const auto count = static_cast<uint32_t>(batch.size());
+			EXIT_IF(gpu->m_pending_commands.fetch_sub(count, std::memory_order_acq_rel) < count);
 		}
-		command();
-		gpu->m_work_epoch.fetch_add(1, std::memory_order_release);
+		for (auto& command: batch) {
+			command();
+			gpu->m_work_epoch.fetch_add(1, std::memory_order_release);
+		}
 	}
 }
 
@@ -2260,11 +2269,17 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	EmitCallback([this] { GetScheduler().Flush(); });
+	EmitCallback([this] {
+		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
+		GetScheduler().Flush();
+	});
 }
 
 void CommandProcessor::BufferFlushForInterrupt() {
-	EmitCallback([this] { GetScheduler().FlushForInterrupt(); });
+	EmitCallback([this] {
+		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
+		GetScheduler().FlushForInterrupt();
+	});
 }
 
 void CommandProcessor::BufferWait() {

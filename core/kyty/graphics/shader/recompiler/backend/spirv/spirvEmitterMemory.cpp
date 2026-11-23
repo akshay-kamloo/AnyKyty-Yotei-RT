@@ -2902,10 +2902,13 @@ void DefineIndirectFormattedLoadFunctions(ValueEmitContext& ctx) {
 // part 2 frame 120.9 -> 110.1 and 115.9 -> 109.9 ms (two run pairs, warm caches). Inline in every program ran the
 // driver's compiler out of memory (CS fbdb4e82: 41 s, then "LLVM ERROR: out of memory"), hence the limit.
 static constexpr uint32_t RawInlineMaxLoads = 16;
+static constexpr uint32_t RawInlineMaxTotalInsts = 8000;
 static spv::FunctionControlMask IndirectRawControl(const EmitterState& state) {
 	uint32_t loads = 0;
+	uint32_t total_insts = 0;
 	for (const auto* block: state.program.blocks) {
 		for (const auto& inst: *block) {
+			++total_insts;
 			const auto op = inst.GetOpcode();
 			if (op != IR::ValueOpcode::LoadBufferU32 && op != IR::ValueOpcode::LoadBufferU32x2 &&
 			    op != IR::ValueOpcode::LoadBufferU32x3 && op != IR::ValueOpcode::LoadBufferU32x4)
@@ -2916,6 +2919,8 @@ static spv::FunctionControlMask IndirectRawControl(const EmitterState& state) {
 			if (mem.kind == IR::ResourceKind::IndirectBuffer && !mem.formatted) ++loads;
 		}
 	}
+	static const bool di_large = []{ const char* v = std::getenv("KYTY_SPIRV_DONTINLINE_LARGE"); return v && v[0] && v[0] != '0'; }();
+	if (di_large && total_insts > RawInlineMaxTotalInsts) return spv::FunctionControlDontInlineMask;
 	return loads <= RawInlineMaxLoads ? spv::FunctionControlInlineMask : spv::FunctionControlDontInlineMask;
 }
 

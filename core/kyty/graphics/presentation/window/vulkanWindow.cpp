@@ -468,6 +468,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+bool PipelineBinaryCacheEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_BINARY_CACHE");
+		return value != nullptr && value[0] != '\0' && value[0] != '0';
+	}();
+	return enabled;
+}
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -957,6 +965,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		ray_query_features.pNext = const_cast<void*>(create_info.pNext);
 		create_info.pNext = &ray_query_features;
 	}
+	vk::PhysicalDevicePipelineBinaryFeaturesKHR pipeline_binary_features {};
+	graphics.pipeline_binary_enabled = false;
+	if (PipelineBinaryCacheEnabled() && HasExtension(enabled_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)) {
+		vk::PhysicalDevicePipelineBinaryFeaturesKHR supported_pb {};
+		vk::PhysicalDeviceFeatures2 pb_query {};
+		pb_query.pNext = &supported_pb;
+		physical_device.getFeatures2(&pb_query);
+		if (supported_pb.pipelineBinaries == VK_TRUE) {
+			pipeline_binary_features.pipelineBinaries = VK_TRUE;
+			pipeline_binary_features.pNext = const_cast<void*>(create_info.pNext);
+			create_info.pNext = &pipeline_binary_features;
+			graphics.pipeline_binary_enabled = true;
+		} else {
+			std::erase_if(enabled_extensions, [](const char* n) { return std::strcmp(n, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME) == 0; });
+		}
+	}
+	LOGF("Vulkan pipeline binary cache (KYTY_PIPELINE_BINARY_CACHE=%d): %s\n", PipelineBinaryCacheEnabled() ? 1 : 0, graphics.pipeline_binary_enabled ? "enabled" : "disabled");
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
@@ -1437,6 +1462,9 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
 			device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
 			device_extensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+		}
+		if (PipelineBinaryCacheEnabled() && HasExtension(available_extensions, VK_KHR_PIPELINE_BINARY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_PIPELINE_BINARY_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	}

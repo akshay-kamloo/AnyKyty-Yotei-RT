@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineBinaryCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1131,8 +1132,47 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		info.flags |= vk::PipelineCreateFlagBits::eCaptureStatisticsKHR;
 	}
 	const auto create_begin = std::chrono::steady_clock::now();
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	bool pb_loaded = false, pb_key_ok = false;
+	vk::PipelineBinaryKeyKHR pb_key {};
+	if (graphics.pipeline_binary_enabled) {
+		vk::PipelineCreateInfoKHR kci {}; kci.pNext = &info;
+		pb_key_ok = graphics.device.getPipelineKeyKHR(&kci, &pb_key) == vk::Result::eSuccess && pb_key.keySize > 0;
+		if (pb_key_ok && PipelineBinaryCache::TryLoadCompute(graphics, info, pb_key, pipeline.pipeline)) {
+			pb_loaded = true;
+			result = vk::Result::eSuccess;
+		}
+	}
+	if (!pb_loaded) {
+		bool warm_hit = false;
+		if (graphics.pipeline_binary_enabled && pb_key_ok && driver_cache != nullptr) {
+			vk::ComputePipelineCreateInfo probe = info;
+			probe.flags |= vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired;
+			const auto pr = graphics.device.createComputePipelines(driver_cache, 1, &probe, nullptr, &pipeline.pipeline);
+			if (pr == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+				result = vk::Result::eSuccess;
+				warm_hit = true;
+			}
+		}
+		if (!warm_hit) {
+			vk::PipelineCreateFlags2CreateInfoKHR flags2 {};
+			vk::ComputePipelineCreateInfo cinfo = info;
+			if (graphics.pipeline_binary_enabled && pb_key_ok) {
+				flags2.flags = static_cast<vk::PipelineCreateFlags2KHR>(static_cast<VkPipelineCreateFlags>(info.flags)) | vk::PipelineCreateFlagBits2KHR::eCaptureDataKHR;
+				flags2.pNext = const_cast<void*>(cinfo.pNext);
+				cinfo.pNext = &flags2;
+			}
+			result = graphics.device.createComputePipelines(driver_cache, 1, &cinfo, nullptr, &pipeline.pipeline);
+			if (graphics.pipeline_binary_enabled && pb_key_ok && result == vk::Result::eSuccess && pipeline.pipeline != nullptr) {
+				const auto save_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - create_begin).count();
+				if (save_ms >= 200.0) {
+					PipelineBinaryCache::SaveCompute(graphics, pipeline.pipeline, pb_key, stats_cs, save_ms);
+				} else {
+					vk::ReleaseCapturedPipelineDataInfoKHR rel {}; rel.pipeline = pipeline.pipeline;
+					(void)graphics.device.releaseCapturedPipelineDataKHR(&rel, nullptr);
+				}
+			}
+		}
+	}
 	// KYTY_TRACE_STARTUP: every compute pipeline creation (GPU thread or background), 50 ms+ ones also as slow.
 	if (Common::StartupTrace::Enabled()) {
 		const auto ms =

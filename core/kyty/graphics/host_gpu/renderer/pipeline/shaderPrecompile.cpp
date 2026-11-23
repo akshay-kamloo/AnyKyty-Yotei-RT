@@ -13,6 +13,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kytyGitVersion.h"
@@ -1784,6 +1785,9 @@ ShaderPrecompiler::ShaderPrecompiler(GraphicContext& graphics, vk::PipelineCache
 	std::vector<Job>  graphics_jobs;
 	std::vector<Job>  stage_jobs;
 	LoadCompute(skipped, compute_jobs);
+	std::ranges::stable_sort(compute_jobs, [&](const Job& a, const Job& b) {
+		return m_compute_records[a.record].code.size() > m_compute_records[b.record].code.size();
+	});
 	if (GraphicsEnabled()) {
 		LoadGraphics(skipped, graphics_jobs, stage_jobs);
 	}
@@ -1846,7 +1850,7 @@ void ShaderPrecompiler::Start(uint32_t requested_threads) {
 		threads = std::clamp(requested_threads, 1u, 64u);
 	} else if (const char* value = Common::EnvOrDefault("KYTY_SHADER_PRECOMPILE_THREADS"); value != nullptr) {
 		// Default from Common::EnvDefaults: 8 threads (6 until 8.11); 4 with KYTY_ENV_DEFAULTS=0.
-		threads = static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
+		threads = static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 32));
 	}
 	// Only the jobs left to compile need workers (suspects and pipelines already in the driver cache are dropped).
 	const auto queued = static_cast<uint32_t>(
@@ -2342,8 +2346,12 @@ bool ShaderPrecompiler::CompileModule(const PrecompileStageRecord& record, uint6
 	options.user_data   = record.user_data;
 	options.back_code   = record.back_code;
 	options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-	options.early_dump  = options.dump_ir;
-	options.dump_label  = StageLabel(record.stage);
+	options.early_dump         = options.dump_ir;
+	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
+	options.native_ray_tracing = RayTracing::NativeTraversals();
+	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
+	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
+	options.dump_label         = StageLabel(record.stage);
 	options.input_info  = stage_input;
 	SetStageCompileOptions(options);
 	// The profile of the GPU thread's compiles (ProgramCache: maintenance8, AMD native min/max), so a module made here is the

@@ -29,6 +29,7 @@ inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 // re-read at every collector run (GraphicContext::GetVramBudgetState), evicting old images before new ones are
 // created over it; implies the KYTY_VRAM_GC_FIX collector.
 [[nodiscard]] bool VramBudgetEnabled();
+[[nodiscard]] bool PipelineBinaryCacheEnabled();
 // KYTY_TRACE_PERF: the allocator's vkAllocateMemory / vkFreeMemory calls since the last call (counts, MiB, ms).
 [[nodiscard]] std::string TakeDeviceMemoryCallStats();
 
@@ -71,6 +72,7 @@ struct GraphicContext {
 	bool                               robust_buffer_access_enabled          = false;
 	bool                               ray_query_enabled                     = false;
 	bool                               native_ray_tracing_enabled            = false;
+	bool                               pipeline_binary_enabled               = false;
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               supports_block_texel_view              = false;

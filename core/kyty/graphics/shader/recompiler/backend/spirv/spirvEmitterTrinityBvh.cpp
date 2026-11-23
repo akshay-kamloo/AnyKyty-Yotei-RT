@@ -73,7 +73,11 @@ struct Bvh8Emitter {
 	                            std::span<const uint32_t> types) {
 		function = s.builder.AllocateId();
 		s.builder.AddName(function, name);
-		s.builder.AddFunction(spv::OpFunction, result, function, spv::FunctionControlMaskNone,
+		size_t total_insts = 0;
+		for (const auto* block: s.program.blocks) for (const auto& inst: *block) { (void)inst; ++total_insts; }
+		static const bool di_large = []{ const char* v = std::getenv("KYTY_SPIRV_DONTINLINE_LARGE"); return v && v[0] && v[0] != '0'; }();
+		const auto fn_ctrl = (di_large && total_insts > 8000u) ? spv::FunctionControlDontInlineMask : spv::FunctionControlMaskNone;
+		s.builder.AddFunction(spv::OpFunction, result, function, fn_ctrl,
 		    s.builder.Type(spv::OpTypeFunction, result, types));
 		std::vector<uint32_t> args;
 		for (auto type: types) {

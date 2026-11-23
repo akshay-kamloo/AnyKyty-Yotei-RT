@@ -100,7 +100,11 @@ void DefineBvhStack(EmitterState& s) {
 	const auto signature = s.builder.Type(spv::OpTypeFunction, pair, types);
 	s.bvh_stack_function = s.builder.AllocateId();
 	s.builder.AddName(s.bvh_stack_function, "trinity_bvh_stack");
-	s.builder.AddFunction(spv::OpFunction, pair, s.bvh_stack_function, spv::FunctionControlMaskNone, signature);
+	size_t total_insts = 0;
+	for (const auto* block: s.program.blocks) for (const auto& inst: *block) { (void)inst; ++total_insts; }
+	static const bool di_large = []{ const char* v = std::getenv("KYTY_SPIRV_DONTINLINE_LARGE"); return v && v[0] && v[0] != '0'; }();
+	const auto fn_ctrl = (di_large && total_insts > 8000u) ? spv::FunctionControlDontInlineMask : spv::FunctionControlMaskNone;
+	s.builder.AddFunction(spv::OpFunction, pair, s.bvh_stack_function, fn_ctrl, signature);
 	std::vector<uint32_t> args;
 	for (const auto type: types) {
 		args.push_back(s.builder.AllocateId());

@@ -216,7 +216,22 @@ bool ImageHeap::Refresh(Memory& memory) {
 			    m_runs.emplace_back(begin, end);
 		    });
 	}
-	if (gpu_dirty) m_runs.assign(1u, {0u, pages});
+	if (gpu_dirty) {
+		auto& buffers = m_context.GetBufferCache();
+		std::vector<uint8_t> need(pages, 0u);
+		for (const auto& [b, e]: m_runs) {
+			std::fill(need.begin() + b, need.begin() + e, uint8_t {1});
+		}
+		for (size_t page = 0; page < pages; ++page) {
+			if (need[page] != 0u) continue;
+			const auto [addr, end] = PageRange(memory.base, memory.size, page, page + 1u);
+			if (buffers.HasGpuDirtyBytes(addr, end - addr)) need[page] = 1u;
+		}
+		m_runs.clear();
+		ForEachRun(
+		    0, pages, [&](size_t page) { return need[page] != 0u; },
+		    [&](size_t begin, size_t end) { m_runs.emplace_back(begin, end); });
+	}
 	for (size_t run = 0; run < m_runs.size(); ++run) {
 		const auto [address, end] = PageRange(memory.base, memory.size, m_runs[run].first,
 		                                      m_runs[run].second);

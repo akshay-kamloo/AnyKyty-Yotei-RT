@@ -2602,17 +2602,27 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!decoded) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			MetadataReadFailure(address, slice_size);
-			continue;
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			if (TraceImageSyncAddr(desc.info.data.address)) {
-				std::fprintf(stderr, "IMAGE_SYNC frame=%u meta_not_uniform code=0x%02x distinct_first=0x%02x\n",
-				             DebugPresentCount().load(), code,
-				             *std::find_if(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte != code; }));
+		std::array<uint8_t, MetadataBlockSize> block, codes;
+		codes.fill(code);
+		bool uniform = true, read_failed = false;
+		uint8_t distinct_first = code;
+		for (uint64_t offset = 0; uniform && offset < slice_size; offset += block.size()) {
+			const auto size = std::min<uint64_t>(block.size(), slice_size - offset);
+			if (!LibKernel::Memory::TryReadBacking(address + offset, block.data(), size)) {
+				MetadataReadFailure(address, slice_size);
+				read_failed = true;
+				break;
 			}
+			if (std::memcmp(block.data(), codes.data(), size) != 0) {
+				uniform = false;
+				if (TraceImageSyncAddr(desc.info.data.address))
+					distinct_first = *std::find_if(block.begin(), block.begin() + static_cast<std::ptrdiff_t>(size), [code](uint8_t b) { return b != code; });
+			}
+		}
+		if (read_failed) continue;
+		if (!uniform) {
+			if (TraceImageSyncAddr(desc.info.data.address))
+				std::fprintf(stderr, "IMAGE_SYNC frame=%u meta_not_uniform code=0x%02x distinct_first=0x%02x\n", DebugPresentCount().load(), code, distinct_first);
 			continue;
 		}
 		// The keys decide, also for an image written through a buffer since they were set (buffer writes never change
@@ -2633,9 +2643,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			block.fill(0xff);
 			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			for (uint64_t offset = 0; offset < slice_size; offset += block.size()) {
+				const auto size = std::min<uint64_t>(block.size(), slice_size - offset);
+				LibKernel::Memory::WriteBacking(address + offset, block.data(), size);
+			}
 		}
 		if (pixel) {
 			LogDccKey10Apply("readback", desc, clear.color);

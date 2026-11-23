@@ -4413,28 +4413,46 @@ void BufferCache::InsertTickRangeJoined(std::map<uint64_t, WriteTick>& ticks, ui
 
 // [start, end) gets `tick`; the parts of older ranges outside it keep theirs.
 void BufferCache::InsertTickRange(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick) {
-	auto& m_write_ticks = ticks;
 	if (start >= end) return;
-	auto it = m_write_ticks.lower_bound(start);
-	if (it != m_write_ticks.begin()) {
+	auto it = ticks.lower_bound(start);
+	if (it != ticks.end() && it->first == start && it->second.end == end) {
+		it->second.tick = tick;
+		return;
+	}
+	using Map = std::map<uint64_t, WriteTick>;
+	thread_local std::vector<Map::node_type> spare;
+	if (spare.capacity() == 0) spare.reserve(64);
+	auto put = [&](Map::const_iterator hint, uint64_t k, WriteTick v) -> Map::iterator {
+		if (spare.empty()) return ticks.emplace_hint(hint, k, v);
+		auto node = std::move(spare.back());
+		spare.pop_back();
+		node.key() = k; node.mapped() = v;
+		return ticks.insert(hint, std::move(node));
+	};
+	auto drop = [&](Map::iterator iter) -> Map::iterator {
+		if (spare.size() == spare.capacity()) return ticks.erase(iter);
+		const auto next = std::next(iter);
+		spare.push_back(ticks.extract(iter));
+		return next;
+	};
+	if (it != ticks.begin()) {
 		auto previous = std::prev(it);
 		if (previous->second.end > start) {
 			const auto old = previous->second;
 			previous->second.end = start;
-			if (old.end > end) m_write_ticks[end] = old;
+			if (old.end > end) it = put(it, end, old);
 		}
 	}
-	it = m_write_ticks.lower_bound(start);
-	while (it != m_write_ticks.end() && it->first < end) {
+	while (it != ticks.end() && it->first < end) {
 		if (it->second.end > end) {
 			const auto old = it->second;
-			m_write_ticks.erase(it);
-			m_write_ticks[end] = old;
+			const auto next = drop(it);
+			it = put(next, end, old);
 			break;
 		}
-		it = m_write_ticks.erase(it);
+		it = drop(it);
 	}
-	m_write_ticks[start] = {end, tick};
+	put(it, start, WriteTick {end, tick});
 }
 
 uint64_t BufferCache::QueryTicks(const std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end) {
@@ -4894,12 +4912,21 @@ bool BufferCache::BarServable(Buffer& buffer, uint64_t vaddr, uint64_t size, uin
 // 6-9.5 ms for 5 command buffers, its own bytes long written; live A/B +1.8% standing, +7.7% walking, draws equal). The
 // bytes left outside stay GPU-modified and synchronize when accessed.
 std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	const uint64_t start = buffer.CpuAddress();
-	const uint64_t end   = start + buffer.Size();
-	const uint64_t lo    = std::max(start, vaddr > ReadWindowBytes ? (vaddr - ReadWindowBytes) & ~0xfffull : 0ull);
-	const uint64_t hi    = std::min(end, (vaddr + size + ReadWindowBytes + 0xfffull) & ~0xfffull);
+	static const uint64_t device_local_window = [] {
+		if (const char* v = std::getenv("KYTY_READ_WINDOW_KB"); v != nullptr && *v != '\0') {
+			const uint64_t kb = std::strtoull(v, nullptr, 10);
+			if (kb >= 4 && kb <= 16384) return kb << 10u;
+		}
+		return uint64_t {256} << 10u;
+	}();
+	const bool     no_bar = buffer.Mapped().empty() || !BarReadsOn();
+	const uint64_t win    = no_bar ? device_local_window : ReadWindowBytes;
+	const uint64_t start  = buffer.CpuAddress();
+	const uint64_t end    = start + buffer.Size();
+	const uint64_t lo     = std::max(start, vaddr > win ? (vaddr - win) & ~0xfffull : 0ull);
+	const uint64_t hi     = std::min(end, (vaddr + size + win + 0xfffull) & ~0xfffull);
 	if (!(lo < hi && lo <= vaddr && vaddr + size <= hi)) return {vaddr, vaddr + size};
-	if (buffer.Mapped().empty() || !BarReadsOn()) return {lo, hi}; // no mapping reads: the window, as without a mapping
+	if (no_bar) return {lo, hi}; // no mapping reads: tuned staging window
 	const auto ready = m_buffer_ready_tick.find(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(buffer.Handle())));
 	if (ready == m_buffer_ready_tick.end()) return {lo, hi};
 	const auto servable = [&](uint64_t a, uint64_t b) { return BarServable(buffer, a, b - a, ready->second); };

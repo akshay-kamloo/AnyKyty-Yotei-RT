@@ -99,6 +99,7 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout, uint64_
 	}
 
 	m_pending_pools.emplace_back(m_current_pool, tick);
+	m_master_semaphore.Refresh();
 	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
 		m_current_pool = pool;
 		m_pending_pools.pop_front();

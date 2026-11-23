@@ -18,6 +18,10 @@ static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 	return static_cast<uint32_t>((static_cast<uint64_t>(value) + (1ull << shift) - 1ull) >> shift);
 }
 
+static uint32_t AlignToBlock(uint32_t value, uint32_t block) {
+	return (value + block - 1u) & ~(block - 1u);
+}
+
 static uint32_t CalcLinearBlockWidth(uint32_t bytes_per_element) {
 	return 256u / bytes_per_element;
 }
@@ -271,18 +275,6 @@ static uint32_t FirstTailLevel(const MipTailLayout& tail, uint32_t width, uint32
 	return levels;
 }
 
-bool TileGetTextureElementLayout(Prospero::BufferFormat format, TileTextureElementLayout& out) {
-	if (const auto bytes = Prospero::NumBytesPerElement(format); std::has_single_bit(bytes)) {
-		out = {bytes, 1, 1};
-		return true;
-	}
-	if (const auto bytes = Prospero::BlockCompressedBytesPerBlock(format); bytes != 0) {
-		out = {bytes, 4, 4};
-		return true;
-	}
-	return false;
-}
-
 bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode tile, bool volume,
                                TileTextureBlockLayout& out) {
 	TileBlockFamily family = TileBlockFamily::Count;
@@ -341,9 +333,11 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 	if (!TileGetTextureBlockLayout(description.format, description.tile_mode, volume, texture)) {
 		return false;
 	}
-	const auto& block   = texture.block;
-	const auto  width0  = (description.width + texture.texel_width - 1u) / texture.texel_width;
-	const auto  height0 = (description.height + texture.texel_height - 1u) / texture.texel_height;
+	const auto& block      = texture.block;
+	const auto  texel_w_sh = std::countr_zero(texture.texel_width);
+	const auto  texel_h_sh = std::countr_zero(texture.texel_height);
+	const auto  width0     = ShiftCeil(description.width, texel_w_sh);
+	const auto  height0    = ShiftCeil(description.height, texel_h_sh);
 
 	TileSurfaceLayout result {};
 	result.description      = description;
@@ -359,12 +353,10 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 
 	for (uint32_t level = 0; level < result.first_tail_level; ++level) {
 		auto& mip = result.mips[level];
-		mip.width = std::max(
-		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
-		mip.height = std::max(
-		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
-		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.width         = std::max(ShiftCeil(description.width >> level, texel_w_sh), 1u);
+		mip.height        = std::max(ShiftCeil(description.height >> level, texel_h_sh), 1u);
+		mip.padded_width  = AlignToBlock(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height = AlignToBlock(std::max(ShiftCeil(height0, level), 1u), block.block_height);
 		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
 		           block.bytes_per_element;
 		result.block_slice_size += mip.size;
@@ -375,10 +367,8 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 	}
 	for (uint32_t level = result.first_tail_level; level < description.levels; ++level) {
 		auto& mip = result.mips[level];
-		mip.width = std::max(
-		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
-		mip.height = std::max(
-		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
+		mip.width  = std::max(ShiftCeil(description.width >> level, texel_w_sh), 1u);
+		mip.height = std::max(ShiftCeil(description.height >> level, texel_h_sh), 1u);
 		mip.padded_width  = block.block_width;
 		mip.padded_height = block.block_height;
 		mip.size          = block.block_size;

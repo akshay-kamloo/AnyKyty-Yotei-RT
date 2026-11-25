@@ -2790,6 +2790,7 @@ void GuestGpu::ThreadRun(void* data) {
 			no_work = gpu->m_submission_count == 0 && !gpu->m_stopping;
 		}
 		if (no_work) {
+			gpu->m_gfx_cp->BufferFlushIfCoalesced(CommandScheduler::FlushSite::SliceIdle);
 			if (ChunkLead::On()) ChunkLead::g_cp_state.store(ChunkLead::CpNoWork, std::memory_order_relaxed); // KYTY_TRACE_CHUNK_LEAD
 			gpu->WaitForExecution(GpuDrain::Idle);
 			uint64_t epoch = 0;

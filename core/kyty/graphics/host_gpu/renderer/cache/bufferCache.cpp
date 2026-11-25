@@ -4211,14 +4211,32 @@ bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+namespace {
+struct GpuDirtyMemoEntry {
+	uint64_t vaddr = 0;
+	uint64_t size  = 0;
+	uint64_t gen   = 0;
+};
+constexpr size_t  kGpuDirtyMemoSlots = 1024;
+GpuDirtyMemoEntry g_gpu_dirty_memo[kGpuDirtyMemoSlots]; // GPU thread only
+} // namespace
+
 void BufferCache::GpuDirtyAdd(uint64_t vaddr, uint64_t size) {
+	if (size == 0u) return;
+	const uint64_t h    = (vaddr * 0x9E3779B97F4A7C15ull) ^ (size + (size << 19u));
+	auto&          slot = g_gpu_dirty_memo[(h ^ (h >> 27u)) & (kGpuDirtyMemoSlots - 1u)];
+	if (slot.gen == m_gpu_dirty_clean_gen && slot.vaddr == vaddr && slot.size == size) {
+		return;
+	}
 	{
 		std::unique_lock lock(m_gpu_dirty_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
+	slot = {vaddr, size, m_gpu_dirty_clean_gen};
 }
 
 void BufferCache::GpuDirtySubtract(uint64_t vaddr, uint64_t size) {
+	m_gpu_dirty_clean_gen++;
 	NoteGpuCleanRange(vaddr, size); // the write memo
 	std::unique_lock lock(m_gpu_dirty_mutex);
 	m_gpu_modified_ranges.Subtract(vaddr, size);
@@ -4595,9 +4613,36 @@ uint64_t BufferCache::QueryWriteTick(uint64_t start, uint64_t end) const {
 // any of its bytes, a safe upper bound for each page in it. Per 4 KiB page the map updates cost
 // ~9% of the GPU thread (the BAR reads note every written binding at each draw/dispatch).
 
+namespace {
+struct GranuleTickFastSlot {
+	uint64_t key  = UINT64_MAX;
+	uint64_t tick = 0;
+};
+constexpr size_t    kGranuleFastSlots = 1024;
+GranuleTickFastSlot g_granule_fast[kGranuleFastSlots]; // GPU thread only
+} // namespace
+
 void BufferCache::NoteGpuWriteTick(uint64_t vaddr, uint64_t size) {
-	const auto tick = m_scheduler.CurrentTick();
-	// A range inside one already raised to this tick needs no new loop.
+	if (size == 0u) return;
+	const auto     tick      = m_scheduler.CurrentTick();
+	const uint64_t first_key = WriteTickKey(vaddr);
+	const uint64_t last_key  = WriteTickKey(vaddr + size - 1u);
+	if (first_key == last_key) {
+		auto& slot = g_granule_fast[(first_key * 0x9E3779B97F4A7C15ull >> 54u) & (kGranuleFastSlots - 1u)];
+		if (slot.key == first_key && slot.tick == tick) {
+			if (PerfEnabled()) {
+				ReportObtainExact(g_obtain_exact.granule_checks.fetch_add(1, std::memory_order_relaxed) + 1);
+				g_obtain_exact.granule_skips.fetch_add(1, std::memory_order_relaxed);
+			}
+			return;
+		}
+		if (PerfEnabled()) {
+			ReportObtainExact(g_obtain_exact.granule_checks.fetch_add(1, std::memory_order_relaxed) + 1);
+		}
+		m_granule_ticks.RaiseRange(first_key, first_key, tick);
+		slot = {first_key, tick};
+		return;
+	}
 	bool noted = false;
 	for (const auto& note: m_granule_notes) {
 		if (note.tick == tick && note.start <= vaddr && vaddr + size <= note.end) {
@@ -4605,12 +4650,14 @@ void BufferCache::NoteGpuWriteTick(uint64_t vaddr, uint64_t size) {
 			break;
 		}
 	}
-	ReportObtainExact(g_obtain_exact.granule_checks.fetch_add(1, std::memory_order_relaxed) + 1);
+	if (PerfEnabled()) {
+		ReportObtainExact(g_obtain_exact.granule_checks.fetch_add(1, std::memory_order_relaxed) + 1);
+	}
 	if (noted) {
-		g_obtain_exact.granule_skips.fetch_add(1, std::memory_order_relaxed);
+		if (PerfEnabled()) g_obtain_exact.granule_skips.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
-	m_granule_ticks.RaiseRange(WriteTickKey(vaddr), WriteTickKey(vaddr + size - 1), tick);
+	m_granule_ticks.RaiseRange(first_key, last_key, tick);
 	m_granule_notes[m_granule_note_next] = {vaddr, vaddr + size, tick};
 	m_granule_note_next = (m_granule_note_next + 1u) % static_cast<uint32_t>(m_granule_notes.size());
 }

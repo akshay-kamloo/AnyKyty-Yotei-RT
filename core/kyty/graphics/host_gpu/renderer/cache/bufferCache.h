@@ -113,17 +113,24 @@ public:
 	// release. Between them LookupBuffer answers FindBuffer(vaddr, size) when FindBuffer would find a buffer (a null id
 	// when it would create one), writing nothing; the buffer registry epoch it saw is DrawRepeat::g_buffer_registry_epoch,
 	// read under the same lock. GPU thread: the registry's page table and slots change only under this lock.
-	[[nodiscard]] bool     TryLockLookup() noexcept { return m_lookup_lock.try_lock(); }
-	// Project 15 way B W2.1: a helper's plan peek tries the lookup lock 4 times, 64 pauses apart (as the resolve's source
-	// build does): a single try lost every entry of the stage while the other helper held it (~8% of the acquisitions).
-	[[nodiscard]] bool     TryLockLookupSpin() noexcept {
-        for (uint32_t attempt = 0; attempt < 4u; attempt++) {
-            if (m_lookup_lock.try_lock()) return true;
-            for (uint32_t spin = 0; spin < 64u; spin++) Common::SpinPause();
-        }
-        return false;
+	[[nodiscard]] bool     TryLockLookup() noexcept {
+		uint32_t v = m_lookup_rw.load(std::memory_order_relaxed);
+		for (uint32_t tries = 0; tries < 8u; tries++) {
+			if ((v & 0x80000000u) != 0u) return false;
+			if (m_lookup_rw.compare_exchange_weak(v, v + 1u, std::memory_order_acquire, std::memory_order_relaxed)) {
+				return true;
+			}
+		}
+		return false;
 	}
-	void                   UnlockLookup() noexcept { m_lookup_lock.unlock(); }
+	[[nodiscard]] bool     TryLockLookupSpin() noexcept {
+		for (uint32_t attempt = 0; attempt < 4u; attempt++) {
+			if (TryLockLookup()) return true;
+			for (uint32_t spin = 0; spin < 64u; spin++) Common::SpinPause();
+		}
+		return false;
+	}
+	void                   UnlockLookup() noexcept { m_lookup_rw.fetch_sub(1u, std::memory_order_release); }
 	[[nodiscard]] BufferId LookupBuffer(uint64_t vaddr, uint64_t size) const;
 	// Project 15 S2a (N3, the read-only translator; design: the analysis session's n3-projekt.md section 4.1): what
 	// ObtainBuffer would answer, writing nothing. Ready: a registered buffer holds the range, it is CPU-clean and no image
@@ -900,15 +907,21 @@ private:
 	std::shared_mutex                                 m_gpu_dirty_mutex;
 	// Guards m_page_table and m_slot_buffers' insertions/erasures against the resolve thread's LookupBuffer; taken by the GPU thread
 	// only for those changes.
-	TrackingSpinLock                                  m_lookup_lock {PerfLockSiteBufferLookup};
-	// The GPU thread's guard for one registry change.
+	std::atomic<uint32_t>                             m_lookup_rw {0}; // bit 31 = writer, bits 0..30 = concurrent readers
+	uint64_t                                          m_gpu_dirty_clean_gen {1};
+	// The GPU thread's guard for one registry change (exclusive against helper readers).
 	class LookupWriteGuard {
 	public:
 		explicit LookupWriteGuard(BufferCache& cache): m_cache(cache) {
 			if (t_translator != 0) TranslatorNote(0); // project 15 S2a: a registry change inside a peek
-			m_cache.m_lookup_lock.lock();
+			uint32_t expected = 0u;
+			while (!m_cache.m_lookup_rw.compare_exchange_weak(expected, 0x80000000u,
+			                                                  std::memory_order_acquire, std::memory_order_relaxed)) {
+				expected = 0u;
+				Common::SpinPause();
+			}
 		}
-		~LookupWriteGuard() { m_cache.m_lookup_lock.unlock(); }
+		~LookupWriteGuard() { m_cache.m_lookup_rw.store(0u, std::memory_order_release); }
 		LookupWriteGuard(const LookupWriteGuard&)            = delete;
 		LookupWriteGuard& operator=(const LookupWriteGuard&) = delete;
 

@@ -1547,7 +1547,7 @@ void GuestGpu::ResolveThread() {
 			// N5.2: with two helpers the tasks go in turns of 8 (warm caches); slots are independent, the execution thread
 			// takes them in order by their phase.
 			task.seq    = m_tasks_pushed; // N5.3: the lead is this minus the operations the execution thread began
-			auto& queue = *m_task_queues[((m_deal_turn++) >> 3u) % m_resolve_helper_count];
+			auto& queue = *m_task_queues[((m_deal_turn++) >> 2u) % m_resolve_helper_count];
 			if (!queue.TryPush(task)) EXIT("resolve helper: the task queue is full\n"); // a task holds a slot: never full
 			m_tasks_pushed++;
 			hs.tasks.fetch_add(1, std::memory_order_relaxed);

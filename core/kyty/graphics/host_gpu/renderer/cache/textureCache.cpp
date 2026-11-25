@@ -5025,10 +5025,12 @@ void TextureCache::CollectGarbageFixed(uint64_t tick) {
 			if (used < soft_trigger) {
 				return;
 			}
-			const bool over = used >= target;
+			const bool over     = used >= target;
+			const bool critical = used >= (target * 105ull) / 100ull;
 			m_gc_stats.runs++;
 			GcPass pass;
-			pass.min_age            = over ? 8 : 64;
+			// Keep live camera-pan textures (min_age 60 frames) unless VRAM is genuinely critical (>=105% of target).
+			pass.min_age            = critical ? 16 : over ? 60 : 96;
 			pass.usage              = used;
 			pass.goal               = std::max<uint64_t>((target * 90ull) / 100ull, 1);
 			pass.allow_download     = true;

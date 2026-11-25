@@ -391,11 +391,10 @@ void GraphicContext::GetVramBudgetState(uint64_t& target, uint64_t& effective) c
 	// Free space inside VMA blocks is reused by new allocations before any block is added: eviction cannot
 	// lower it, and counting it would make the collectors evict for nothing.
 	const uint64_t empty        = blocks > allocated ? blocks - allocated : 0;
-	const uint64_t raw_pressure = (budget * (100ull - headroom_pct / 2ull)) / 100ull;
-	// Cap the VMA empty-block credit at 5% of live budget (and drop it once real usage reaches 92.5% of budget)
-	// so fragmented empty blocks never blind GC and let process VRAM spill past 100% into WDDM PCIe paging.
-	const uint64_t max_credit   = (budget * 5ull) / 100ull;
-	const uint64_t credit       = (budget != 0 && usage >= raw_pressure) ? 0ull : std::min(empty, max_credit);
+	// Keep VMA's full empty-block credit below 94% of live budget so camera pans never trigger false GC thrash,
+	// and drop the credit to 0 once real usage reaches 94% so GC always engages before 100% WDDM PCIe paging.
+	const uint64_t raw_critical = (budget * 94ull) / 100ull;
+	const uint64_t credit       = (budget != 0 && usage >= raw_critical) ? 0ull : empty;
 	effective                   = usage > credit ? usage - credit : 0;
 }
 

@@ -4501,16 +4501,17 @@ void BufferCache::ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait) 
 	RecomputeEagerBounds();
 }
 
-void BufferCache::IssueEagerReadbacks(bool advance_clock) {
-	if (m_in_eager_readbacks) return;
+bool BufferCache::IssueEagerReadbacks(bool advance_clock) {
+	if (m_in_eager_readbacks) return false;
 	m_in_eager_readbacks = true;
 	ApplyEagerReadbacks(0, 0, false);
 	if (advance_clock) ++m_hot_clock;
 	if (m_hot_reads.empty() || m_hot_min_start >= m_hot_max_end ||
 	    !m_gpu_modified_ranges.Intersects(m_hot_min_start, m_hot_max_end - m_hot_min_start)) {
 		m_in_eager_readbacks = false;
-		return;
+		return false;
 	}
+	bool issued = false;
 	for (const auto& hot: m_hot_reads) {
 		if (hot.hits < 2u || m_hot_clock - hot.last_use > 256u) continue;
 		if (!m_gpu_modified_ranges.Intersects(hot.start, hot.end - hot.start)) continue;
@@ -4536,8 +4537,10 @@ void BufferCache::IssueEagerReadbacks(bool advance_clock) {
 		                             .bytes = std::move(bytes)});
 		if (hot.start < m_eager_min_start) m_eager_min_start = hot.start;
 		if (hot.end > m_eager_max_end) m_eager_max_end = hot.end;
+		issued = true;
 	}
 	m_in_eager_readbacks = false;
+	return issued;
 }
 
 // Three skips in the bookkeeping of obtained buffers, each leaving every answer as without it:

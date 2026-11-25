@@ -3071,7 +3071,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (async_pipeline != nullptr) {
 		// (taken from the plan)
-	} else if (DrawWritesMemory(state)) {
+	} else if (DrawWritesMemory(state) && ([&] {
+		           static const bool async_visual = [] {
+			           const char* v = std::getenv("KYTY_ASYNC_WRITING_VISUAL_DRAWS");
+			           return v == nullptr || v[0] != '0';
+		           }();
+		           return !async_visual || (state.color_count == 0u && !static_cast<bool>(state.depth_info.image_id));
+	           })()) {
 		NoteAsyncDraw(false);
 	} else {
 		bool failed    = false; // (a worker could not create it: today's creation on this thread)

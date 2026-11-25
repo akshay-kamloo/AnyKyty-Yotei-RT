@@ -363,7 +363,7 @@ public:
 	void                      VerifyBdaWrittenPage(uint64_t page_address, uint64_t first_frame, uint64_t last_frame);
 	void               RunGarbageCollector();
 	// v16-eager-dma-prefetch: issue async GPU DMA readbacks for dirty hot-read windows before submit flush.
-	void               PrefetchEagerReadbacks() { IssueEagerReadbacks(false); }
+	bool               PrefetchEagerReadbacks() { return IssueEagerReadbacks(false); }
 	// Bytes of cached guest-memory buffers (KYTY_TRACE_PERF memory split).
 	[[nodiscard]] uint64_t UsedMemory() const noexcept { return m_total_used_memory; }
 	// Bytes of cached guest-memory buffers (KYTY_TRACE_PERF buffers=): unlike UsedMemory(), which the collector
@@ -830,7 +830,7 @@ private:
 	void        RecordHotRead(uint64_t vaddr);
 	void        BumpHotGeneration(uint64_t vaddr, uint64_t size);
 	void        ApplyEagerReadbacks(uint64_t vaddr, uint64_t size, bool wait);
-	void        IssueEagerReadbacks(bool advance_clock = true);
+	bool        IssueEagerReadbacks(bool advance_clock = true);
 	bool        m_in_eager_readbacks = false;
 	// KYTY_TRACE_SYNC_TIMELINE: write tick and GPU-dirty bytes of what the running reader request needs.
 	void        NoteSyncTimelineNeed(uint64_t vaddr, uint64_t size);

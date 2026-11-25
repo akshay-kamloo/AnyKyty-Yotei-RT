@@ -299,7 +299,7 @@ void CommandScheduler::Flush(FlushSite site) {
 void CommandScheduler::FlushForSlice(FlushSite site) {
 	static const bool coalesce = [] {
 		const char* v = std::getenv("KYTY_SLICE_COALESCE");
-		return v != nullptr && v[0] == '1';
+		return v == nullptr || v[0] != '0';
 	}();
 	if (!coalesce) {
 		Flush(site);

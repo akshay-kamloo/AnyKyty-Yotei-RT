@@ -2324,8 +2324,11 @@ void CommandProcessor::BufferFlush(CommandScheduler::FlushSite site) {
 
 void CommandProcessor::BufferFlushForSlice(CommandScheduler::FlushSite site) {
 	EmitCallback([this, site] {
-		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
-		GetScheduler().FlushForSlice(site);
+		if (m_renderer.GetBufferCache().PrefetchEagerReadbacks()) {
+			GetScheduler().Flush(site);
+		} else {
+			GetScheduler().FlushForSlice(site);
+		}
 	});
 }
 

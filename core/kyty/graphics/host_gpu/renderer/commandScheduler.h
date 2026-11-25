@@ -36,13 +36,20 @@ public:
 		Other,
 		GfxSlice,
 		ComputeSlice,
+		SliceIdle,
 		Suspend,
 		Flip,
 		BufReadback,
 		TexReadback,
+		WaitCurrent,
+		Finish,
+		FlushAndWait,
+		OldestWrite,
 		Count
 	};
 	void           Flush(FlushSite site = FlushSite::Other);
+	void           FlushForSlice(FlushSite site);
+	void           FlushIfCoalesced(FlushSite site);
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	// Before a draw or dispatch, the open command buffer is submitted (no wait) once 128 draws/dispatches were recorded
@@ -111,6 +118,7 @@ private:
 	SubmitReason m_submit_reason      = SubmitReason::Other;
 	SubmitReason m_last_submit_reason = SubmitReason::Other;
 	FlushSite    m_flush_site         = FlushSite::Other;
+	bool         m_slice_coalesced_pending = false;
 	// The batching's state, all reset by Submit.
 	std::atomic_bool m_batch_interrupt_pending {false};
 	uint32_t                              m_batch_interrupt_packets = 0;
@@ -119,6 +127,7 @@ private:
 	// KYTY_TRACE_PERF counters (ReportSubmitPerf).
 	std::atomic<uint64_t> m_perf_submits[static_cast<uint32_t>(SubmitReason::Count)] {};
 	std::atomic<uint64_t> m_perf_other_sites[static_cast<uint32_t>(FlushSite::Count)] {};
+	std::atomic<uint64_t> m_perf_coalesced_slices {0};
 	std::atomic<uint64_t> m_perf_deferred_periodic {0};
 	std::atomic<uint64_t> m_perf_deferred_interrupts {0};
 	std::atomic<uint64_t> m_perf_interrupt_delay_us {0};

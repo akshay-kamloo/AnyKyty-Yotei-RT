@@ -1952,7 +1952,7 @@ void GuestGpu::WaitForOldestWrite() {
 	// The oldest waits for the host GPU and, a label, then for its publish command. Submitting is enough: waiting for
 	// the host GPU on the renderer's thread would stop the rest of the frame too.
 	const auto start = g_gpu_stage_stats ? StageNowNs() : 0;
-	m_gfx_cp->EmitCallback([this] { m_renderer.GetCommandScheduler().Flush(); });
+	m_gfx_cp->EmitCallback([this] { m_renderer.GetCommandScheduler().Flush(CommandScheduler::FlushSite::OldestWrite); });
 	while (m_pending_count == PendingWriteCapacity) {
 		ForgetExecutedWrites();
 		Common::SpinPause();
@@ -2304,6 +2304,19 @@ void CommandProcessor::BufferFlush(CommandScheduler::FlushSite site) {
 	EmitCallback([this, site] {
 		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
 		GetScheduler().Flush(site);
+	});
+}
+
+void CommandProcessor::BufferFlushForSlice(CommandScheduler::FlushSite site) {
+	EmitCallback([this, site] {
+		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
+		GetScheduler().FlushForSlice(site);
+	});
+}
+
+void CommandProcessor::BufferFlushIfCoalesced(CommandScheduler::FlushSite site) {
+	EmitCallback([this, site] {
+		GetScheduler().FlushIfCoalesced(site);
 	});
 }
 
@@ -2831,6 +2844,7 @@ void GuestGpu::ThreadRun(void* data) {
 				// the queue waits liveness guard: no queue can run and a stream waits in a block of waits whose
 				// predicate was never read.
 				if (selected_queue < 0) {
+					gpu->m_gfx_cp->BufferFlushIfCoalesced(CommandScheduler::FlushSite::SliceIdle);
 					selected_queue = gpu->CondGuardQueue();
 					cond_guard     = selected_queue >= 0;
 				}
@@ -2973,7 +2987,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			m_slice_progressed = progressed;
 			if (progressed) {
-				cp.BufferFlush(CommandScheduler::FlushSite::GfxSlice);
+				cp.BufferFlushForSlice(CommandScheduler::FlushSite::GfxSlice);
 			}
 			break;
 		}
@@ -2995,7 +3009,7 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			m_slice_progressed = submission.command_execution.MadeProgress();
 			if (m_slice_progressed) {
-				cp.BufferFlush(CommandScheduler::FlushSite::ComputeSlice);
+				cp.BufferFlushForSlice(CommandScheduler::FlushSite::ComputeSlice);
 			}
 			break;
 		}
@@ -3947,7 +3961,7 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 		return;
 	}
 	EmitCallback([this, video_out_handle, display_buffer_index] {
-		GetScheduler().Flush();
+		GetScheduler().Flush(CommandScheduler::FlushSite::Flip);
 
 		SyncTimeline::WaitScope timeline(SyncTimeline::Site::FlipDone, 0, 0, 0); // KYTY_TRACE_SYNC_TIMELINE
 		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),

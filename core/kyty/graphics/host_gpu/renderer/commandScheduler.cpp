@@ -278,12 +278,40 @@ void CommandScheduler::Flush(FlushSite site) {
 	Flush(submit);
 }
 
+void CommandScheduler::FlushForSlice(FlushSite site) {
+	static const bool coalesce = [] {
+		const char* v = std::getenv("KYTY_SLICE_COALESCE");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!coalesce) {
+		Flush(site);
+		return;
+	}
+	if (!Active() || m_command.IsInvalid()) return;
+	if (GpuIdle() || m_commands_since_submit >= SubmitEvery) {
+		Flush(site);
+		return;
+	}
+	m_slice_coalesced_pending = true;
+	if (PerfEnabled()) {
+		m_perf_coalesced_slices.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+void CommandScheduler::FlushIfCoalesced(FlushSite site) {
+	if (!m_slice_coalesced_pending) return;
+	m_slice_coalesced_pending = false;
+	if (!Active() || m_command.IsInvalid()) return;
+	Flush(site);
+}
+
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	m_flush_site = FlushSite::FlushAndWait;
 	const auto tick = Submit();
 	{ PerfScope perf_wait(PerfKind::FenceWait); WaitSites::Scope wait_site; m_master.Wait(tick); }
 	BeginNext();
@@ -293,6 +321,7 @@ void CommandScheduler::Finish() {
 	SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::Finish); // KYTY_TRACE_SYNC_TIMELINE
 	CheckActive();
 	if (!m_command.IsInvalid()) {
+		m_flush_site = FlushSite::Finish;
 		Submit();
 	}
 	{ PerfScope perf_wait(PerfKind::FenceWait); WaitSites::Scope wait_site; m_master.Wait(CurrentTick() - 1); }
@@ -313,6 +342,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 		// A stream-buffer wrap can wait while a draw is being prepared through a reference to
 		// Current(). The wrapper stays stable while its pooled Vulkan buffer is retired. Deferred
 		// resources are released only at the next GPU operation boundary.
+		m_flush_site = FlushSite::WaitCurrent;
 		const auto submitted_tick = Submit();
 		EXIT_IF(submitted_tick != tick);
 		if (timeline) SyncTimeline::NoteOpenFlush();
@@ -584,6 +614,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	m_last_submit_reason      = m_submit_reason;
 	m_submit_reason           = SubmitReason::Other;
 	m_flush_site              = FlushSite::Other;
+	m_slice_coalesced_pending = false;
 	m_batch_interrupt_pending = false;
 	m_batch_idle_armed        = false;
 	return tick;
@@ -684,13 +715,18 @@ void CommandScheduler::ReportSubmitPerf() {
 	             take(m_perf_deferred_interrupts), delays != 0 ? delay_us / delays : 0ull,
 	             take(m_perf_interrupt_delay_max_us));
 	std::fprintf(stderr,
-	             "PERF submit_other_sites gfx_slice=%llu compute_slice=%llu suspend=%llu flip=%llu buf_rb=%llu tex_rb=%llu other=%llu\n",
+	             "PERF submit_other_sites gfx_slice=%llu compute_slice=%llu slice_idle=%llu coalesced=%llu suspend=%llu flip=%llu buf_rb=%llu tex_rb=%llu wait_cur=%llu finish=%llu oldest_wr=%llu other=%llu\n",
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::GfxSlice)]),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::ComputeSlice)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::SliceIdle)]),
+	             take(m_perf_coalesced_slices),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Suspend)]),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Flip)]),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::BufReadback)]),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::TexReadback)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::WaitCurrent)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Finish)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::OldestWrite)]),
 	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Other)]));
 }
 

@@ -91,6 +91,8 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush(CommandScheduler::FlushSite site = CommandScheduler::FlushSite::Other);
+	void            BufferFlushForSlice(CommandScheduler::FlushSite site);
+	void            BufferFlushIfCoalesced(CommandScheduler::FlushSite site);
 	// An end-of-pipe interrupt was queued: its tick must be submitted (CommandScheduler::FlushForInterrupt;
 	// deferred while the GPU is busy, bounded).
 	void            BufferFlushForInterrupt();

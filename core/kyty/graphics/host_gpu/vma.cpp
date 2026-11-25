@@ -378,9 +378,15 @@ void GraphicContext::GetMemoryCounts(uint64_t& device_blocks, uint64_t& device_a
 void GraphicContext::GetVramBudgetState(uint64_t& target, uint64_t& effective) const {
 	uint64_t usage = 0, budget = 0, blocks = 0, allocated = 0;
 	GetDeviceLocalMemoryStats(usage, budget, blocks, allocated);
-	constexpr uint64_t GiB   = 1024ull * 1024 * 1024;
-	const uint64_t     cap   = VramBudgetCap();
-	const uint64_t     limit = budget > 2 * GiB ? budget - GiB : budget / 2;
+	static const uint64_t headroom_pct = [] {
+		if (const char* v = std::getenv("KYTY_VRAM_HEADROOM_PCT"); v != nullptr) {
+			const auto p = std::strtoull(v, nullptr, 10);
+			if (p >= 5u && p <= 40u) return static_cast<uint64_t>(p);
+		}
+		return 15ull; // 85% target of live VK_EXT_memory_budget on any GPU
+	}();
+	const uint64_t cap   = VramBudgetCap();
+	const uint64_t limit = (budget * (100ull - headroom_pct)) / 100ull;
 	target                   = budget == 0 ? 0 : cap != 0 ? std::min(limit, cap) : limit;
 	// Free space inside VMA blocks is reused by new allocations before any block is added: eviction cannot
 	// lower it, and counting it would make the collectors evict for nothing.

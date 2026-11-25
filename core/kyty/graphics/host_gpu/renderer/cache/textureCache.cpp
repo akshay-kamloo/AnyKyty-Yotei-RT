@@ -4981,18 +4981,18 @@ void TextureCache::CollectGarbageFixed(uint64_t tick) {
 			m_budget_target        = target;
 			m_budget_used          = used;
 			constexpr uint64_t MiB = 1024ull * 1024;
-			// Below target - 512 MiB the cache keeps everything (re-uploads cost more than holding memory).
-			if (used + 512 * MiB < target) {
+			// Percentage-based hysteresis: keep everything below 95% of target (~80.8% of VRAM budget),
+			// and evict gently down to 90% of target (~76.5% of budget); aggressive eviction at >= 100% of target.
+			const uint64_t soft_trigger = (target * 95ull) / 100ull;
+			if (used < soft_trigger) {
 				return;
 			}
-			// From there it frees the oldest images until the usage is 1 GiB under the target: images unused for
-			// 64 frames, and once at the target or over it, images unused for 8 frames and bindless-pinned ones.
 			const bool over = used >= target;
 			m_gc_stats.runs++;
 			GcPass pass;
 			pass.min_age            = over ? 8 : 64;
 			pass.usage              = used;
-			pass.goal               = std::max<uint64_t>(target > 1024 * MiB ? target - 1024 * MiB : target / 2, 1);
+			pass.goal               = std::max<uint64_t>((target * 90ull) / 100ull, 1);
 			pass.allow_download     = true;
 			pass.allow_pinned       = over;
 			pass.max_download_bytes = over ? 256 * MiB : 128 * MiB;

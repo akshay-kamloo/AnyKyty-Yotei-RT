@@ -3030,7 +3030,7 @@ struct ObtainMemoEntry {
 	BufferId id {};
 };
 constexpr size_t kObtainMemoWays = 4;
-constexpr size_t kObtainMemoSets = 2048;
+constexpr size_t kObtainMemoSets = 8192;
 struct ObtainMemoSet {
 	ObtainMemoEntry ways[kObtainMemoWays];
 	uint32_t        next_victim = 0;
@@ -3158,7 +3158,7 @@ struct WriteMemoEntry {
 	BufferId id {};
 };
 constexpr size_t kWriteMemoWays = 4;
-constexpr size_t kWriteMemoSets = 2048;
+constexpr size_t kWriteMemoSets = 8192;
 struct WriteMemoSet {
 	WriteMemoEntry ways[kWriteMemoWays];
 	uint32_t       next_victim = 0;
@@ -3982,8 +3982,13 @@ bool BdaMemoCheck() {
 bool BdaMemoOn() {
 	return true; // the only path (walk ABBA 11.11 with the table-set first try: 20.01/20.05 -> 20.25/20.41 fps)
 }
-constexpr size_t kBdaMemoSlots = 4096;
-ObtainMemoEntry  g_bda_memo[kBdaMemoSlots]; // GPU thread
+constexpr size_t kBdaMemoWays = 4;
+constexpr size_t kBdaMemoSets = 4096;
+struct BdaMemoSet {
+	ObtainMemoEntry ways[kBdaMemoWays];
+	uint32_t        next_victim = 0;
+};
+BdaMemoSet g_bda_memo[kBdaMemoSets]; // GPU thread (16384 entries, 4-way set-associative)
 void BdaMemoNote(bool bad) {
 	static uint64_t compared = 0, wrong = 0;
 	compared++;
@@ -4000,24 +4005,40 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRangePath(uint64_t vaddr, uin
 		EXIT("BufferCache: BDA range request requires a recording command buffer\n");
 	}
 	const bool bda_memo = !is_written && BdaMemoOn() && GuestGpu::IsGpuThread();
-	ObtainMemoEntry* memo_slot = nullptr;
-	const ObtainMemoEntry* memo_hit = nullptr;
+	BdaMemoSet*            memo_set  = nullptr;
+	ObtainMemoEntry*       memo_slot = nullptr;
+	const ObtainMemoEntry* memo_hit  = nullptr;
 	if (bda_memo) {
-		memo_slot = &g_bda_memo[ObtainMemoSetIndex(vaddr, size) & (kBdaMemoSlots - 1u)];
-		const auto& e = *memo_slot;
-		bool        ok = e.regions != 0 && e.vaddr == vaddr && e.size == size &&
-		          e.buffer_epoch == DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
-		if (ok) {
-			auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
-			for (uint32_t i = 0; i < e.regions && ok; i++) ok = table[e.region + i].load(std::memory_order_acquire) == e.epochs[i];
-		}
-		if (ok && m_slot_buffers[e.id].IsInBounds(vaddr, size)) {
-			memo_hit = memo_slot;
-			if (!BdaMemoCheck()) {
-				auto& buffer = m_slot_buffers[e.id];
-				TouchBuffer(buffer);
-				return {&buffer, buffer.Offset(vaddr)};
+		memo_set = &g_bda_memo[ObtainMemoSetIndex(vaddr, size) & (kBdaMemoSets - 1u)];
+		const uint64_t reg_epoch = DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);
+		size_t empty_way = kBdaMemoWays;
+		for (size_t w = 0; w < kBdaMemoWays; w++) {
+			auto& e = memo_set->ways[w];
+			if (e.regions == 0) {
+				if (empty_way == kBdaMemoWays) empty_way = w;
+				continue;
 			}
+			if (e.vaddr != vaddr || e.size != size) continue;
+			memo_slot = &e;
+			bool ok   = e.buffer_epoch == reg_epoch;
+			if (ok) {
+				auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+				for (uint32_t i = 0; i < e.regions && ok; i++) ok = table[e.region + i].load(std::memory_order_acquire) == e.epochs[i];
+			}
+			if (ok && m_slot_buffers[e.id].IsInBounds(vaddr, size)) {
+				memo_hit = memo_slot;
+				if (!BdaMemoCheck()) {
+					auto& buffer = m_slot_buffers[e.id];
+					TouchBuffer(buffer);
+					return {&buffer, buffer.Offset(vaddr)};
+				}
+			}
+			break;
+		}
+		if (memo_slot == nullptr) {
+			memo_slot = empty_way < kBdaMemoWays
+			                ? &memo_set->ways[empty_way]
+			                : &memo_set->ways[memo_set->next_victim++ & (kBdaMemoWays - 1u)];
 		}
 	}
 	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {

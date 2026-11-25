@@ -131,6 +131,18 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 			             static_cast<unsigned long long>(size), static_cast<int>(result));
 		}
 	}
+	if (graphics.memory_priority_ext_enabled && usage == MemoryUsage::DeviceLocal) {
+		allocation_info.priority = 1.0f;
+	}
+	if (result != vk::Result::eSuccess && usage == MemoryUsage::DeviceLocal && bda_flag == 0 &&
+	    graphics.device_buffer_pool != nullptr) {
+		VmaAllocationCreateInfo pool_alloc {};
+		pool_alloc.flags    = allocation_info.flags;
+		pool_alloc.pool     = graphics.device_buffer_pool;
+		pool_alloc.priority = allocation_info.priority;
+		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
+		                                                 &pool_alloc, &native_buffer, &m_allocation, &allocation_result));
+	}
 	if (result != vk::Result::eSuccess) {
 		result = static_cast<vk::Result>(vmaCreateBuffer(graphics.allocator, static_cast<const VkBufferCreateInfo*>(buffer_info),
 		                                                 &allocation_info, &native_buffer, &m_allocation, &allocation_result));

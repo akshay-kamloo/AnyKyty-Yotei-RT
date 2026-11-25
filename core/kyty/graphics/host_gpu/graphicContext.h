@@ -58,6 +58,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               memory_priority_ext_enabled           = false;
+	VmaPool                            device_buffer_pool                    = nullptr;
 	// KYTY_TRACE_PIPELINE_STATS: VK_KHR_pipeline_executable_properties is enabled.
 	bool                               pipeline_stats_enabled                = false;
 	bool                               compute_subgroup_size_control_enabled = false;

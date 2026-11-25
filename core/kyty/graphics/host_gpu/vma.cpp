@@ -299,11 +299,38 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+	if (memory_priority_ext_enabled) {
+		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT;
+	}
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;
+	}
+
+	const char* pool_env = std::getenv("KYTY_VMA_BUFFER_POOL");
+	if (pool_env == nullptr || pool_env[0] != '0') {
+		VkBufferCreateInfo probe_buf {};
+		probe_buf.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		probe_buf.size  = 65536;
+		probe_buf.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+		                  VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+		                  VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+		                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+		VmaAllocationCreateInfo probe_alloc {};
+		probe_alloc.usage         = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+		probe_alloc.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+		uint32_t mem_type_idx     = 0;
+		if (vmaFindMemoryTypeIndexForBufferInfo(allocator, &probe_buf, &probe_alloc, &mem_type_idx) == VK_SUCCESS) {
+			VmaPoolCreateInfo pool_info {};
+			pool_info.memoryTypeIndex = mem_type_idx;
+			pool_info.priority        = memory_priority_ext_enabled ? 1.0f : 0.0f;
+			if (vmaCreatePool(allocator, &pool_info, &device_buffer_pool) == VK_SUCCESS) {
+				LOGF("VMA dedicated device-local buffer pool created (memType=%u, priority=%.1f)\n",
+				     mem_type_idx, pool_info.priority);
+			}
+		}
 	}
 	return true;
 }
@@ -316,6 +343,10 @@ void GraphicContext::DestroyAllocator() {
 		std::lock_guard lock(g_recycle_mutex);
 		TrimRecycled(allocator, true);
 		g_recyclable.clear();
+	}
+	if (device_buffer_pool != nullptr) {
+		vmaDestroyPool(allocator, device_buffer_pool);
+		device_buffer_pool = nullptr;
 	}
 	vmaDestroyAllocator(allocator);
 	allocator = nullptr;
@@ -487,6 +518,12 @@ bool GraphicContext::CreateImage(const vk::ImageCreateInfo& image_info, VulkanIm
 	VmaAllocationCreateInfo alloc_info {};
 	alloc_info.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
 	alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+	if (memory_priority_ext_enabled) {
+		const bool high_prio = bool(image_info.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+		                                                vk::ImageUsageFlagBits::eDepthStencilAttachment |
+		                                                vk::ImageUsageFlagBits::eStorage));
+		alloc_info.priority = high_prio ? 1.0f : 0.5f;
+	}
 	if (relocation != nullptr) {
 		// Texture relocation: the old image's memory type (AUTO_PREFER_DEVICE may pick the BAR type), the fullest block with room
 		// (VMA walks its blocks fullest first), no new block unless the batch allows one, and never a parked image (its

@@ -982,6 +982,26 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		}
 	}
 	LOGF("Vulkan pipeline binary cache (KYTY_PIPELINE_BINARY_CACHE=%d): %s\n", PipelineBinaryCacheEnabled() ? 1 : 0, graphics.pipeline_binary_enabled ? "enabled" : "disabled");
+	vk::PhysicalDeviceMemoryPriorityFeaturesEXT memory_priority_features {};
+	graphics.memory_priority_ext_enabled = false;
+	if (HasExtension(enabled_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+		vk::PhysicalDeviceMemoryPriorityFeaturesEXT supported_mp {};
+		vk::PhysicalDeviceFeatures2 mp_query {};
+		mp_query.pNext = &supported_mp;
+		physical_device.getFeatures2(&mp_query);
+		if (supported_mp.memoryPriority == VK_TRUE) {
+			memory_priority_features.memoryPriority = VK_TRUE;
+			memory_priority_features.pNext = const_cast<void*>(create_info.pNext);
+			create_info.pNext = &memory_priority_features;
+			graphics.memory_priority_ext_enabled = true;
+		} else {
+			std::erase_if(enabled_extensions, [](const char* n) {
+				return std::strcmp(n, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME) == 0;
+			});
+		}
+	}
+	LOGF("Vulkan memory priority (VK_EXT_memory_priority): %s\n",
+	     graphics.memory_priority_ext_enabled ? "enabled" : "disabled");
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
@@ -1421,6 +1441,9 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
 		}
 		// KYTY_FIX_DCC_GPU_CLEAR_CHECK / KYTY_PERF_DCC_GPU_ALL: conditional rendering for the GPU-side DCC clear
 		// check; the default device stays identical without the switches.

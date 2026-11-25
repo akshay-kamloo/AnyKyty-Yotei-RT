@@ -21,6 +21,8 @@ For full engineering history, benchmark logs, and next steps, see [`ERLOU_PORT_H
 
 ## Current Status & Benchmarks
 
+> **Performance Target:** **100+ FPS (`<= 10.0 ms/frame`)** (intermediate gate: 60 FPS) in *Ghost of Yōtei* (`PPSA26344`) — full architectural roadmap tracked in [`ROADMAP_100FPS.md`](ROADMAP_100FPS.md).
+
 Tested on **Windows 11**, **Intel Core Ultra 7 270K Plus**, **32 GB RAM**, **NVIDIA GeForce RTX 5070 (12 GB VRAM)** with *Ghost of Yōtei* (`PPSA26344`, v2.002):
 
 | Build / Scenario | Resolution | Measured FPS | Notes |

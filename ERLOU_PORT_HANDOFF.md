@@ -4,6 +4,7 @@
 
 ## 1. Project Goal, Guardrails & Current State
 - **Goal**: Optimize and stabilize **Ghost of Yōtei (`PPSA26344`, v02.002.000)** on Windows **AnyKyty + Erlou KytyPS5-Yotei GPU backend port** (`D:\Games\AnyKyty`) with native hardware Ray Tracing (`VK_KHR_ray_query`), real Big-O CPU/GPU optimizations, async shader variant compilation, and GPU-driven indirect compute dispatch.
+- **Target FPS**: **100+ FPS (`<= 10.0 ms/frame`)** (intermediate gate: 60 FPS) in Ghost of Yōtei (`PPSA26344`). Full architectural redesigns authorized. See living plan: [`ROADMAP_100FPS.md`](ROADMAP_100FPS.md).
 - **Current Repo Snapshot**:
   - Committed as **source code only** to `https://github.com/akshay-kamloo/AnyKyty-Yotei-RT` (branch `AnyKyty`).
   - Current tree includes all phases through **`native-rt-v12-pgo-v3`** (`v10` `BufferCache` O(1) hot-read/BAR pruning + `AppendRelease` fix, `v11` 64-bit queue bitmask scheduler + 1024-slot `SnapshotRing` + gated `StallWatch`, `v12` descriptor/BDA churn cuts, Swing/Hammer `B`/`V` keyboard motion bindings, and fresh 19-snapshot `yotei-v3.profdata` PGO).

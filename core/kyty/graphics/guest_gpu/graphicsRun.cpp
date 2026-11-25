@@ -657,7 +657,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	m_resolver = std::jthread([this] { ResolveThread(); });
 	RenderExecutor::SetResolveCheckMode(ResolveCheckOn()); // project 15 N2.2: the helper resolves
 	const uint32_t hw_threads = std::max(std::thread::hardware_concurrency(), 1u);
-	m_resolve_helper_count = std::clamp(hw_threads / 4u, 2u, kMaxResolveHelpers);
+	m_resolve_helper_count = std::clamp(hw_threads / 6u, 2u, 4u);
 	if (const char* v = std::getenv("KYTY_RESOLVE_HELPERS"); v != nullptr) {
 		const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 		if (n >= 1u && n <= kMaxResolveHelpers) m_resolve_helper_count = n;

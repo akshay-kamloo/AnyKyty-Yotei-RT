@@ -4207,38 +4207,23 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::HasGpuDirtyBytesShared(uint64_t vaddr, uint64_t size) {
-	std::shared_lock lock(m_gpu_dirty_mutex);
+	const GpuDirtyReadGuard lock(m_gpu_dirty_rw);
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
-namespace {
-struct GpuDirtyMemoEntry {
-	uint64_t vaddr = 0;
-	uint64_t size  = 0;
-	uint64_t gen   = 0;
-};
-constexpr size_t  kGpuDirtyMemoSlots = 1024;
-GpuDirtyMemoEntry g_gpu_dirty_memo[kGpuDirtyMemoSlots]; // GPU thread only
-} // namespace
-
 void BufferCache::GpuDirtyAdd(uint64_t vaddr, uint64_t size) {
 	if (size == 0u) return;
-	const uint64_t h    = (vaddr * 0x9E3779B97F4A7C15ull) ^ (size + (size << 19u));
-	auto&          slot = g_gpu_dirty_memo[(h ^ (h >> 27u)) & (kGpuDirtyMemoSlots - 1u)];
-	if (slot.gen == m_gpu_dirty_clean_gen && slot.vaddr == vaddr && slot.size == size) {
+	// GPU thread is the sole writer of m_gpu_modified_ranges: lock-free Contains() skips the write lock on 99%+ of writes.
+	if (m_gpu_modified_ranges.Contains(vaddr, size)) {
 		return;
 	}
-	{
-		std::unique_lock lock(m_gpu_dirty_mutex);
-		m_gpu_modified_ranges.Add(vaddr, size);
-	}
-	slot = {vaddr, size, m_gpu_dirty_clean_gen};
+	const GpuDirtyWriteGuard lock(m_gpu_dirty_rw);
+	m_gpu_modified_ranges.Add(vaddr, size);
 }
 
 void BufferCache::GpuDirtySubtract(uint64_t vaddr, uint64_t size) {
-	m_gpu_dirty_clean_gen++;
 	NoteGpuCleanRange(vaddr, size); // the write memo
-	std::unique_lock lock(m_gpu_dirty_mutex);
+	const GpuDirtyWriteGuard lock(m_gpu_dirty_rw);
 	m_gpu_modified_ranges.Subtract(vaddr, size);
 }
 
@@ -5563,7 +5548,7 @@ void BufferCache::AppendBeforePoolMark(uint64_t vaddr, uint64_t size) {
 	pool->keep.Clear();
 	// The bytes GPU-dirty now hold GPU writes from before this cycle: never released by it.
 	{
-		std::shared_lock lock(m_gpu_dirty_mutex);
+		const GpuDirtyReadGuard lock(m_gpu_dirty_rw);
 		m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t a, uint64_t b) { pool->keep.Add(a, b - a); });
 	}
 	// Another pool over the same bytes (other base or size): neither releases anything this cycle.

@@ -904,7 +904,45 @@ private:
 	// read the set while the GPU thread changes it).
 	void                                              GpuDirtyAdd(uint64_t vaddr, uint64_t size);
 	void                                              GpuDirtySubtract(uint64_t vaddr, uint64_t size);
-	std::shared_mutex                                 m_gpu_dirty_mutex;
+	// Writer-priority RW-spinlock: bit 31 = writer active/pending, bits 0..30 = concurrent readers.
+	// Eliminates Windows std::shared_mutex writer starvation (10-80 us stalls in GpuDirtyAdd).
+	mutable std::atomic<uint32_t>                     m_gpu_dirty_rw {0};
+	class GpuDirtyReadGuard {
+	public:
+		explicit GpuDirtyReadGuard(std::atomic<uint32_t>& rw): m_rw(rw) {
+			for (;;) {
+				uint32_t v = m_rw.load(std::memory_order_relaxed);
+				if ((v & 0x80000000u) != 0u) {
+					Common::SpinPause();
+					continue;
+				}
+				if (m_rw.compare_exchange_weak(v, v + 1u, std::memory_order_acquire, std::memory_order_relaxed)) {
+					return;
+				}
+			}
+		}
+		~GpuDirtyReadGuard() { m_rw.fetch_sub(1u, std::memory_order_release); }
+		GpuDirtyReadGuard(const GpuDirtyReadGuard&)            = delete;
+		GpuDirtyReadGuard& operator=(const GpuDirtyReadGuard&) = delete;
+	private:
+		std::atomic<uint32_t>& m_rw;
+	};
+	class GpuDirtyWriteGuard {
+	public:
+		explicit GpuDirtyWriteGuard(std::atomic<uint32_t>& rw): m_rw(rw) {
+			// Single writer (GPU thread): set writer bit immediately to block new readers, then drain active readers.
+			uint32_t v = m_rw.fetch_or(0x80000000u, std::memory_order_acquire);
+			while ((v & 0x7fffffffu) != 0u) {
+				Common::SpinPause();
+				v = m_rw.load(std::memory_order_acquire);
+			}
+		}
+		~GpuDirtyWriteGuard() { m_rw.fetch_and(0x7fffffffu, std::memory_order_release); }
+		GpuDirtyWriteGuard(const GpuDirtyWriteGuard&)            = delete;
+		GpuDirtyWriteGuard& operator=(const GpuDirtyWriteGuard&) = delete;
+	private:
+		std::atomic<uint32_t>& m_rw;
+	};
 	// Guards m_page_table and m_slot_buffers' insertions/erasures against the resolve thread's LookupBuffer; taken by the GPU thread
 	// only for those changes.
 	std::atomic<uint32_t>                             m_lookup_rw {0}; // bit 31 = writer, bits 0..30 = concurrent readers

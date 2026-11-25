@@ -2080,8 +2080,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 			EXIT("TextureCache: invalid video-out upload\n");
 		}
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
-		const auto copies = info.BufferCopies(linear.offset);
-		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		auto       copies = info.BufferCopies(linear.offset);
+		if (destination.host_mip_skip != 0u) {
+			const uint32_t skip = destination.host_mip_skip;
+			std::erase_if(copies, [skip](const vk::BufferImageCopy& c) {
+				return c.imageSubresource.mipLevel < skip;
+			});
+			for (auto& c: copies) c.imageSubresource.mipLevel -= skip;
+		}
+		if (!copies.empty()) {
+			destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}

@@ -199,7 +199,7 @@ public:
 	}
 	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
-		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
+		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size >> (2u * host_mip_skip), 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
@@ -290,6 +290,8 @@ public:
 	// Texture relocation: steady-clock ms of its last move to another VMA block (0: never), so a texture is not moved back and
 	// forth between blocks.
 	uint64_t         texmove_ms         = 0;
+	// Adaptive read-only BCn mip-cap: number of top guest mip levels omitted from host backing.
+	uint32_t         host_mip_skip      = 0;
 
 private:
 	friend struct ImageTestAccess;

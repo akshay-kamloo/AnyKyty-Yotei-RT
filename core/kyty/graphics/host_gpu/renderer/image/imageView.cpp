@@ -329,6 +329,16 @@ ImageViewInfo Image::NormalizeView(const ImageViewInfo& view_info) const {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	if (host_mip_skip != 0u && normalized.level_count != 0u) {
+		if (normalized.base_level >= host_mip_skip) {
+			normalized.base_level -= host_mip_skip;
+		} else {
+			const uint32_t trimmed = host_mip_skip - normalized.base_level;
+			normalized.base_level  = 0u;
+			normalized.level_count = normalized.level_count > trimmed ? normalized.level_count - trimmed : 1u;
+			normalized.min_lod     = normalized.min_lod > trimmed * 256u ? normalized.min_lod - trimmed * 256u : 0u;
+		}
+	}
 	// The host image stops at its 1x1 level (ImageInfo::HostLevels). The guest levels past it are 1x1 too; a view of
 	// them views the last host level, and a view that only extends past it is cut there (it differs only where the
 	// sampler selects such a level).

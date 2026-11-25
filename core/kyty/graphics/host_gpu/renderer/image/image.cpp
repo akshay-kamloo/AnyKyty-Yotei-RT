@@ -806,8 +806,64 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	create.usage         = ImageUsageFlags(graphics, info);
 	create.flags         = ImageCreateFlags(graphics, info, create.usage);
 	create.imageType     = HostImageType(info.type);
-	create.extent        = info.extent;
-	create.mipLevels     = info.HostLevels();
+	// Adaptive Read-Only BCn Mip-Cap (KYTY_TEXTURE_MIP_CAP=auto|0|1|2):
+	// Drops top mip 0 (75% of texture VRAM) on large immutable 2D BC1-BC7 textures when live VRAM
+	// pressure rises on 8-12 GB GPUs, while staying at native resolution on 16-24 GB GPUs with ample headroom.
+	host_mip_skip = [&]() -> uint32_t {
+		if (create.imageType != vk::ImageType::e2D || info.samples != 1u || info.IsDepth() || info.HasStencil() ||
+		    info.metadata.kind != ImageMetadataKind::None || info.HostLevels() < 3u ||
+		    info.tiling.texel_width != 4u || info.tiling.texel_height != 4u) {
+			return 0u;
+		}
+		if (bool(create.usage & (vk::ImageUsageFlagBits::eColorAttachment |
+		                         vk::ImageUsageFlagBits::eDepthStencilAttachment |
+		                         vk::ImageUsageFlagBits::eStorage))) {
+			return 0u;
+		}
+		static const int mode = [] {
+			const char* v = std::getenv("KYTY_TEXTURE_MIP_CAP");
+			if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) return -1;
+			if (v[0] == '0') return 0;
+			if (v[0] == '2') return 2;
+			return 1;
+		}();
+		if (mode == 0) return 0u;
+		const uint32_t max_dim = std::max(info.extent.width, info.extent.height);
+		if (max_dim < 1024u) return 0u;
+		uint32_t min_dim = 2048u;
+		if (mode == 2) {
+			min_dim = 1024u;
+		} else if (mode == -1) {
+			static std::atomic<uint32_t> poll_counter {0};
+			static std::atomic<uint32_t> cached_pct {0};
+			if ((poll_counter.fetch_add(1u, std::memory_order_relaxed) & 31u) == 0u &&
+			    graphics.CanReportMemoryUsage()) {
+				uint64_t usage = 0, budget = 0, blocks = 0, alloc = 0;
+				graphics.GetDeviceLocalMemoryStats(usage, budget, blocks, alloc);
+				const uint32_t pct = budget != 0 ? static_cast<uint32_t>((usage * 100ull) / budget) : 0u;
+				cached_pct.store(pct, std::memory_order_relaxed);
+			}
+			const uint32_t pct = cached_pct.load(std::memory_order_relaxed);
+			if (pct < 55u) return 0u;
+			min_dim = pct >= 72u ? 1024u : 2048u;
+		}
+		if (max_dim < min_dim) return 0u;
+		const auto next_ext = info.MipExtent(1u);
+		if (next_ext.width < 4u || next_ext.height < 4u) return 0u;
+		static std::atomic<uint64_t> capped_count {0};
+		static std::atomic<uint64_t> saved_bytes {0};
+		const uint64_t n = capped_count.fetch_add(1u, std::memory_order_relaxed) + 1u;
+		const uint64_t saved = info.data.size - (info.data.size >> 2u);
+		const uint64_t tot = saved_bytes.fetch_add(saved, std::memory_order_relaxed) + saved;
+		if ((n & 255u) == 0u) {
+			std::fprintf(stderr, "PERF mip_cap capped=%llu saved_MiB=%llu\n",
+			             static_cast<unsigned long long>(n),
+			             static_cast<unsigned long long>(tot >> 20u));
+		}
+		return 1u;
+	}();
+	create.extent        = host_mip_skip != 0u ? info.MipExtent(host_mip_skip) : info.extent;
+	create.mipLevels     = info.HostLevels() - host_mip_skip;
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;

@@ -3507,9 +3507,29 @@ bool TextureCache::TableReplayStageChecks(std::span<const ImageId> ids) const {
 }
 
 bool TextureCache::TableReplayStage(std::span<const ImageId> ids) {
+	const auto tick = m_scheduler.CurrentTick();
+	// v33a: Shared-lock fast path when every image in the stage was already touched on this tick/gc_tick
+	// (~90%+ of the 6,000-10,000 calls/frame): avoids exclusive m_lock contention with all Resolve Helpers.
+	{
+		m_lock.lock_shared();
+		if (!TableReplayStageChecks(ids)) {
+			m_lock.unlock_shared();
+			return false;
+		}
+		bool needs_touch = false;
+		for (const auto id: ids) {
+			const auto& image = m_slot_images[id];
+			if (image.info.data.Empty()) continue;
+			if (image.tick_accessed_last != tick || (image.registered && image.lru_touch_tick != m_gc_tick)) {
+				needs_touch = true;
+				break;
+			}
+		}
+		m_lock.unlock_shared();
+		if (!needs_touch) return true;
+	}
 	const TcReadSection lock {m_lock}; // access ticks and LRU touches only
 	if (!TableReplayStageChecks(ids)) return false;
-	const auto tick = m_scheduler.CurrentTick();
 	for (const auto id: ids) {
 		auto& image = m_slot_images[id];
 		if (image.info.data.Empty()) continue;
@@ -3522,6 +3542,24 @@ bool TextureCache::TableReplayStage(std::span<const ImageId> ids) {
 // The table sets: FindTexture's work for a stage set's sampled images (views come from the set), all or none
 // under one lock: FindTextureReplay's no-op predicate for each (see there), then the LRU touch.
 bool TextureCache::TableTexturesReady(std::span<const ImageId> ids) {
+	// v33a: Shared-lock fast path when every image in the stage already has lru_touch_tick == m_gc_tick (~99% of calls).
+	{
+		m_lock.lock_shared();
+		if (!TableTexturesReadyChecks(ids)) {
+			m_lock.unlock_shared();
+			return false;
+		}
+		bool needs_touch = false;
+		for (const auto id: ids) {
+			const auto& image = m_slot_images[id];
+			if (!image.info.data.Empty() && image.registered && image.lru_touch_tick != m_gc_tick) {
+				needs_touch = true;
+				break;
+			}
+		}
+		m_lock.unlock_shared();
+		if (!needs_touch) return true;
+	}
 	const TcReadSection lock {m_lock}; // LRU touches only
 	return TableTexturesReadyLocked(ids);
 }

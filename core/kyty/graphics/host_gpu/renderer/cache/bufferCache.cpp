@@ -2197,6 +2197,8 @@ void BufferCache::NoteDirectGpuWrite(uint64_t vaddr, uint64_t size, const void* 
 	if (cp_data != nullptr && size <= write.cp_bytes.size()) {
 		write.cp_size = static_cast<uint32_t>(size);
 		std::memcpy(write.cp_bytes.data(), cp_data, size);
+	} else {
+		m_direct_non_cp_writes.fetch_add(1, std::memory_order_release);
 	}
 	g_direct_stats.writes.fetch_add(1, std::memory_order_relaxed);
 	g_direct_stats.write_bytes.fetch_add(size, std::memory_order_relaxed);
@@ -5068,7 +5070,7 @@ std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t va
 			const uint64_t kb = std::strtoull(v, nullptr, 10);
 			if (kb >= 4 && kb <= 16384) return kb << 10u;
 		}
-		return uint64_t {256} << 10u;
+		return uint64_t {2048} << 10u;
 	}();
 	const bool     no_bar = buffer.Mapped().empty() || !BarReadsOn();
 	const uint64_t win    = no_bar ? device_local_window : ReadWindowBytes;

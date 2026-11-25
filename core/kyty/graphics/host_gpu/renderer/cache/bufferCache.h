@@ -185,6 +185,7 @@ public:
 	// read plainly. False: today's wait and overlay.
 	[[nodiscard]] bool DirectWordQuiet(uint64_t vaddr) const { return m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, 4); }
 	[[nodiscard]] bool DirectRangeQuiet(uint64_t vaddr, uint64_t size) const { return m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, size); }
+	[[nodiscard]] bool HasDirectNonCpWrites() const noexcept { return m_direct_non_cp_writes.load(std::memory_order_acquire) != 0u; }
 	// P1: the plan's answer for a binding (the same condition and work as ObtainBuffer's plan branch: the proof, Direct's
 	// mode, the touch of a Ready buffer); true when it answered.
 	[[nodiscard]] bool PlanAnswerBinding(PlanBuffer& entry, uint64_t vaddr, uint64_t size);
@@ -766,7 +767,8 @@ private:
 	// Per direct range: the span of its listed GPU writes (a superset after removals; rebuilt with them), so a read outside
 	// every span needs no scan of the list (WaitDirectGpuWrites, ~1 M calls per second).
 	std::vector<std::pair<uint64_t, uint64_t>> m_direct_write_spans;
-	bool                                     m_direct_write_unspanned = false; // a listed write in no range: scan
+	bool                                     m_direct_write_unspanned = false;
+	std::atomic<uint64_t>                    m_direct_non_cp_writes {0}; // a listed write in no range: scan
 	void                                     RebuildDirectWriteSpans();
 	[[nodiscard]] bool                       DirectWritesMayOverlap(uint64_t vaddr, uint64_t size) const;
 	// The pending command-processor writes the last WaitDirectGpuWrites left to the reader.

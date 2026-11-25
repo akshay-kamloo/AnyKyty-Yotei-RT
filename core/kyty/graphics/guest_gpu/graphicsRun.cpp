@@ -2455,7 +2455,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 		}
 	};
 	read();
-	if (!covered && m_renderer.GetBufferCache().InDirectRange(reinterpret_cast<uint64_t>(addr), sizeof(T))) {
+	static const bool skip_cp_only = [] {
+		const char* v = std::getenv("KYTY_PERF_REGMEM_SKIP_CP_ONLY");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!covered && (!skip_cp_only || m_renderer.GetBufferCache().HasDirectNonCpWrites()) &&
+	    m_renderer.GetBufferCache().InDirectRange(reinterpret_cast<uint64_t>(addr), sizeof(T))) {
 		// Only a word that passes the test as read is drained for (walk 9.11: +1.4%). One that fails is not: the stream
 		// suspends as after a failed test and reads the word again when it resumes (a write the drain would have waited for
 		// can only make a later read pass). KYTY_DIAG_REGMEM_DRAIN_CHECK=1 (diagnostic): the execution thread, at the place

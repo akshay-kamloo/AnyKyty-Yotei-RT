@@ -32,7 +32,17 @@ public:
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
 	void           BeginRendering(const RenderState& state);
 	void           EndRendering();
-	void           Flush();
+	enum class FlushSite : uint32_t {
+		Other,
+		GfxSlice,
+		ComputeSlice,
+		Suspend,
+		Flip,
+		BufReadback,
+		TexReadback,
+		Count
+	};
+	void           Flush(FlushSite site = FlushSite::Other);
 	void           Flush(SubmitInfo& submit);
 	void           FlushAndWait();
 	// Before a draw or dispatch, the open command buffer is submitted (no wait) once 128 draws/dispatches were recorded
@@ -100,6 +110,7 @@ private:
 
 	SubmitReason m_submit_reason      = SubmitReason::Other;
 	SubmitReason m_last_submit_reason = SubmitReason::Other;
+	FlushSite    m_flush_site         = FlushSite::Other;
 	// The batching's state, all reset by Submit.
 	std::atomic_bool m_batch_interrupt_pending {false};
 	uint32_t                              m_batch_interrupt_packets = 0;
@@ -107,6 +118,7 @@ private:
 	bool                                  m_batch_idle_armed = false;
 	// KYTY_TRACE_PERF counters (ReportSubmitPerf).
 	std::atomic<uint64_t> m_perf_submits[static_cast<uint32_t>(SubmitReason::Count)] {};
+	std::atomic<uint64_t> m_perf_other_sites[static_cast<uint32_t>(FlushSite::Count)] {};
 	std::atomic<uint64_t> m_perf_deferred_periodic {0};
 	std::atomic<uint64_t> m_perf_deferred_interrupts {0};
 	std::atomic<uint64_t> m_perf_interrupt_delay_us {0};

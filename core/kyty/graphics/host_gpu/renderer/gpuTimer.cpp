@@ -378,10 +378,48 @@ void Report(State& s) {
 			const char* value = std::getenv("KYTY_TRACE_GPU_TIME_TOP");
 			return value != nullptr ? static_cast<size_t>(std::strtoul(value, nullptr, 10)) : size_t {30};
 		}();
+		const auto emu_name = [](uint64_t id) -> const char* {
+			switch (id & 0xffffffffull) {
+				case (1ull << 16u) | 161u: return "buf_dl";
+				case (1ull << 16u) | 402u: return "buf_ul";
+				case (2ull << 16u) | 126u: return "fault_dl";
+				case (3ull << 16u) | 184u: return "stream_ul1";
+				case (3ull << 16u) | 210u: return "stream_ul2";
+				case (4ull << 16u) | 1666u: return "tex_sync1";
+				case (4ull << 16u) | 1669u: return "tex_sync2";
+				case (5ull << 16u) | 407u: return "depth_rt";
+				case (6ull << 16u) | 266u: return "img_266";
+				case (6ull << 16u) | 306u: return "img_306";
+				case (6ull << 16u) | 387u: return "img_387";
+				case (6ull << 16u) | 438u: return "img_438";
+				case (6ull << 16u) | 538u: return "img_538";
+				case (6ull << 16u) | 554u: return "img_554";
+				case (6ull << 16u) | 590u: return "img_590";
+				case (7ull << 16u) | 306u: return "tiler_306";
+				case (7ull << 16u) | 332u: return "tiler_332";
+				case (7ull << 16u) | 575u: return "tiler_575";
+				case (7ull << 16u) | 655u: return "tiler_655";
+				case (7ull << 16u) | 0x4e7eu: return "tiler_4e7e";
+				case (7ull << 16u) | 690u: return "tiler_690";
+				case (8ull << 16u) | 934u: return "tex_934";
+				case (8ull << 16u) | 1732u: return "tex_1732";
+				case (8ull << 16u) | 1882u: return "tex_1882";
+				case (8ull << 16u) | 0x0dccu: return "tex_dcc";
+				default: return nullptr;
+			}
+		};
 		for (size_t i = 0; i < top.size() && i < top_count; i++) {
-			std::fprintf(stderr, " [%c %016llx %016llx %.1fms n=%llu]", top[i].first.kind,
-			             static_cast<unsigned long long>(top[i].first.a), static_cast<unsigned long long>(top[i].first.b),
-			             ms(top[i].second.ticks), static_cast<unsigned long long>(top[i].second.count));
+			const char* label = top[i].first.kind == 'e' ? emu_name(top[i].first.a) : nullptr;
+			if (label != nullptr) {
+				std::fprintf(stderr, " [%c %016llx(%s) %016llx %.1fms n=%llu]", top[i].first.kind,
+				             static_cast<unsigned long long>(top[i].first.a), label,
+				             static_cast<unsigned long long>(top[i].first.b),
+				             ms(top[i].second.ticks), static_cast<unsigned long long>(top[i].second.count));
+			} else {
+				std::fprintf(stderr, " [%c %016llx %016llx %.1fms n=%llu]", top[i].first.kind,
+				             static_cast<unsigned long long>(top[i].first.a), static_cast<unsigned long long>(top[i].first.b),
+				             ms(top[i].second.ticks), static_cast<unsigned long long>(top[i].second.count));
+			}
 		}
 		std::fprintf(stderr, "\n");
 	}

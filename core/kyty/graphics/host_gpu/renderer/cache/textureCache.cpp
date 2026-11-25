@@ -4410,7 +4410,7 @@ TextureCache::CpuReadServe TextureCache::BeginCpuRead(uint64_t vaddr) {
 	stats.serves.fetch_add(1, std::memory_order_relaxed);
 	if (!serve.items.empty() || serve.tick == m_scheduler.CurrentTick()) {
 		serve.tick = m_scheduler.CurrentTick();
-		m_scheduler.Flush();
+		m_scheduler.Flush(CommandScheduler::FlushSite::TexReadback);
 	}
 	stats.record_ns.fetch_add(
 	    static_cast<uint64_t>(

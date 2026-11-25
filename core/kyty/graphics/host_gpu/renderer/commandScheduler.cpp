@@ -272,7 +272,8 @@ void CommandScheduler::EndRendering() {
 	}
 }
 
-void CommandScheduler::Flush() {
+void CommandScheduler::Flush(FlushSite site) {
+	m_flush_site = site;
 	SubmitInfo submit;
 	Flush(submit);
 }
@@ -565,6 +566,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// waited for it.
 	if (PerfEnabled()) {
 		m_perf_submits[static_cast<uint32_t>(m_submit_reason)].fetch_add(1, std::memory_order_relaxed);
+		if (m_submit_reason == SubmitReason::Other) {
+			m_perf_other_sites[static_cast<uint32_t>(m_flush_site)].fetch_add(1, std::memory_order_relaxed);
+		}
 		if (m_batch_interrupt_pending) {
 			const auto us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
 			                                          std::chrono::steady_clock::now() - m_batch_interrupt_since)
@@ -579,6 +583,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	// Everything recorded, deferred interrupts included, is submitted now.
 	m_last_submit_reason      = m_submit_reason;
 	m_submit_reason           = SubmitReason::Other;
+	m_flush_site              = FlushSite::Other;
 	m_batch_interrupt_pending = false;
 	m_batch_idle_armed        = false;
 	return tick;
@@ -678,6 +683,15 @@ void CommandScheduler::ReportSubmitPerf() {
 	             submits[static_cast<uint32_t>(SubmitReason::IdleEarly)], take(m_perf_deferred_periodic),
 	             take(m_perf_deferred_interrupts), delays != 0 ? delay_us / delays : 0ull,
 	             take(m_perf_interrupt_delay_max_us));
+	std::fprintf(stderr,
+	             "PERF submit_other_sites gfx_slice=%llu compute_slice=%llu suspend=%llu flip=%llu buf_rb=%llu tex_rb=%llu other=%llu\n",
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::GfxSlice)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::ComputeSlice)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Suspend)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Flip)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::BufReadback)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::TexReadback)]),
+	             take(m_perf_other_sites[static_cast<uint32_t>(FlushSite::Other)]));
 }
 
 void CommandScheduler::BeginNext() {

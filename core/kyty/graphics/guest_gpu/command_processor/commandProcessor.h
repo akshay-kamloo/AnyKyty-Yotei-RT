@@ -1,6 +1,7 @@
 #ifndef GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 #define GRAPHICS_GUEST_GPU_COMMAND_PROCESSOR_COMMAND_PROCESSOR_H
 
+#include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "common/assert.h"
 #include "graphics/guest_gpu/command_processor/gpuOperation.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -89,7 +90,7 @@ public:
 	void ApplyContextStateOperation(ContextStateOperation operation);
 
 	void            BufferInit();
-	void            BufferFlush();
+	void            BufferFlush(CommandScheduler::FlushSite site = CommandScheduler::FlushSite::Other);
 	// An end-of-pipe interrupt was queued: its tick must be submitted (CommandScheduler::FlushForInterrupt;
 	// deferred while the GPU is busy, bounded).
 	void            BufferFlushForInterrupt();

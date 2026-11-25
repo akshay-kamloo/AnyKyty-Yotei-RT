@@ -404,6 +404,38 @@ static void PerfReport(RenderContext& renderer) {
 		             static_cast<unsigned long long>(pages[i].first >> 48u), pages[i].second);
 	}
 	std::fprintf(stderr, "\n");
+	if (!pages.empty()) {
+		struct CoalescedRange {
+			uint64_t start_page = 0;
+			uint64_t end_page   = 0;
+			uint64_t hits       = 0;
+		};
+		auto by_addr = pages;
+		std::ranges::sort(by_addr, [](const auto& a, const auto& b) {
+			return (a.first & 0xffffffffffffull) < (b.first & 0xffffffffffffull);
+		});
+		std::vector<CoalescedRange> ranges;
+		for (const auto& [key, cnt]: by_addr) {
+			const uint64_t p = key & 0xffffffffffffull;
+			if (!ranges.empty() && p <= ranges.back().end_page + 1u) {
+				if (p > ranges.back().end_page) ranges.back().end_page = p;
+				ranges.back().hits += cnt;
+			} else {
+				ranges.push_back({p, p, cnt});
+			}
+		}
+		std::ranges::sort(ranges, [](const auto& a, const auto& b) { return a.hits > b.hits; });
+		std::fprintf(stderr, "PERF read_ranges count=%zu", ranges.size());
+		for (size_t i = 0; i < ranges.size() && i < 8u; i++) {
+			const uint64_t kb = (ranges[i].end_page - ranges[i].start_page + 1u) * 64ull;
+			std::fprintf(stderr, " [0x%llx0000..0x%llx0000 %lluKB x%llu]",
+			             static_cast<unsigned long long>(ranges[i].start_page),
+			             static_cast<unsigned long long>(ranges[i].end_page + 1u),
+			             static_cast<unsigned long long>(kb),
+			             static_cast<unsigned long long>(ranges[i].hits));
+		}
+		std::fprintf(stderr, "\n");
+	}
 	ReportGpuStageCheck();
 	if (MemCensusRequested()) MemCensusLine(renderer);
 }
@@ -2268,10 +2300,10 @@ void CommandProcessor::BufferInit() {
 	EmitCallback([this, bound] { GetScheduler().Begin(*bound.context, *bound.user_config, *bound.shaders); });
 }
 
-void CommandProcessor::BufferFlush() {
-	EmitCallback([this] {
+void CommandProcessor::BufferFlush(CommandScheduler::FlushSite site) {
+	EmitCallback([this, site] {
 		m_renderer.GetBufferCache().PrefetchEagerReadbacks();
-		GetScheduler().Flush();
+		GetScheduler().Flush(site);
 	});
 }
 
@@ -2941,7 +2973,7 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			m_slice_progressed = progressed;
 			if (progressed) {
-				cp.BufferFlush();
+				cp.BufferFlush(CommandScheduler::FlushSite::GfxSlice);
 			}
 			break;
 		}
@@ -2963,7 +2995,7 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			m_slice_progressed = submission.command_execution.MadeProgress();
 			if (m_slice_progressed) {
-				cp.BufferFlush();
+				cp.BufferFlush(CommandScheduler::FlushSite::ComputeSlice);
 			}
 			break;
 		}
@@ -2979,7 +3011,7 @@ bool GuestGpu::Process(Submission& submission) {
 			cp.EmitCallback([this, ready = m_suspend_point_ready] {
 				m_renderer.GetCommandScheduler().DeferPriorityOperation([ready] { ready->release(); });
 			});
-			cp.BufferFlush();
+			cp.BufferFlush(CommandScheduler::FlushSite::Suspend);
 			cp.Reset();
 			break;
 	}
@@ -4348,7 +4380,7 @@ void CommandProcessor::Flip() {
 		(void)command.Handle();
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
-		GetScheduler().Flush();
+		GetScheduler().Flush(CommandScheduler::FlushSite::Flip);
 		LiveAbFrameBoundary();
 	});
 }
@@ -4370,7 +4402,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 		(void)command.Handle();
 		GetScheduler().DeferPriorityOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
-		GetScheduler().Flush();
+		GetScheduler().Flush(CommandScheduler::FlushSite::Flip);
 		LiveAbFrameBoundary();
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -4402,7 +4434,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 			    renderer.GetVideoOut().CompleteFlip(request);
 			    renderer.TriggerInterrupt(event_id, 0);
 		    });
-		GetScheduler().Flush();
+		GetScheduler().Flush(CommandScheduler::FlushSite::Flip);
 		LiveAbFrameBoundary();
 	});
 	NoteGuestWrite(sequence, reinterpret_cast<uint64_t>(dst_gpu_addr), sizeof(value), &value);
@@ -4422,7 +4454,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 		GetScheduler().DeferPriorityOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
-		GetScheduler().Flush();
+		GetScheduler().Flush(CommandScheduler::FlushSite::Flip);
 		LiveAbFrameBoundary();
 	});
 }

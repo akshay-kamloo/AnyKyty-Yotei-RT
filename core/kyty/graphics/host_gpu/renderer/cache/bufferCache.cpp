@@ -1362,7 +1362,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 								             static_cast<unsigned long long>(m_scheduler.CurrentTick()), ranges.c_str());
 							}
 						}
-						if (plan.tick >= m_scheduler.CurrentTick()) m_scheduler.Flush();
+						if (plan.tick >= m_scheduler.CurrentTick()) m_scheduler.Flush(CommandScheduler::FlushSite::BufReadback);
 						*defer                = plan.tick;
 						caller_timer.deferred = true;
 						return;
@@ -2241,7 +2241,7 @@ bool BufferCache::WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_ove
 				g_direct_stats.gap_max_us.store(gap, std::memory_order_relaxed);
 		}
 		if (target >= m_scheduler.CurrentTick()) {
-			m_scheduler.Flush();
+			m_scheduler.Flush(CommandScheduler::FlushSite::BufReadback);
 			g_direct_stats.flushes.fetch_add(1, std::memory_order_relaxed);
 		}
 		m_scheduler.Wait(target);
@@ -2996,8 +2996,13 @@ struct ObtainMemoEntry {
 	uint32_t regions = 0;      // 1 or 2; 0: empty
 	BufferId id {};
 };
-constexpr size_t kObtainMemoSlots = 8192;
-ObtainMemoEntry  g_obtain_memo[kObtainMemoSlots]; // GPU thread
+constexpr size_t kObtainMemoWays = 4;
+constexpr size_t kObtainMemoSets = 2048;
+struct ObtainMemoSet {
+	ObtainMemoEntry ways[kObtainMemoWays];
+	uint32_t        next_victim = 0;
+};
+ObtainMemoSet g_obtain_memo[kObtainMemoSets]; // GPU thread (8192 entries, 4-way set-associative)
 struct ObtainMemoStats {
 	uint64_t hits = 0, misses = 0, stores = 0;
 	uint64_t miss[5] {}; // empty slot, other range, buffer epoch, CPU-dirty region epoch, image page sum
@@ -3011,10 +3016,10 @@ static ObtainMemoStats& ObtainMemoStatsRef() {
 
 namespace {
 
-size_t ObtainMemoIndex(uint64_t vaddr, uint64_t size) {
+size_t ObtainMemoSetIndex(uint64_t vaddr, uint64_t size) {
 	uint64_t h = vaddr * 0x9E3779B97F4A7C15ull ^ (size + (size << 17u));
 	h ^= h >> 29u;
-	return static_cast<size_t>(h & (kObtainMemoSlots - 1u));
+	return static_cast<size_t>(h & (kObtainMemoSets - 1u));
 }
 
 // The tracker regions of the range (at most 2 are kept) and their epochs now; false when the range spans more.
@@ -3031,38 +3036,58 @@ bool ObtainMemoRegions(uint64_t vaddr, uint64_t size, uint64_t& first, uint32_t&
 
 // The entry of the range when it still holds; null when it does not.
 const ObtainMemoEntry* ObtainMemoFind(uint64_t vaddr, uint64_t size) {
-	const ObtainMemoEntry* entry = &g_obtain_memo[ObtainMemoIndex(vaddr, size)];
-	const auto&            e     = *entry;
-	auto&                  miss  = ObtainMemoStatsRef().miss;
-	if (e.regions == 0) {
-		miss[0]++;
-		return nullptr;
-	}
-	if (e.vaddr != vaddr || e.size != size) {
-		miss[1]++;
-		return nullptr;
-	}
-	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) {
-		miss[2]++;
-		return nullptr;
-	}
-	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
-	for (uint32_t i = 0; i < e.regions; i++) {
-		if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) {
-			miss[3]++;
+	const auto& set  = g_obtain_memo[ObtainMemoSetIndex(vaddr, size)];
+	auto&       miss = ObtainMemoStatsRef().miss;
+	bool        any_empty = false;
+	for (size_t w = 0; w < kObtainMemoWays; w++) {
+		const auto& e = set.ways[w];
+		if (e.regions == 0) {
+			any_empty = true;
+			continue;
+		}
+		if (e.vaddr != vaddr || e.size != size) {
+			continue;
+		}
+		if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) {
+			miss[2]++;
 			return nullptr;
 		}
+		auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+		for (uint32_t i = 0; i < e.regions; i++) {
+			if (table[e.region + i].load(std::memory_order_acquire) != e.epochs[i]) {
+				miss[3]++;
+				return nullptr;
+			}
+		}
+		if (e.image_global_epoch != DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire) &&
+		    DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
+			miss[4]++;
+			return nullptr;
+		}
+		return &e;
 	}
-	if (e.image_global_epoch != DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire) &&
-	    DrawRepeat::ImagePageEpochSum(vaddr, size) != e.image_sum) {
-		miss[4]++;
-		return nullptr;
-	}
-	return entry;
+	miss[any_empty ? 0 : 1]++;
+	return nullptr;
 }
 
 void ObtainMemoStore(uint64_t vaddr, uint64_t size, const ObtainMemoEntry& fresh) {
-	g_obtain_memo[ObtainMemoIndex(vaddr, size)] = fresh;
+	auto& set = g_obtain_memo[ObtainMemoSetIndex(vaddr, size)];
+	size_t empty_way = kObtainMemoWays;
+	for (size_t w = 0; w < kObtainMemoWays; w++) {
+		auto& e = set.ways[w];
+		if (e.regions != 0 && e.vaddr == vaddr && e.size == size) {
+			e = fresh;
+			return;
+		}
+		if (e.regions == 0 && empty_way == kObtainMemoWays) {
+			empty_way = w;
+		}
+	}
+	if (empty_way < kObtainMemoWays) {
+		set.ways[empty_way] = fresh;
+		return;
+	}
+	set.ways[set.next_victim++ & (kObtainMemoWays - 1u)] = fresh;
 }
 
 void ObtainMemoReport() {
@@ -3099,8 +3124,13 @@ struct WriteMemoEntry {
 	uint32_t regions = 0; // 1 or 2; 0: empty
 	BufferId id {};
 };
-constexpr size_t kWriteMemoSlots = 8192;
-WriteMemoEntry   g_write_memo[kWriteMemoSlots]; // GPU thread
+constexpr size_t kWriteMemoWays = 4;
+constexpr size_t kWriteMemoSets = 2048;
+struct WriteMemoSet {
+	WriteMemoEntry ways[kWriteMemoWays];
+	uint32_t       next_victim = 0;
+};
+WriteMemoSet g_write_memo[kWriteMemoSets]; // GPU thread (8192 entries, 4-way set-associative)
 struct {
 	uint64_t hits = 0, retick_hits = 0, misses = 0, stores = 0;
 	// Misses by the first reason: 0 empty or another range, 1 another tick, 2 buffer registry, 3 CPU-dirty epoch,
@@ -3108,10 +3138,10 @@ struct {
 	uint64_t miss_reason[6] {};
 } g_write_memo_stats;
 
-WriteMemoEntry& WriteMemoSlot(uint64_t vaddr, uint64_t size) {
+WriteMemoSet& WriteMemoBucket(uint64_t vaddr, uint64_t size) {
 	uint64_t h = vaddr * 0x9E3779B97F4A7C15ull ^ (size + (size << 21u));
 	h ^= h >> 31u;
-	return g_write_memo[h & (kWriteMemoSlots - 1u)];
+	return g_write_memo[h & (kWriteMemoSets - 1u)];
 }
 
 // The tracker regions of the range (at most 2) and both epochs of each now; false when the range spans more.
@@ -3132,21 +3162,45 @@ bool WriteMemoEpochs(uint64_t vaddr, uint64_t size, WriteMemoEntry& e) {
 }
 
 WriteMemoEntry* WriteMemoFind(uint64_t vaddr, uint64_t size, uint32_t& reason) {
-	auto& e = WriteMemoSlot(vaddr, size);
-	reason  = 0;
-	if (e.regions == 0 || e.vaddr != vaddr || e.size != size) return nullptr;
-	reason = 2;
-	if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) return nullptr;
-	auto* cpu = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
-	auto* gpu = g_gpu_clean_region_epochs.load(std::memory_order_acquire);
-	for (uint32_t i = 0; i < e.regions; i++) {
-		reason = 3;
-		if (cpu[e.region + i].load(std::memory_order_acquire) != e.cpu_epochs[i]) return nullptr;
-		reason = 4;
-		if (gpu[e.region + i].load(std::memory_order_acquire) != e.gpu_epochs[i]) return nullptr;
+	auto& set = WriteMemoBucket(vaddr, size);
+	reason    = 0;
+	for (size_t w = 0; w < kWriteMemoWays; w++) {
+		auto& e = set.ways[w];
+		if (e.regions == 0 || e.vaddr != vaddr || e.size != size) continue;
+		reason = 2;
+		if (e.buffer_epoch != DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire)) return nullptr;
+		auto* cpu = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+		auto* gpu = g_gpu_clean_region_epochs.load(std::memory_order_acquire);
+		for (uint32_t i = 0; i < e.regions; i++) {
+			reason = 3;
+			if (cpu[e.region + i].load(std::memory_order_acquire) != e.cpu_epochs[i]) return nullptr;
+			reason = 4;
+			if (gpu[e.region + i].load(std::memory_order_acquire) != e.gpu_epochs[i]) return nullptr;
+		}
+		reason = 5;
+		return &e;
 	}
-	reason = 5;
-	return &e;
+	return nullptr;
+}
+
+void WriteMemoStore(uint64_t vaddr, uint64_t size, const WriteMemoEntry& fresh) {
+	auto& set = WriteMemoBucket(vaddr, size);
+	size_t empty_way = kWriteMemoWays;
+	for (size_t w = 0; w < kWriteMemoWays; w++) {
+		auto& e = set.ways[w];
+		if (e.regions != 0 && e.vaddr == vaddr && e.size == size) {
+			e = fresh;
+			return;
+		}
+		if (e.regions == 0 && empty_way == kWriteMemoWays) {
+			empty_way = w;
+		}
+	}
+	if (empty_way < kWriteMemoWays) {
+		set.ways[empty_way] = fresh;
+		return;
+	}
+	set.ways[set.next_victim++ & (kWriteMemoWays - 1u)] = fresh;
 }
 
 void WriteMemoReport() {
@@ -3174,10 +3228,14 @@ void BufferCache::PrefetchObtainMemo(uint64_t vaddr, uint64_t size, bool is_writ
 	if (is_written) {
 		// (The write memo serves the GPU thread only.)
 		if (!GuestGpu::IsGpuThread()) return;
-		PrefetchEntry(&WriteMemoSlot(vaddr, size), sizeof(WriteMemoEntry));
+		const auto& set = WriteMemoBucket(vaddr, size);
+		PrefetchEntry(&set.ways[0], sizeof(WriteMemoEntry));
+		PrefetchEntry(&set.ways[2], sizeof(WriteMemoEntry));
 	} else {
 		if (is_texel_buffer) return;
-		PrefetchEntry(&g_obtain_memo[ObtainMemoIndex(vaddr, size)], sizeof(ObtainMemoEntry));
+		const auto& set = g_obtain_memo[ObtainMemoSetIndex(vaddr, size)];
+		PrefetchEntry(&set.ways[0], sizeof(ObtainMemoEntry));
+		PrefetchEntry(&set.ways[2], sizeof(ObtainMemoEntry));
 	}
 }
 
@@ -3792,7 +3850,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferPath(uint64_t vaddr, uint6
 	// The write memo: kept with the epochs read before the full path, in the command buffer it was noted for.
 	if (write_memo_keep && m_scheduler.CurrentTick() == write_memo_fresh.tick) {
 		write_memo_fresh.id = id;
-		WriteMemoSlot(vaddr, size) = write_memo_fresh;
+		WriteMemoStore(vaddr, size, write_memo_fresh);
 		g_write_memo_stats.stores++;
 	}
 	if (memo_on) {
@@ -3912,7 +3970,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRangePath(uint64_t vaddr, uin
 	ObtainMemoEntry* memo_slot = nullptr;
 	const ObtainMemoEntry* memo_hit = nullptr;
 	if (bda_memo) {
-		memo_slot = &g_bda_memo[ObtainMemoIndex(vaddr, size) & (kBdaMemoSlots - 1u)];
+		memo_slot = &g_bda_memo[ObtainMemoSetIndex(vaddr, size) & (kBdaMemoSlots - 1u)];
 		const auto& e = *memo_slot;
 		bool        ok = e.regions != 0 && e.vaddr == vaddr && e.size == size &&
 		          e.buffer_epoch == DrawRepeat::g_buffer_registry_epoch.load(std::memory_order_acquire);

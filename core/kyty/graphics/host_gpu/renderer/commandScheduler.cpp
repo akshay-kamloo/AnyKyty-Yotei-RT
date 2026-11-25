@@ -126,7 +126,7 @@ uint32_t SubmitEveryValue() {
 			const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 			if (n >= 64u && n <= 2048u) return n;
 		}
-		return 512u;
+		return 128u;
 	}();
 	return val;
 }
@@ -136,11 +136,11 @@ uint32_t BatchIdleCommandsValue() {
 			const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
 			if (n >= 4u && n <= 256u) return n;
 		}
-		return 32u;
+		return 8u;
 	}();
 	return val;
 }
-constexpr uint32_t BatchMaxBatches       = 4;
+constexpr uint32_t BatchMaxBatches       = 8;
 constexpr uint32_t BatchInterruptPackets = 256;
 constexpr uint32_t BatchInterruptUs      = 1000;
 
@@ -299,7 +299,7 @@ void CommandScheduler::Flush(FlushSite site) {
 void CommandScheduler::FlushForSlice(FlushSite site) {
 	static const bool coalesce = [] {
 		const char* v = std::getenv("KYTY_SLICE_COALESCE");
-		return v == nullptr || v[0] != '0';
+		return v != nullptr && v[0] == '1';
 	}();
 	if (!coalesce) {
 		Flush(site);

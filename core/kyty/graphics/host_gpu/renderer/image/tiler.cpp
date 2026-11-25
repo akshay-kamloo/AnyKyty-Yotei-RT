@@ -347,8 +347,9 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t sou
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
-	                        &barriers[1], 0, nullptr);
+	                        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader |
+	                            vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &barriers[1], 0, nullptr);
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
@@ -575,8 +576,9 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
-	                        &barriers[1], 0, nullptr);
+	                        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader |
+	                            vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &barriers[1], 0, nullptr);
 }
 
 void TileManager::TransformColor(Result input, Result output, ColorTransform transform,

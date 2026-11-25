@@ -1159,12 +1159,8 @@ struct PipelineCache::ProgramCache {
 		// Offload first-time non-writing graphics stage variant compilation to background workers so
 		// brand-new open-world areas do not stall the GPU execution thread for 100-465 ms.
 		if constexpr (!std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-			static const bool async_visual_variants = [] {
-				const char* v = std::getenv("KYTY_ASYNC_WRITING_VISUAL_DRAWS");
-				return v == nullptr || v[0] != '0';
-			}();
 			if (allow_async && enqueue_async && !use_reused && !entry->second.call_source &&
-			    (async_visual_variants || !StagePlanWritesMemory(entry->second.resource_plan, entry->second.Resources()))) {
+			    !StagePlanWritesMemory(entry->second.resource_plan, entry->second.Resources())) {
 				const uint64_t variant_key = precompile_key != 0
 				    ? precompile_key
 				    : PrecompileKey(stage, params.hash, params.user_data_count,

@@ -198,7 +198,7 @@ private:
 	// The pipeline: operations ring from the command processor thread to the resolve thread and from there to the execution
 	// thread, which also serves m_commands and so may sleep on the bell, not in the ring.
 	static constexpr size_t         OperationQueueSize = 4096;
-	static constexpr size_t         ResolvedQueueSize  = 256; // RenderExecutor::ResolvedDrawRing holds more
+	static constexpr size_t         ResolvedQueueSize  = 2048; // RenderExecutor::ResolvedDrawRing holds more
 	Common::SpscQueue<GpuOperation> m_operations;
 	Common::SpscQueue<GpuOperation> m_resolved;
 	alignas(64) std::atomic_bool    m_execution_sleeping {false};

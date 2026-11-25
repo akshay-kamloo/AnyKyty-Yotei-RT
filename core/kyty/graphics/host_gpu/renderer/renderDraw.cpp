@@ -4024,7 +4024,7 @@ enum ResolvedPhase : uint8_t { PhaseFree = 0, PhasePending = 1, PhaseRunning = 2
 // More resolutions than operations can wait between the resolve and execution threads (GuestGpu::ResolvedQueueSize), so
 // the resolve thread only ever waits for room in that queue.
 struct RenderExecutor::ResolvedDrawRing {
-	static constexpr size_t Size = 320;
+	static constexpr size_t Size = 2304;
 
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;

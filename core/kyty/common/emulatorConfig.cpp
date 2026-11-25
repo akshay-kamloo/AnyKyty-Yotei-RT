@@ -321,10 +321,12 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		return value == nullptr || std::string_view(value) != "0";
 	}();
 	if (stage == GpuStageThread::ResolveHelper) {
+		if (high_priority) Common::Thread::RaiseCurrentPriority();
 		Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(GpuStageThread::Resolve)]);
 		return;
 	}
 	if (stage == GpuStageThread::ResolveHelper2) {
+		if (high_priority) Common::Thread::RaiseCurrentPriority();
 		// Project 15 N5.3: not pinned (the walk 10.11: with the plans 19.23 fps and 333 frames over 60 ms, against 18.97 and
 		// 527 on the first helper's SMT sibling): the scheduler gives it a core of its own.
 		return;

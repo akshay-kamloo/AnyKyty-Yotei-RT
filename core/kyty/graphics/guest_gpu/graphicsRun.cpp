@@ -665,7 +665,7 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	std::fprintf(stderr, "PERF_RESOLVE_HELPERS count=%u hw_threads=%u\n", m_resolve_helper_count, hw_threads);
 	m_resolve_helpers.reserve(m_resolve_helper_count);
 	for (uint32_t i = 0; i < m_resolve_helper_count; i++) {
-		m_task_queues[i] = std::make_unique<Common::SpscQueue<RenderExecutor::ResolveTask>>(512);
+		m_task_queues[i] = std::make_unique<Common::SpscQueue<RenderExecutor::ResolveTask>>(4096);
 		m_resolve_helpers.emplace_back([this, i] { ResolveHelperThread(i); });
 	}
 	m_thread   = std::jthread(ThreadRun, this);

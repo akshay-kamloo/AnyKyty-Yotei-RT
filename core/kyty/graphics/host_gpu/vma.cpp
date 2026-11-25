@@ -186,9 +186,9 @@ struct RecycledImage {
 	uint64_t                              bytes      = 0;
 	std::chrono::steady_clock::time_point parked;
 };
-constexpr size_t   RecycleMaxImages = 32;
+constexpr size_t   RecycleMaxImages = 256;
 constexpr uint64_t RecycleMaxBytes  = uint64_t {512} << 20u;
-constexpr auto     RecycleMaxAge    = std::chrono::seconds(2);
+constexpr auto     RecycleMaxAge    = std::chrono::seconds(4);
 std::mutex                                g_recycle_mutex;
 std::vector<RecycledImage>                g_recycled; // oldest first
 uint64_t                                  g_recycled_bytes = 0;

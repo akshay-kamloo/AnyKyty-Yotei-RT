@@ -811,13 +811,11 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	// pressure rises on 8-12 GB GPUs, while staying at native resolution on 16-24 GB GPUs with ample headroom.
 	host_mip_skip = [&]() -> uint32_t {
 		if (create.imageType != vk::ImageType::e2D || info.samples != 1u || info.IsDepth() || info.HasStencil() ||
-		    info.metadata.kind != ImageMetadataKind::None || info.HostLevels() < 3u ||
-		    info.tiling.texel_width != 4u || info.tiling.texel_height != 4u) {
+		    info.metadata.kind != ImageMetadataKind::None || !info.IsBlock() || info.HostLevels() < 5u) {
 			return 0u;
 		}
 		if (bool(create.usage & (vk::ImageUsageFlagBits::eColorAttachment |
-		                         vk::ImageUsageFlagBits::eDepthStencilAttachment |
-		                         vk::ImageUsageFlagBits::eStorage))) {
+		                         vk::ImageUsageFlagBits::eDepthStencilAttachment))) {
 			return 0u;
 		}
 		static const int mode = [] {
@@ -836,16 +834,24 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		} else if (mode == -1) {
 			static std::atomic<uint32_t> poll_counter {0};
 			static std::atomic<uint32_t> cached_pct {0};
+			static std::atomic<uint64_t> cached_budget_mib {0};
 			if ((poll_counter.fetch_add(1u, std::memory_order_relaxed) & 31u) == 0u &&
 			    graphics.CanReportMemoryUsage()) {
 				uint64_t usage = 0, budget = 0, blocks = 0, alloc = 0;
 				graphics.GetDeviceLocalMemoryStats(usage, budget, blocks, alloc);
 				const uint32_t pct = budget != 0 ? static_cast<uint32_t>((usage * 100ull) / budget) : 0u;
 				cached_pct.store(pct, std::memory_order_relaxed);
+				cached_budget_mib.store(budget >> 20u, std::memory_order_relaxed);
 			}
-			const uint32_t pct = cached_pct.load(std::memory_order_relaxed);
-			if (pct < 55u) return 0u;
-			min_dim = pct >= 72u ? 1024u : 2048u;
+			const uint32_t pct        = cached_pct.load(std::memory_order_relaxed);
+			const uint64_t budget_mib = cached_budget_mib.load(std::memory_order_relaxed);
+			if (budget_mib >= 15000ull) {
+				if (pct < 75u) return 0u;
+				min_dim = 2048u;
+			} else {
+				if (pct < 40u) return 0u;
+				min_dim = pct >= 60u ? 1024u : 2048u;
+			}
 		}
 		if (max_dim < min_dim) return 0u;
 		const auto next_ext = info.MipExtent(1u);

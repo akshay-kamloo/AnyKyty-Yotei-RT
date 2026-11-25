@@ -251,7 +251,7 @@ inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
 // before the BufferCache exists.
 inline std::atomic<std::atomic<uint32_t>*> g_cpu_dirty_region_epochs {nullptr};
 inline std::atomic<uint32_t>               g_cpu_dirty_region_clock {0};
-inline std::atomic<uint64_t>               g_gpu_dirty_clock {0};
+alignas(64) inline std::atomic<uint64_t>   g_gpu_dirty_clock {0};
 
 inline void NoteCpuDirtyRegionEpoch(std::atomic<uint32_t>* epochs, uint64_t region) {
 	epochs[region].store(g_cpu_dirty_region_clock.fetch_add(1, std::memory_order_relaxed) + 1u, std::memory_order_release);

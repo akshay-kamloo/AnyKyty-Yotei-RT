@@ -146,9 +146,8 @@ public:
 		uint64_t offset       = 0;
 		uint64_t buffer_epoch = 0, image_sum = 0, image_global_epoch = 0, region = 0;
 		uint32_t epochs[2] {};
-		uint32_t regions   = 0;
-		uint32_t cpu_clock = 0;
-		bool     bda       = false; // ObtainBdaRange's peek: no image in the proof
+		uint32_t regions = 0;
+		bool     bda     = false; // ObtainBdaRange's peek: no image in the proof
 		bool     helper_direct = false; // way B W0: a helper's peek of a range overlapping a direct range (Upload, in order)
 		uint64_t direct_gen    = 0;     // W2.2: a Direct answer's generation of the direct ranges (g_direct_generation)
 		vk::Buffer handle {};           // P1: the buffer's handle (Ready, Direct)

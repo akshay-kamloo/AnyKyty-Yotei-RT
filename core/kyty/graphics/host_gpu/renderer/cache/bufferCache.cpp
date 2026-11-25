@@ -2025,6 +2025,39 @@ void BufferCache::ActivateDirect(DirectRange& range) {
 	             static_cast<unsigned long long>(old_ids.size()));
 }
 
+bool BufferCache::TryAutoPromoteDirectRange(uint64_t start, uint64_t end, uint64_t hits) {
+	static const bool auto_promote = [] {
+		const char* v = std::getenv("KYTY_DIRECT_AUTO_PROMOTE");
+		return v == nullptr || v[0] != '0';
+	}();
+	if (!auto_promote || DirectMode() == 0) return false;
+	// Only promote CPU-shared heap ranges (< 0x4000000000); 0x50... shader-hot VRAM stays tracked.
+	constexpr uint64_t kMaxDirectAutoAddr = 0x4000000000ull;
+	constexpr uint64_t kMaxDirectAutoSize = 8ull * 1024ull * 1024ull;
+	constexpr size_t   kMaxDirectRanges   = 48u; // strictly < reserved 64 (no reallocation)
+	start = Common::AlignDown(start, CACHING_PAGESIZE);
+	end   = Common::AlignUp(end, CACHING_PAGESIZE);
+	if (start >= end || end > kMaxDirectAutoAddr || (end - start) > kMaxDirectAutoSize) return false;
+	if (m_direct_ranges.size() >= kMaxDirectRanges) return false;
+	for (const auto& r: m_direct_ranges) {
+		if (start < r.end && r.start < end) return false;
+	}
+	{
+		const DirectChange change(*this);
+		m_direct_ranges.push_back({start, end});
+		RebuildDirectWriteSpans();
+	}
+	ActivateDirect(m_direct_ranges.back());
+	if (m_direct_ranges.back().active) {
+		std::fprintf(stderr, "PERF_DIRECT_AUTO_PROMOTE active 0x%llx-0x%llx (%lluKB hits=%llu)\n",
+		             static_cast<unsigned long long>(start), static_cast<unsigned long long>(end),
+		             static_cast<unsigned long long>((end - start) / 1024ull),
+		             static_cast<unsigned long long>(hits));
+		return true;
+	}
+	return false;
+}
+
 void BufferCache::DeactivateDirect(DirectRange& range, bool replace) {
 	if (!range.active) return;
 	const DirectChange change(*this); // (W2.2)

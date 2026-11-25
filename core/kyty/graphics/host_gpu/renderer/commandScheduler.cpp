@@ -120,11 +120,29 @@ void AsyncSubmitOnWorker(const void* blob) {
 //    instance) draws/dispatches and the GPU is still idle: at most one extra submission per such
 //    event, never in the steady draw stream.
 // Only submission points move; what each command buffer records and the order of all GPU work are unchanged.
-constexpr uint32_t SubmitEvery           = 128; // the open buffer is submitted every so many draws/dispatches
-constexpr uint32_t BatchMaxBatches       = 8;
+uint32_t SubmitEveryValue() {
+	static const uint32_t val = [] {
+		if (const char* v = std::getenv("KYTY_SUBMIT_EVERY"); v != nullptr) {
+			const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+			if (n >= 64u && n <= 2048u) return n;
+		}
+		return 512u;
+	}();
+	return val;
+}
+uint32_t BatchIdleCommandsValue() {
+	static const uint32_t val = [] {
+		if (const char* v = std::getenv("KYTY_BATCH_IDLE_CMDS"); v != nullptr) {
+			const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+			if (n >= 4u && n <= 256u) return n;
+		}
+		return 32u;
+	}();
+	return val;
+}
+constexpr uint32_t BatchMaxBatches       = 4;
 constexpr uint32_t BatchInterruptPackets = 256;
 constexpr uint32_t BatchInterruptUs      = 1000;
-constexpr uint32_t BatchIdleCommands     = 8;
 
 } // namespace
 
@@ -288,7 +306,7 @@ void CommandScheduler::FlushForSlice(FlushSite site) {
 		return;
 	}
 	if (!Active() || m_command.IsInvalid()) return;
-	if (GpuIdle() || m_commands_since_submit >= SubmitEvery) {
+	if (GpuIdle() || m_commands_since_submit >= SubmitEveryValue()) {
 		Flush(site);
 		return;
 	}
@@ -640,14 +658,15 @@ void CommandScheduler::NoteGpuCommandBatched() {
 		// idle GPU there only means the recording is the bottleneck, which more submissions would slow.
 		m_batch_idle_armed = GpuIdle();
 	}
-	if (m_batch_idle_armed && count > (m_command.IsRendering() ? BatchIdleCommands * 4u : BatchIdleCommands)) {
+	const uint32_t idle_cmds = BatchIdleCommandsValue(); if (m_batch_idle_armed && count > (m_command.IsRendering() ? idle_cmds * 4u : idle_cmds)) {
 		if (GpuIdle()) {
 			FlushFor(SubmitReason::IdleEarly);
 			return;
 		}
 	}
-	if (count <= SubmitEvery) return;
-	const bool boundary = count == SubmitEvery + 1u;
+	const uint32_t submit_every = SubmitEveryValue();
+	if (count <= submit_every) return;
+	const bool boundary = count == submit_every + 1u;
 	if (GpuIdle()) {
 		FlushFor(boundary ? SubmitReason::Periodic : SubmitReason::PeriodicLate);
 		return;
@@ -655,7 +674,7 @@ void CommandScheduler::NoteGpuCommandBatched() {
 	if (boundary && PerfEnabled()) {
 		m_perf_deferred_periodic.fetch_add(1, std::memory_order_relaxed);
 	}
-	if (uint64_t {count} > uint64_t {SubmitEvery} * BatchMaxBatches) {
+	if (uint64_t {count} > uint64_t {submit_every} * BatchMaxBatches) {
 		FlushFor(SubmitReason::PeriodicBound);
 	}
 }

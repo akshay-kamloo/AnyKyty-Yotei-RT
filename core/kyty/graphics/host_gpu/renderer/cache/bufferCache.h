@@ -465,6 +465,7 @@ public:
 	bool               WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay = false);
 	void               ApplyDirectCpWrites(uint64_t vaddr, void* data, uint64_t size) const;
 	void               UnmapDirect(uint64_t vaddr, uint64_t size);
+	bool               TryAutoPromoteDirectRange(uint64_t start, uint64_t end, uint64_t hits);
 	// KYTY_FIX_VIRTUAL_GPU_CLOCK (virtualGpuClock.cpp), GPU thread: a value the GPU produced at an earlier, finished point
 	// of the command stream (an end-of-pipe clock value resolved once its command buffer completed) for [address,
 	// address + size).

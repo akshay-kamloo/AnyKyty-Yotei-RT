@@ -435,6 +435,13 @@ static void PerfReport(RenderContext& renderer) {
 			             static_cast<unsigned long long>(ranges[i].hits));
 		}
 		std::fprintf(stderr, "\n");
+		for (size_t i = 0; i < ranges.size() && i < 8u; i++) {
+			if (ranges[i].hits >= 500u) {
+				const uint64_t r_start = ranges[i].start_page << 16u;
+				const uint64_t r_end   = (ranges[i].end_page + 1u) << 16u;
+				renderer.GetBufferCache().TryAutoPromoteDirectRange(r_start, r_end, ranges[i].hits);
+			}
+		}
 	}
 	ReportGpuStageCheck();
 	if (MemCensusRequested()) MemCensusLine(renderer);

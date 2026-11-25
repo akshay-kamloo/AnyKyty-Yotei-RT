@@ -69,9 +69,15 @@ public:
 
 	// write = false (the texture cache's read-only sections): the section writes none of the
 	// image state lock-free readers check, so it leaves g_tc_write_seq as it is. Every other section opens it (odd).
+	static constexpr uint32_t kWriteLock      = 1u << 31u;
+	static constexpr uint32_t kWriterWaitInc  = 1u << 16u;
+	static constexpr uint32_t kWriterWaitMask = 0x3FFF0000u;
+	static constexpr uint32_t kReaderMask     = 0x0000FFFFu;
+
 	void lock(bool write = true) noexcept {
-		const auto thread = CurrentThread();
-		if (m_lock.test_and_set(std::memory_order_acquire)) {
+		const auto thread   = CurrentThread();
+		uint32_t   expected = 0u;
+		if (!m_state.compare_exchange_strong(expected, kWriteLock, std::memory_order_acquire, std::memory_order_relaxed)) {
 			// Contended: visible in Tracy (another thread holds the region, e.g. across a protect).
 			KYTY_PROFILER_BLOCK("RegionLock::Wait");
 			// KYTY_TRACE_PERF: contended waits by thread kind (PERF locks); only this branch pays for it.
@@ -111,17 +117,12 @@ public:
 			if (gpu_thread) m_gpu_waiting.store(true, std::memory_order_relaxed);
 			uint32_t spins  = 0;
 			uint32_t yields = 0;
-			do {
+			m_state.fetch_add(kWriterWaitInc, std::memory_order_relaxed);
+			for (;;) {
 				EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-				// Test before test-and-set: waiting reads do not pull the line away from the holder.
-				while (m_lock.test(std::memory_order_relaxed)) {
+				uint32_t s = m_state.load(std::memory_order_relaxed);
+				while ((s & (kWriteLock | kReaderMask)) != 0u) {
 					SpinPause();
-					// After ~25 us of spinning: gives up the time slice, so a holder preempted inside a protect can run;
-					// after ~1 ms a guest thread sleeps 1 ms per round. With the game's fault handlers spinning here at once
-					// (8.11 stall watchdog: the main thread, 11 job workers and the GPU thread on one lock for 0.5-2.7 s) a
-					// yield only reaches threads ready on the same processor and the holder got no core: the page-manager
-					// lock's backoff (6.11) for this lock too. The GPU thread keeps spinning: it has a core of its own
-					// (nobody waits for that core), and sleeping it cost ~6-10% fps in the walk.
 					if (++spins >= 2048u) {
 						spins = 0;
 						if (!gpu_thread && ++yields >= 40u) {
@@ -130,8 +131,11 @@ public:
 							std::this_thread::yield();
 						}
 					}
+					s = m_state.load(std::memory_order_relaxed);
 				}
-			} while (m_lock.test_and_set(std::memory_order_acquire));
+				const uint32_t next = (s - kWriterWaitInc) | kWriteLock;
+				if (m_state.compare_exchange_weak(s, next, std::memory_order_acquire, std::memory_order_relaxed)) break;
+			}
 			if (gpu_thread) m_gpu_waiting.store(false, std::memory_order_relaxed);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
@@ -149,7 +153,8 @@ public:
 	// The resolve thread's lookups: takes the lock only if it is free, never waits. A failed
 	// attempt only reads the lock word (it does not pull the line away from the holder).
 	[[nodiscard]] bool try_lock() noexcept {
-		if (m_lock.test(std::memory_order_relaxed) || m_lock.test_and_set(std::memory_order_acquire)) {
+		uint32_t expected = 0u;
+		if (!m_state.compare_exchange_strong(expected, kWriteLock, std::memory_order_acquire, std::memory_order_relaxed)) {
 			return false;
 		}
 		m_owner.store(CurrentThread(), std::memory_order_relaxed);
@@ -169,7 +174,39 @@ public:
 			}
 		}
 		m_owner.store(0, std::memory_order_relaxed);
-		m_lock.clear(std::memory_order_release);
+		m_state.fetch_and(~kWriteLock, std::memory_order_release);
+	}
+	void lock_shared() noexcept {
+		uint32_t s = m_state.load(std::memory_order_relaxed);
+		if ((s & (kWriteLock | kWriterWaitMask)) == 0u &&
+		    m_state.compare_exchange_weak(s, s + 1u, std::memory_order_acquire, std::memory_order_relaxed)) {
+			if (m_perf_site == PerfLockSiteTextureCache) t_tc_lock_held++;
+			return;
+		}
+		const bool gpu_thread = PerfIsGpuThread();
+		uint32_t   spins      = 0;
+		uint32_t   yields     = 0;
+		for (;;) {
+			s = m_state.load(std::memory_order_relaxed);
+			if ((s & (kWriteLock | kWriterWaitMask)) == 0u) {
+				if (m_state.compare_exchange_weak(s, s + 1u, std::memory_order_acquire, std::memory_order_relaxed)) break;
+				continue;
+			}
+			SpinPause();
+			if (++spins >= 2048u) {
+				spins = 0;
+				if (!gpu_thread && ++yields >= 40u) {
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				} else {
+					std::this_thread::yield();
+				}
+			}
+		}
+		if (m_perf_site == PerfLockSiteTextureCache) t_tc_lock_held++;
+	}
+	void unlock_shared() noexcept {
+		if (m_perf_site == PerfLockSiteTextureCache) t_tc_lock_held--;
+		m_state.fetch_sub(1u, std::memory_order_release);
 	}
 
 private:
@@ -197,7 +234,7 @@ private:
 #endif
 	}
 
-	std::atomic_flag     m_lock = ATOMIC_FLAG_INIT;
+	std::atomic_uint32_t m_state {0};
 	std::atomic_uint32_t m_owner {0};
 	std::atomic_bool     m_gpu_waiting {false};
 	uint8_t              m_perf_site = PerfLockSiteRegion;

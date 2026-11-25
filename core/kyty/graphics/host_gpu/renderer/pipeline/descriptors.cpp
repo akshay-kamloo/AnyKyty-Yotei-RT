@@ -3343,16 +3343,8 @@ uint32_t RenderExecutor::ResolveTableDescriptor(BindlessTable::Table& table, con
 		stats.placeholder[static_cast<size_t>(why)]++;
 		return placeholder_slot;
 	};
-	// The same descriptor seen through any table already has a slot.
-	const BindlessTable::TableSlotKey key {table.view, words};
-	if (const auto slot = bindless.FindTableSlot(key); slot != 0u) {
-		const auto* image = texture_cache.m_slot_images.try_get(bindless.GetTableSlot(binding, slot).image);
-		if (image != nullptr && image->registered) return slot;
-		bindless.DropTableSlot(binding, slot); // its image went without a notice: resolve the descriptor anew
-	}
-	// Words that only resemble a descriptor (a record past a table's live count, a field that holds data in some
-	// records) stay the placeholder; so does what the float-typed arrays cannot hold (integer formats, other shapes),
-	// as on the heap path.
+	// Fast-reject non-descriptors and incompatible formats BEFORE hashing/probing the 45K-entry BindlessTable map
+	// (rejected descriptors are never inserted via AddTableSlot, so FindTableSlot would always miss).
 	if (!LooksLikeImageDescriptor(words.data(), (table.view.flags & 1u) != 0u))
 		return placeholder(Placeholder::NotDescriptor);
 	ShaderTextureResource descriptor {};
@@ -3367,9 +3359,18 @@ uint32_t RenderExecutor::ResolveTableDescriptor(BindlessTable::Table& table, con
 			if (bindless.ClassesEnabled() && (format_class == Prospero::TextureNumericClass::Uint ||
 			                                  format_class == Prospero::TextureNumericClass::Sint))
 				bindless.GetClassStats().int_in_float++;
-			stats.incompatible[{static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(descriptor.Format())}]++;
+			if (PerfEnabled()) {
+				stats.incompatible[{static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(descriptor.Format())}]++;
+			}
 		}
 		return placeholder(Placeholder::Incompatible);
+	}
+	// The same descriptor seen through any table already has a slot.
+	const BindlessTable::TableSlotKey key {table.view, words};
+	if (const auto slot = bindless.FindTableSlot(key); slot != 0u) {
+		const auto* image = texture_cache.m_slot_images.try_get(bindless.GetTableSlot(binding, slot).image);
+		if (image != nullptr && image->registered) return slot;
+		bindless.DropTableSlot(binding, slot); // its image went without a notice: resolve the descriptor anew
 	}
 	uint32_t probe = 0;
 	if (!GuestRange {descriptor.Base40(), 1u}.Valid() ||

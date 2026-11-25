@@ -68,32 +68,69 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
 		stop = begin;
 		return Result::NeedsReader;
 	}
-	auto&    buffers           = g_gpu_resources->GetBufferCache();
-	uint64_t cached_clean_page = ~uint64_t {0};
+	auto& buffers = g_gpu_resources->GetBufferCache();
+	static const bool use_page_cache = [] {
+		const char* v = std::getenv("KYTY_FAST_VERIFY_CACHE");
+		return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+	}();
+	struct CleanPageSlot {
+		uint64_t       page    = ~uint64_t {0};
+		const uint8_t* backing = nullptr;
+	};
+	CleanPageSlot  cache[8] {};
+	uint32_t       cache_next = 0;
+	const uint8_t* log_bytes  = log.bytes.data();
 	for (size_t i = begin; i < log.entries.size(); ++i) {
 		const auto& entry = log.entries[i];
-		if (!entry.ok || entry.size == 0 || !IsGpuAddressRange(entry.address, entry.size)) {
+		if (!entry.ok || entry.size == 0) {
 			stop = i;
 			return Result::NeedsReader;
 		}
 		const uint64_t first_page = entry.address & ~uint64_t {0xfff};
 		const uint64_t last_page  = (entry.address + entry.size - 1u) & ~uint64_t {0xfff};
-		if (first_page != cached_clean_page || last_page != cached_clean_page) {
-			if (first_page == last_page && IsGpuAddressRange(first_page, 0x1000) &&
+		if (use_page_cache && first_page == last_page) {
+			const uint8_t* backing = nullptr;
+			for (const auto& s: cache) {
+				if (s.page == first_page) {
+					backing = s.backing;
+					break;
+				}
+			}
+			if (backing != nullptr) {
+				if (std::memcmp(backing + (entry.address & 0xfffu), log_bytes + entry.first, entry.size) != 0) {
+					stop = i;
+					return Result::Changed;
+				}
+				stats.entries_fast++;
+				stats.runs++;
+				continue;
+			}
+			if (IsGpuAddressRange(first_page, 0x1000) &&
 			    !buffers.IsRegionGpuModified(first_page, 0x1000) &&
-			    !buffers.HasPendingReadback(first_page, 0x1000)) {
-				cached_clean_page = first_page;
-			} else if (buffers.HasGpuDirtyBytes(entry.address, entry.size) ||
-			           buffers.HasPendingReadback(entry.address, entry.size)) {
-				stop = i;
-				return Result::NeedsReader;
+			    !buffers.HasPendingReadback(first_page, 0x1000) &&
+			    buffers.DirectRangeQuiet(first_page, 0x1000)) {
+				backing = TryGetBackingPage(first_page);
+				if (backing != nullptr) {
+					cache[cache_next & 7u] = {first_page, backing};
+					++cache_next;
+					if (std::memcmp(backing + (entry.address & 0xfffu), log_bytes + entry.first, entry.size) != 0) {
+						stop = i;
+						return Result::Changed;
+					}
+					stats.entries_fast++;
+					stats.runs++;
+					continue;
+				}
 			}
 		}
-		if (!buffers.DirectRangeQuiet(entry.address, entry.size)) {
+		if (!IsGpuAddressRange(entry.address, entry.size) ||
+		    buffers.HasGpuDirtyBytes(entry.address, entry.size) ||
+		    buffers.HasPendingReadback(entry.address, entry.size) ||
+		    !buffers.DirectRangeQuiet(entry.address, entry.size)) {
 			stop = i;
 			return Result::NeedsReader;
 		}
-		const int cmp = CompareBacking(entry.address, log.bytes.data() + entry.first, entry.size);
+		const int cmp = CompareBacking(entry.address, log_bytes + entry.first, entry.size);
 		if (cmp == 1) {
 			stop = i;
 			return Result::Changed;

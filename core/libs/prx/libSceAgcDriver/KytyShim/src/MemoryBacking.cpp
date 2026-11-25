@@ -1163,6 +1163,13 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 
 
 
+const uint8_t* TryGetBackingPage(uint64_t page_vaddr) noexcept {
+	if (!Shim::ViewEnabled() || !ValidRange(page_vaddr, PageSize)) return nullptr;
+	const uint32_t entry = Pages().LoadBacking(page_vaddr >> PageBits);
+	if (entry == 0) return nullptr;
+	return State().base + (uint64_t {entry - 1u} << PageBits);
+}
+
 int CompareBacking(uint64_t vaddr, const void* expected, uint64_t size) {
 	if (size == 0) return 0;
 	if (expected == nullptr || !ValidRange(vaddr, size) || !Shim::ViewEnabled()) return 2;

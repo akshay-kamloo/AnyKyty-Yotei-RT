@@ -4131,6 +4131,18 @@ void BufferCache::NoteObtainedWriteRepeat(uint64_t vaddr, uint64_t size, bool sa
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBdaRange(uint64_t vaddr, uint64_t size, bool is_written,
                                                          BufferId id) {
+	if (!PlanBufferCheck() && g_plan_buffers != nullptr && !is_written && GuestGpu::IsGpuThread() && GuestRange {vaddr, size}.Valid()) {
+		if (auto* entry = PlanBufferFind(vaddr, size, false, true); entry != nullptr) {
+			const bool direct = entry->peek.klass == BufferPeek::Direct && DirectMode() == m_direct_mode_seen;
+			if ((entry->peek.klass == BufferPeek::Ready || direct) && PeekProofHolds(entry->peek, vaddr, size)) {
+				entry->used  = true;
+				auto& buffer = m_slot_buffers[entry->peek.id];
+				if (!direct) TouchBuffer(buffer);
+				g_ahead.buffers_answered++;
+				return {&buffer, entry->peek.offset};
+			}
+		}
+	}
 	if (PlanBufferCheck() && g_plan_buffers != nullptr && !is_written && GuestGpu::IsGpuThread() && GuestRange {vaddr, size}.Valid()) {
 		if (auto* entry = PlanBufferFind(vaddr, size, false, true); entry != nullptr) {
 			return PlanChecked(*entry, vaddr, size, [&] { return ObtainBdaRangePath(vaddr, size, is_written, id); });

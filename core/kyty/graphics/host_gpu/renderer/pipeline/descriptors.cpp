@@ -4359,18 +4359,54 @@ void RenderExecutor::PeekStageBuffers(const ShaderRecompiler::IR::CompiledShader
 			if (cache != nullptr) cache->UnlockLookup();
 		}
 	} const unlock {helper ? &cache : nullptr};
-	for (uint32_t index = 0; !t_peek_slim && index < snapshot.indirect_ranges.size(); index++) {
-		const auto& range = snapshot.indirect_ranges[index];
-		if (range.written) continue;
-		const auto* ahead = StageF::RangeSourceAhead(record, index, range, false);
-		if (ahead == nullptr || ahead->size == 0u) continue;
-		auto& entry    = out.emplace_back();
-		entry.vaddr    = range.address;
-		entry.size     = ahead->size;
-		entry.bda      = true;
-		entry.kind     = 1;
-		entry.distance = distance;
-		entry.peek     = cache.PeekBuffer(range.address, ahead->size, false, false, ahead->id, true);
+	static const bool plan_bda = [] {
+		const char* v = std::getenv("KYTY_PLAN_BDA");
+		return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+	}();
+	if (plan_bda || !t_peek_slim) {
+		for (uint32_t index = 0; index < snapshot.indirect_ranges.size(); index++) {
+			const auto& range = snapshot.indirect_ranges[index];
+			if (range.written) continue;
+			const auto* ahead = StageF::RangeSourceAhead(record, index, range, false);
+			if (ahead == nullptr || ahead->size == 0u) continue;
+			auto& entry    = out.emplace_back();
+			entry.vaddr    = range.address;
+			entry.size     = ahead->size;
+			entry.bda      = true;
+			entry.kind     = 1;
+			entry.distance = distance;
+			entry.peek     = cache.PeekBuffer(range.address, ahead->size, false, false, ahead->id, true);
+		}
+		if (const auto& words = program.info.srt_gpu_words; !words.empty()) {
+			const auto& flat = snapshot.flattened_srt;
+			thread_local std::vector<uint64_t> t_word_addrs;
+			t_word_addrs.clear();
+			for (const auto& word: words) {
+				if (word.slot >= flat.size() || word.hi >= flat.size()) continue;
+				const uint64_t address = (uint64_t {flat[word.hi]} << 32u) | flat[word.slot];
+				if (address == 0u || cache.InDirectRange(address, sizeof(uint32_t))) continue;
+				t_word_addrs.push_back(address);
+			}
+			if (!std::ranges::is_sorted(t_word_addrs)) std::ranges::sort(t_word_addrs);
+			for (size_t first = 0; first < t_word_addrs.size();) {
+				const uint64_t start = t_word_addrs[first];
+				size_t         last  = first;
+				while (last + 1u < t_word_addrs.size() &&
+				       t_word_addrs[last + 1u] <= t_word_addrs[last] + 4u + 256u &&
+				       (t_word_addrs[last + 1u] >> 16u) == (start >> 16u)) {
+					++last;
+				}
+				const uint64_t end = t_word_addrs[last] + sizeof(uint32_t);
+				auto& entry    = out.emplace_back();
+				entry.vaddr    = start;
+				entry.size     = end - start;
+				entry.bda      = true;
+				entry.kind     = 1;
+				entry.distance = distance;
+				entry.peek     = cache.PeekBuffer(start, end - start, false, false, {}, true);
+				first          = last + 1u;
+			}
+		}
 	}
 	for (uint32_t resource = 0; resource < program.info.buffers.size(); ++resource) {
 		const auto& metadata = program.info.buffers[resource];
@@ -5333,9 +5369,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// plan's SRT read count, which the flat buffer always holds), the storage view the words themselves.
 	const auto upload_uniform = [&](std::span<const uint32_t> words, vk::DescriptorBufferInfo* storage_view,
 	                                vk::DescriptorBufferInfo* uniform_view) {
-		m_uniform_words.assign(words.begin(), words.end());
-		m_uniform_words.resize((words.size() + 3u) & ~size_t {3}, 0u);
-		const auto view = NativeUpload(m_context, m_uniform_words);
+		std::span<const uint32_t> upload_span = words;
+		if ((words.size() & 3u) != 0u) {
+			m_uniform_words.assign(words.begin(), words.end());
+			m_uniform_words.resize((words.size() + 3u) & ~size_t {3}, 0u);
+			upload_span = m_uniform_words;
+		}
+		const auto view = NativeUpload(m_context, upload_span);
 		if (storage_view != nullptr) *storage_view = {view.buffer, view.offset, words.size_bytes()};
 		*uniform_view = {view.buffer, view.offset,
 		                 std::min<vk::DeviceSize>(view.range, ShaderRecompiler::IR::UniformBufferMaxBytes)};

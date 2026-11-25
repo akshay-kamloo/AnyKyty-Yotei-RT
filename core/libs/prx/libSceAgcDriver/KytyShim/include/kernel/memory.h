@@ -142,6 +142,7 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 // mapping and holds exactly `expected`, 1 = it holds other bytes, 2 = not a plain single-mapping range (TryReadBacking
 // decides).
 int                    CompareBacking(uint64_t vaddr, const void* expected, uint64_t size);
+const uint8_t*         TryGetBackingPage(uint64_t page_vaddr) noexcept;
 // The BDA fallback: host view of the direct-memory backing; offset of a guest range held by one mapping.
 uint64_t               GuestBackingBase();
 uint64_t               GuestBackingSize();

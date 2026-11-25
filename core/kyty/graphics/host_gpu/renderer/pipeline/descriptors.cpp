@@ -4017,6 +4017,9 @@ struct TableSet {
 	std::vector<uint8_t>        memo;
 	std::vector<uint64_t>       page_sums;
 	uint64_t                    image_global_epoch = 0;
+	uint64_t                    verified_tick      = ~uint64_t {0};
+	uint64_t                    verified_reg_epoch = ~uint64_t {0};
+	uint64_t                    verified_gc_tick   = ~uint64_t {0};
 	std::vector<ImageId>        member_ids;
 	std::vector<vk::Sampler>    samplers;
 };
@@ -4776,12 +4779,28 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 				}
 				if (pages) table_set->image_global_epoch = cur_global;
 			}
-			const bool ok = pages && m_context.GetTextureCache().TableReplayStage(table_set->member_ids);
+			const uint64_t cur_tick      = m_context.GetCommandScheduler().CurrentTick();
+			const uint64_t cur_reg_epoch = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+			const uint64_t cur_gc_tick   = m_context.GetTextureCache().GcTick();
+			bool           ok            = false;
+			if (pages) {
+				if (table_set->verified_tick == cur_tick &&
+				    table_set->verified_reg_epoch == cur_reg_epoch &&
+				    table_set->verified_gc_tick == cur_gc_tick) {
+					ok = true;
+				} else if (m_context.GetTextureCache().TableReplayStage(table_set->member_ids)) {
+					table_set->verified_tick      = cur_tick;
+					table_set->verified_reg_epoch = cur_reg_epoch;
+					table_set->verified_gc_tick   = cur_gc_tick;
+					ok                            = true;
+				}
+			}
 			if (ok) {
 				table_use             = table_set;
-				prepared.table_epoch  = DrawRepeat::g_image_registry_epoch.load(std::memory_order_acquire);
+				prepared.table_epoch  = cur_reg_epoch;
 				TableStats().hits++;
 			} else {
+				table_set->verified_tick = ~uint64_t {0};
 				TableStats().prep_fail++;
 			}
 		}
@@ -4855,6 +4874,7 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 				table_set->samplers    = prepared.samplers;
 				table_set->memo.assign(prepared.images.size(), 0u);
 				table_set->image_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
+				table_set->verified_tick      = ~uint64_t {0};
 				table_set->page_sums.clear();
 				table_set->member_ids.clear();
 				for (size_t i = 0; i < prepared.images.size(); i++) {
@@ -6245,23 +6265,29 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						scalar_buffer_ranges.push_back(MakeScalarWriteRange(address, size));
 					});
 				}
-				scalar_sorted_ranges.assign(scalar_image_ranges.begin(), scalar_image_ranges.end());
-				scalar_sorted_ranges.insert(scalar_sorted_ranges.end(), scalar_buffer_ranges.begin(),
-				                            scalar_buffer_ranges.end());
-				std::sort(scalar_sorted_ranges.begin(), scalar_sorted_ranges.end(),
-				          [](const ScalarWriteRange& a, const ScalarWriteRange& b) { return a.begin < b.begin; });
-				scalar_sorted_max_end.resize(scalar_sorted_ranges.size());
-				uint64_t max_end = 0;
-				for (size_t i = 0; i < scalar_sorted_ranges.size(); ++i) {
-					max_end                  = std::max(max_end, scalar_sorted_ranges[i].end);
-					scalar_sorted_max_end[i] = max_end;
+				const size_t total_ranges = scalar_image_ranges.size() + scalar_buffer_ranges.size();
+				if (total_ranges > 8u) {
+					scalar_sorted_ranges.assign(scalar_image_ranges.begin(), scalar_image_ranges.end());
+					scalar_sorted_ranges.insert(scalar_sorted_ranges.end(), scalar_buffer_ranges.begin(),
+					                            scalar_buffer_ranges.end());
+					std::sort(scalar_sorted_ranges.begin(), scalar_sorted_ranges.end(),
+					          [](const ScalarWriteRange& a, const ScalarWriteRange& b) { return a.begin < b.begin; });
+					scalar_sorted_max_end.resize(scalar_sorted_ranges.size());
+					uint64_t max_end = 0;
+					for (size_t i = 0; i < scalar_sorted_ranges.size(); ++i) {
+						max_end                  = std::max(max_end, scalar_sorted_ranges[i].end);
+						scalar_sorted_max_end[i] = max_end;
+					}
+				} else {
+					scalar_sorted_ranges.clear();
 				}
 			}
 			if (scalar_image_ranges.empty() && scalar_buffer_ranges.empty()) continue;
+			const bool use_sorted = !scalar_sorted_ranges.empty();
 			for (const auto [address, size]: reads) {
 				if (size == 0 || address > UINT64_MAX - size) EXIT("invalid image overlap range\n");
 				const auto end = address + size;
-				if (!intersects_any(address, end)) continue;
+				if (use_sorted && !intersects_any(address, end)) continue;
 				for (size_t i = 0; i < scalar_image_ranges.size(); ++i) {
 					const auto& range = scalar_image_ranges[i];
 					if (address < range.end && range.begin < end) {

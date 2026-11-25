@@ -3538,9 +3538,11 @@ uint32_t BufferCache::PeekProofFail(const BufferPeek& peek, uint64_t vaddr, uint
 		// W2.2: and the direct ranges as the peek saw them (the mode is checked where the answer is taken)
 		return peek.direct_gen == g_direct_generation.load(std::memory_order_acquire) ? 0 : 1;
 	}
-	auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
-	for (uint32_t i = 0; i < peek.regions; i++) {
-		if (table[peek.region + i].load(std::memory_order_acquire) != peek.epochs[i]) return 2;
+	if (peek.cpu_clock != g_cpu_dirty_region_clock.load(std::memory_order_acquire)) {
+		auto* table = g_cpu_dirty_region_epochs.load(std::memory_order_acquire);
+		for (uint32_t i = 0; i < peek.regions; i++) {
+			if (table[peek.region + i].load(std::memory_order_acquire) != peek.epochs[i]) return 2;
+		}
 	}
 	if (peek.bda || peek.image_global_epoch == DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire)) return 0;
 	return DrawRepeat::ImagePageEpochSum(vaddr, size) == peek.image_sum ? 0 : 3; // the BDA path touches no image
@@ -3620,6 +3622,7 @@ BufferCache::BufferPeek BufferCache::PeekBuffer(uint64_t vaddr, uint64_t size, b
 			return;
 		}
 		static_cast<void>(is_texel_buffer); // a formatted read with no image at the address does nothing more today
+		p.cpu_clock      = g_cpu_dirty_region_clock.load(std::memory_order_acquire);
 		const bool proof = ObtainMemoRegions(vaddr, size, p.region, p.regions, p.epochs);
 		p.image_global_epoch = DrawRepeat::g_image_page_global_epoch.load(std::memory_order_acquire);
 		p.image_sum          = DrawRepeat::ImagePageEpochSum(vaddr, size);

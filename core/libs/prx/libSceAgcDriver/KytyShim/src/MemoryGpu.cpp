@@ -76,9 +76,25 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
 	struct CleanPageSlot {
 		uint64_t       page    = ~uint64_t {0};
 		const uint8_t* backing = nullptr;
+		uint64_t       gen     = 0;
 	};
-	CleanPageSlot  cache[8] {};
-	uint32_t       cache_next = 0;
+	thread_local CleanPageSlot t_cache[64] {};
+	thread_local uint64_t      t_cache_gen       = 1;
+	thread_local uint64_t      t_last_ranges_gen = ~uint64_t {0};
+	thread_local uint64_t      t_last_gpu_clock  = ~uint64_t {0};
+	const uint64_t cur_ranges_gen = RangesGeneration();
+	const uint64_t cur_gpu_clock  = Graphics::g_gpu_dirty_clock.load(std::memory_order_acquire);
+	const bool     direct_empty   = buffers.DirectRangeQuiet(0, 0);
+	if (!direct_empty || cur_ranges_gen != t_last_ranges_gen || cur_gpu_clock != t_last_gpu_clock) {
+		++t_cache_gen;
+		if (t_cache_gen == 0) {
+			for (auto& s: t_cache) s.gen = 0;
+			t_cache_gen = 1;
+		}
+		t_last_ranges_gen = cur_ranges_gen;
+		t_last_gpu_clock  = cur_gpu_clock;
+	}
+	const uint64_t active_gen = t_cache_gen;
 	const uint8_t* log_bytes  = log.bytes.data();
 	for (size_t i = begin; i < log.entries.size(); ++i) {
 		const auto& entry = log.entries[i];
@@ -89,15 +105,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
 		const uint64_t first_page = entry.address & ~uint64_t {0xfff};
 		const uint64_t last_page  = (entry.address + entry.size - 1u) & ~uint64_t {0xfff};
 		if (use_page_cache && first_page == last_page) {
-			const uint8_t* backing = nullptr;
-			for (const auto& s: cache) {
-				if (s.page == first_page) {
-					backing = s.backing;
-					break;
-				}
-			}
-			if (backing != nullptr) {
-				if (std::memcmp(backing + (entry.address & 0xfffu), log_bytes + entry.first, entry.size) != 0) {
+			auto& slot = t_cache[(first_page >> 12u) & 63u];
+			if (slot.gen == active_gen && slot.page == first_page) {
+				if (std::memcmp(slot.backing + (entry.address & 0xfffu), log_bytes + entry.first, entry.size) != 0) {
 					stop = i;
 					return Result::Changed;
 				}
@@ -108,11 +118,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
 			if (IsGpuAddressRange(first_page, 0x1000) &&
 			    !buffers.IsRegionGpuModified(first_page, 0x1000) &&
 			    !buffers.HasPendingReadback(first_page, 0x1000) &&
-			    buffers.DirectRangeQuiet(first_page, 0x1000)) {
-				backing = TryGetBackingPage(first_page);
-				if (backing != nullptr) {
-					cache[cache_next & 7u] = {first_page, backing};
-					++cache_next;
+			    (direct_empty || buffers.DirectRangeQuiet(first_page, 0x1000))) {
+				if (const uint8_t* backing = TryGetBackingPage(first_page); backing != nullptr) {
+					slot = {first_page, backing, active_gen};
 					if (std::memcmp(backing + (entry.address & 0xfffu), log_bytes + entry.first, entry.size) != 0) {
 						stop = i;
 						return Result::Changed;

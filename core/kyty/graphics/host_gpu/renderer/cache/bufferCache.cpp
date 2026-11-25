@@ -1429,9 +1429,16 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// v32c: For a faulting guest thread (caller_eligible && allow_defer) reading/invalidating a device-local
 			// buffer, issue the copy asynchronously via DownloadBufferMemory<true>, flush without waiting on the GPU
 			// thread, and hand the tick back so the faulting guest thread waits off the GPU thread (like ServeImageRead).
+			// v32d: Record hot live write-invalidate windows (after DropDeadRingBytes & AppendRelease) so
+			// IssueEagerReadbacks prefetches them asynchronously at slice boundaries BEFORE the game thread faults.
+			static const bool eager_invalidate = [] {
+				const char* v = std::getenv("KYTY_PERF_EAGER_INVALIDATE");
+				return v == nullptr || v[0] != '0';
+			}();
+			if (eager_invalidate && is_write && size <= 64u * 1024u) RecordHotRead(vaddr);
 			static const bool async_caller_dl = [] {
 				const char* v = std::getenv("KYTY_PERF_ASYNC_CALLER_DL");
-				return v == nullptr || v[0] != '0';
+				return v != nullptr && v[0] == '1';
 			}();
 			if (async_caller_dl && allow_defer && !census.active && buffer.Mapped().empty()) {
 				std::vector<std::pair<uint64_t, uint64_t>> bytes;

@@ -989,6 +989,13 @@ private:
 		uint64_t end;
 		uint64_t tick;
 	};
+	struct RecentTick {
+		uint64_t begin = 0;
+		uint64_t end   = 0;
+		uint64_t tick  = 0;
+	};
+	std::array<RecentTick, 256>   m_recent_write_ticks {};
+	std::array<RecentTick, 256>   m_recent_write_frames {};
 	std::map<uint64_t, WriteTick> m_write_ticks;
 	std::map<uint64_t, WriteTick> m_write_frames; // data ring: game frame + 1 of the newest GPU write of each byte range
 	static void InsertTickRange(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick);

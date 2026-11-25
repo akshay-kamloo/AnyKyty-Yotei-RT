@@ -3823,10 +3823,26 @@ uint32_t EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst)
 	                                 buffer.indirect_search_iterations, UINT32_MAX);
 }
 
+static void EmitLdsLaneSync(EmitterState& state, const IR::MemoryInfo& mem) {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY76_LDS_SYNC");
+		return v != nullptr && v[0] != '\0' && v[0] != '0';
+	}();
+	if (!enabled || state.program.stage != ShaderType::Compute || mem.kind != IR::ResourceKind::Lds ||
+	    state.lane_count != 2 || state.lds_storage_class != spv::StorageClassWorkgroup ||
+	    state.program.info.bvh_stack) {
+		return;
+	}
+	state.builder.AddFunction(
+	    spv::OpControlBarrier, ConstantU32(state, spv::ScopeSubgroup), ConstantU32(state, spv::ScopeWorkgroup),
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);
 	if (op == IR::ValueOpcode::LoadAddressU32 && mem.planning_only) return;
+	EmitLdsLaneSync(ctx.state, mem);
 	const auto buffer_components = IR::BufferComponentCount(op);
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
@@ -3864,6 +3880,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op                = inst.GetOpcode();
 	const auto& mem               = ctx.Memory(inst);
+	EmitLdsLaneSync(ctx.state, mem);
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();

@@ -4378,12 +4378,19 @@ void ReportObtainExact(uint64_t count) {
 // no other reader of the ticks is on (sync timeline, SRT exact reads).
 void BufferCache::NoteWriteTick(uint64_t start, uint64_t end, uint64_t tick) {
 	if (!SyncTimeline::Enabled() && (end <= 0x2002600000ull || start >= 0x2010000000ull)) return;
+	auto& recent = m_recent_write_ticks[((start ^ (end << 24u)) * 0x9e3779b97f4a7c15ull) >> 56u];
+	if (recent.begin == start && recent.end == end && recent.tick == tick) return;
+	recent = {start, end, tick};
 	InsertTickRangeJoined(m_write_ticks, start, end, tick);
 }
 
 void BufferCache::NoteWriteFrame(uint64_t start, uint64_t end) {
 	if (end <= 0x2002600000ull || start >= 0x2010000000ull) return;
-	InsertTickRangeJoined(m_write_frames, start, end, g_ring_exec_data_frame + 1u);
+	const uint64_t frame = g_ring_exec_data_frame + 1u;
+	auto& recent = m_recent_write_frames[((start ^ (end << 24u)) * 0x9e3779b97f4a7c15ull) >> 56u];
+	if (recent.begin == start && recent.end == end && recent.tick == frame) return;
+	recent = {start, end, frame};
+	InsertTickRangeJoined(m_write_frames, start, end, frame);
 }
 
 void BufferCache::InsertTickRangeJoined(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick) {

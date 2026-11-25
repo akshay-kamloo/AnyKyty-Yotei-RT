@@ -1342,7 +1342,7 @@ void BuildBufferSources(RenderContext& renderer, const ShaderRecompiler::IR::Res
 		}
 		if (descriptor.NumRecords() == UINT32_MAX) {
 			b.sentinel = true;
-			size       = std::min({size, uint64_t {256} * 1024 * 1024, sentinel_limit});
+			size       = std::min(std::min(size, uint64_t {256} * 1024 * 1024), sentinel_limit);
 		}
 		uint64_t generation = 0;
 		uint64_t clamped    = 0;
@@ -4898,7 +4898,7 @@ static std::optional<std::pair<uint64_t, uint64_t>> VSharpRange(RenderContext&  
 			const auto& graphics = renderer.GetGraphics();
 			const auto limit = uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
 			                   (graphics.StorageMinAlignment() - 1);
-			size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
+			size = std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit);
 		}
 	}
 	{
@@ -6331,7 +6331,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 		census_part.emplace(DispatchSub::BDesc);
 	floor_scan.reset();
-	m_descriptor_images.resize(image_descriptor_count);
+	if (m_descriptor_images.size() < image_descriptor_count) {
+		m_descriptor_images.resize(image_descriptor_count);
+	}
 	m_descriptor_writes.clear();
 	m_descriptor_writes.reserve(write_count);
 	size_t image_cursor = 0;

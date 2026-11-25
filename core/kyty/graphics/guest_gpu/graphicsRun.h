@@ -241,8 +241,9 @@ private:
 	bool                                  m_slice_progressed = false;
 	// Project 15 N2.2: the resolve thread's tasks for the helper (each task holds a slot of the 320-slot ring, so 512 never
 	// fill), the tasks pushed (resolve thread) and finished (helper), and the counters of PERF resolve_helper.
-	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks {512};
-	Common::SpscQueue<RenderExecutor::ResolveTask> m_tasks2 {512}; // N5.2: the second helper's
+	static constexpr uint32_t kMaxResolveHelpers = 8;
+	uint32_t                  m_resolve_helper_count = 2;
+	std::array<std::unique_ptr<Common::SpscQueue<RenderExecutor::ResolveTask>>, kMaxResolveHelpers> m_task_queues;
 	uint32_t                                       m_deal_turn = 0; // N5.2: the tasks dealt in the current turn
 	uint64_t                                       m_tasks_pushed = 0;
 	std::atomic<uint64_t>                          m_tasks_finished {0};
@@ -260,8 +261,7 @@ private:
 	} m_helper_stats;
 	std::jthread    m_executor;
 	std::jthread    m_resolver;
-	std::jthread    m_resolve_helper;
-	std::jthread    m_resolve_helper2; // N5.2
+	std::vector<std::jthread> m_resolve_helpers;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

@@ -3030,7 +3030,7 @@ struct ObtainMemoEntry {
 	BufferId id {};
 };
 constexpr size_t kObtainMemoWays = 4;
-constexpr size_t kObtainMemoSets = 8192;
+constexpr size_t kObtainMemoSets = 2048;
 struct ObtainMemoSet {
 	ObtainMemoEntry ways[kObtainMemoWays];
 	uint32_t        next_victim = 0;
@@ -3158,7 +3158,7 @@ struct WriteMemoEntry {
 	BufferId id {};
 };
 constexpr size_t kWriteMemoWays = 4;
-constexpr size_t kWriteMemoSets = 8192;
+constexpr size_t kWriteMemoSets = 2048;
 struct WriteMemoSet {
 	WriteMemoEntry ways[kWriteMemoWays];
 	uint32_t       next_victim = 0;
@@ -3983,7 +3983,7 @@ bool BdaMemoOn() {
 	return true; // the only path (walk ABBA 11.11 with the table-set first try: 20.01/20.05 -> 20.25/20.41 fps)
 }
 constexpr size_t kBdaMemoWays = 4;
-constexpr size_t kBdaMemoSets = 4096;
+constexpr size_t kBdaMemoSets = 1024;
 struct BdaMemoSet {
 	ObtainMemoEntry ways[kBdaMemoWays];
 	uint32_t        next_victim = 0;

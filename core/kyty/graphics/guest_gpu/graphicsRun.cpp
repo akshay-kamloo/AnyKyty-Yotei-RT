@@ -656,8 +656,18 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 	m_executor = std::jthread([this] { ExecutionThread(); });
 	m_resolver = std::jthread([this] { ResolveThread(); });
 	RenderExecutor::SetResolveCheckMode(ResolveCheckOn()); // project 15 N2.2: the helper resolves
-	m_resolve_helper = std::jthread([this] { ResolveHelperThread(0); });
-	m_resolve_helper2 = std::jthread([this] { ResolveHelperThread(1); }); // project 15 N5.2: the second helper
+	const uint32_t hw_threads = std::max(std::thread::hardware_concurrency(), 1u);
+	m_resolve_helper_count = std::clamp(hw_threads / 4u, 2u, kMaxResolveHelpers);
+	if (const char* v = std::getenv("KYTY_RESOLVE_HELPERS"); v != nullptr) {
+		const auto n = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+		if (n >= 1u && n <= kMaxResolveHelpers) m_resolve_helper_count = n;
+	}
+	std::fprintf(stderr, "PERF_RESOLVE_HELPERS count=%u hw_threads=%u\n", m_resolve_helper_count, hw_threads);
+	m_resolve_helpers.reserve(m_resolve_helper_count);
+	for (uint32_t i = 0; i < m_resolve_helper_count; i++) {
+		m_task_queues[i] = std::make_unique<Common::SpscQueue<RenderExecutor::ResolveTask>>(512);
+		m_resolve_helpers.emplace_back([this, i] { ResolveHelperThread(i); });
+	}
 	m_thread   = std::jthread(ThreadRun, this);
 	StallWatch::StartIfEnabled(); // KYTY_DIAG_STALL_WATCH (diagnostic)
 }
@@ -1537,7 +1547,7 @@ void GuestGpu::ResolveThread() {
 			// N5.2: with two helpers the tasks go in turns of 8 (warm caches); slots are independent, the execution thread
 			// takes them in order by their phase.
 			task.seq    = m_tasks_pushed; // N5.3: the lead is this minus the operations the execution thread began
-			auto& queue = (m_deal_turn++ & 8u) != 0 ? m_tasks2 : m_tasks;
+			auto& queue = *m_task_queues[((m_deal_turn++) >> 3u) % m_resolve_helper_count];
 			if (!queue.TryPush(task)) EXIT("resolve helper: the task queue is full\n"); // a task holds a slot: never full
 			m_tasks_pushed++;
 			hs.tasks.fetch_add(1, std::memory_order_relaxed);
@@ -1617,14 +1627,14 @@ void GuestGpu::ResolveHelperThread(uint32_t index) {
 	if (lead) ChunkLead::ResolveThreadStart(index == 0, index == 0 ? "helper" : "helper2");
 	auto& executor = m_renderer.GetRenderExecutor();
 	auto& hs       = m_helper_stats;
-	auto& tasks    = index == 0 ? m_tasks : m_tasks2;
+	auto& tasks    = *m_task_queues[index];
 	// N5.3: the helpers build plans (not under the oracle, whose execution thread builds them), for member draws with a
 	// lead of at least 32 operations - never making anyone wait.
 	static const bool helper_plans = [] {
 		const char* oracle = std::getenv("KYTY_CHECK_CHUNKS");
 		return !(oracle != nullptr && oracle[0] == '2');
 	}();
-	constexpr uint64_t PlanMargin = 32;
+	constexpr uint64_t PlanMargin = 16;
 	while (auto task = tasks.Pop()) {
 		if (helper_plans && (task->member || task->dispatch)) {
 			const uint64_t claimed = m_tasks_claimed.load(std::memory_order_relaxed);
@@ -1728,7 +1738,7 @@ void GuestGpu::ClaimResolved(GpuOperation& operation, void (*busy)(void* context
 			auto& s = g_helper_waits[{operation.pass_id, static_cast<uint8_t>(operation.kind)}];
 			s.waits++;
 			s.wait_ms += static_cast<double>(ns) / 1e6;
-			s.queued += m_tasks.SizeApprox() + m_tasks2.SizeApprox();
+			for (uint32_t i = 0; i < m_resolve_helper_count; i++) s.queued += m_task_queues[i]->SizeApprox();
 			HelperWaitsReport();
 		}
 		hs.waits.fetch_add(1, std::memory_order_relaxed);
@@ -1797,13 +1807,11 @@ void GuestGpu::StopExecution() {
 	if (m_resolver.joinable()) {
 		m_resolver.join();
 	}
-	m_tasks.Stop(); // project 15 N2.2: after the resolve thread, the only producer of tasks
-	m_tasks2.Stop();
-	if (m_resolve_helper.joinable()) {
-		m_resolve_helper.join();
+	for (uint32_t i = 0; i < m_resolve_helper_count; i++) {
+		if (m_task_queues[i]) m_task_queues[i]->Stop();
 	}
-	if (m_resolve_helper2.joinable()) {
-		m_resolve_helper2.join();
+	for (auto& helper: m_resolve_helpers) {
+		if (helper.joinable()) helper.join();
 	}
 	m_execution_stop.store(true, std::memory_order_seq_cst);
 	RingExecution();

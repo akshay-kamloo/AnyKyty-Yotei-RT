@@ -4155,7 +4155,7 @@ bool RenderExecutor::ResolveTaskInto(ResolvedDraw& slot, const ResolveTask& task
 			if (slot.ahead.planned) t_helper_plans_made++;
 			if (task.gpu_indirect) t_helper_packets++;
 			const uint32_t row = ShaderRecompiler::IR::t_ahead_scratch_slot - 3u;
-			if ((t_ahead_helper.planned & 255u) == 0 && row < 2u) {
+			if ((t_ahead_helper.planned & 255u) == 0 && row < kMaxResolveHelpers) {
 				g_helper_plan_snap[row].Publish(t_ahead_helper, t_helper_plans_made, t_helper_packets);
 			}
 		}

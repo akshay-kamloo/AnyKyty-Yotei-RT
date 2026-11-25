@@ -74,7 +74,8 @@ struct HelperPlanSnap {
 		for (size_t i = 0; i < Count; i++) v[i].store(values[i], std::memory_order_relaxed);
 	}
 };
-inline HelperPlanSnap g_helper_plan_snap[2];
+inline constexpr uint32_t kMaxResolveHelpers = 8;
+inline HelperPlanSnap g_helper_plan_snap[kMaxResolveHelpers];
 inline thread_local uint64_t t_helper_plans_made = 0, t_helper_packets = 0;
 inline uint32_t   AheadBucket(uint32_t distance) {
     return distance == 0u ? 0u : distance < 16u ? 1u : distance < 64u ? 2u : 3u;

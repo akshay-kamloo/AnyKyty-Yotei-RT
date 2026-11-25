@@ -2028,7 +2028,7 @@ void BufferCache::ActivateDirect(DirectRange& range) {
 bool BufferCache::TryAutoPromoteDirectRange(uint64_t start, uint64_t end, uint64_t hits) {
 	static const bool auto_promote = [] {
 		const char* v = std::getenv("KYTY_DIRECT_AUTO_PROMOTE");
-		return v == nullptr || v[0] != '0';
+		return v != nullptr && v[0] == '1';
 	}();
 	if (!auto_promote || DirectMode() == 0) return false;
 	// Only promote CPU-shared heap ranges (< 0x4000000000); 0x50... shader-hot VRAM stays tracked.

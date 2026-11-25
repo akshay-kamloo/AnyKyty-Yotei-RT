@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/virtualGpuClock.h"
 #include "graphics/host_gpu/renderer/waitSites.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/cache/asyncHostCopy.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/recordPackets.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -84,11 +85,13 @@ struct AsyncSubmitPacket {
 	uint64_t          debug_submit = 0;
 	uint32_t          debug_arg[4] {};
 	uint64_t          debug_arg4 = 0;
+	uint64_t          copy_epoch = 0;
 };
 static_assert(std::is_trivially_copyable_v<AsyncSubmitPacket>);
 
 void AsyncSubmitOnWorker(const void* blob) {
 	auto packet = *static_cast<const AsyncSubmitPacket*>(blob);
+	if (packet.copy_epoch != 0) AsyncHostCopy::WaitForEpoch(packet.copy_epoch);
 	if (GpuTimer::Enabled()) GpuTimer::NoteQueueSubmit(packet.tick); // KYTY_TRACE_GPU_TIMELINE
 	const auto result = QueueSubmitLocked(*packet.graphics, packet.buffer, packet.submit);
 	if (result != vk::Result::eSuccess) {
@@ -585,8 +588,10 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		packet.debug_arg[2] = m_command.m_debug_arg2;
 		packet.debug_arg[3] = m_command.m_debug_arg3;
 		packet.debug_arg4   = m_command.m_debug_arg4;
+		packet.copy_epoch   = AsyncHostCopy::PublishedEpoch();
 		CommandRecorder::EnqueueCall(&AsyncSubmitOnWorker, &packet, sizeof(packet));
 	} else {
+		AsyncHostCopy::WaitForEpoch(AsyncHostCopy::PublishedEpoch());
 		QueueLockGuard lock(graphics.queue_mutex, "commandScheduler.cpp:781");
 		tick = m_master.NextTick();
 		submit.AddSignal(m_master.Handle(), tick);

@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/asyncHostCopy.h"
 #include "graphics/host_gpu/renderer/cache/bufferCacheTrace.h"
 #include "graphics/guest_gpu/chunkLead.h"
 #include "graphics/host_gpu/renderer/cache/ringCensus.h"
@@ -1102,6 +1103,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	AsyncHostCopy::Drain();
 	if (m_maptime.worker.joinable()) {
 		{
 			std::scoped_lock lock(m_maptime.mutex);
@@ -2896,7 +2898,12 @@ void BufferCache::ClaimBatchedUpload(Buffer& buffer, uint64_t vaddr, uint64_t si
 	stats.claimed_bytes.fetch_add(claimed, std::memory_order_relaxed);
 }
 
+#include "graphics/host_gpu/renderer/cache/asyncHostCopyImpl.inl"
+
 void BufferCache::CommitUploadBatch(BatchCommit reason) {
+	if (reason != BatchCommit::ScopeEnd && reason != BatchCommit::Sync) {
+		AsyncHostCopy::Drain();
+	}
 	auto& batch = Batch();
 	if (batch.entries.empty() && batch.regions.empty()) {
 		return;
@@ -2904,6 +2911,77 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 	const bool timed = PerfEnabled();
 	const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	auto&      stats = m_protect_batch_stats;
+	if (AsyncHostCopy::Enabled() && (reason == BatchCommit::ScopeEnd || reason == BatchCommit::Sync) &&
+	    !UploadClobberCheck() && Staging().IsCoherent()) {
+		std::vector<UploadBatchEntry>              entries;
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		entries.swap(batch.entries);
+		ranges.swap(batch.ranges);
+		thread_local std::vector<AsyncHostCopy::CopyItem> job_copies;
+		job_copies.clear();
+		std::vector<vk::BufferCopy> copies;
+		size_t                      fallback_index = entries.size();
+		for (size_t ei = 0; ei < entries.size(); ++ei) {
+			const auto& entry      = entries[ei];
+			auto&       buffer     = *entry.buffer;
+			uint64_t    total_size = 0;
+			copies.clear();
+			for (uint32_t index = 0; index < entry.range_count; ++index) {
+				const auto [address, bytes] = ranges[entry.first_range + index];
+				copies.emplace_back(total_size, buffer.Offset(address), bytes);
+				total_size += bytes;
+			}
+			if (copies.empty()) continue;
+			auto [mapped, base_offset] = Staging().Map(total_size, 4);
+			if (mapped == nullptr) {
+				fallback_index = ei;
+				break;
+			}
+			for (auto& copy: copies) {
+				const auto address = buffer.CpuAddress() + copy.dstOffset;
+				job_copies.push_back({mapped + copy.srcOffset, address, copy.size});
+				copy.srcOffset += base_offset;
+			}
+			Staging().Commit();
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+			RecordBufferUpload(buffer, Staging().Handle(), copies);
+		}
+		uint32_t updated = static_cast<uint32_t>(batch.regions.size());
+		if (!job_copies.empty() || !batch.regions.empty()) {
+			AsyncHostCopy::GetWorker().EnqueueImpl(&m_memory_tracker, job_copies, batch.regions, true);
+		}
+		if (fallback_index < entries.size()) {
+			AsyncHostCopy::Drain();
+			for (size_t ei = fallback_index; ei < entries.size(); ++ei) {
+				const auto& entry      = entries[ei];
+				auto&       buffer     = *entry.buffer;
+				uint64_t    total_size = 0;
+				copies.clear();
+				for (uint32_t index = 0; index < entry.range_count; ++index) {
+					const auto [address, bytes] = ranges[entry.first_range + index];
+					copies.emplace_back(total_size, buffer.Offset(address), bytes);
+					total_size += bytes;
+				}
+				if (auto source = UploadCopies(buffer, copies, total_size); source) {
+					RecordBufferUpload(buffer, source, copies);
+				}
+			}
+		}
+		entries.clear();
+		ranges.clear();
+		if (batch.entries.empty()) batch.entries.swap(entries);
+		if (batch.ranges.empty()) batch.ranges.swap(ranges);
+		stats.commits.fetch_add(1, std::memory_order_relaxed);
+		stats.region_updates.fetch_add(updated, std::memory_order_relaxed);
+		stats.reasons[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+		if (timed) {
+			stats.commit_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                    std::chrono::steady_clock::now() - began)
+			                                                    .count()),
+			                          std::memory_order_relaxed);
+		}
+		return;
+	}
 	struct Recheck {
 		uint64_t address;
 		uint64_t size;
@@ -3032,6 +3110,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (c0_check) m_c0_staged.clear();
 	auto [mapped, base_offset] = Staging().Map(total_size, 4);
 	if (mapped != nullptr) {
+		if (AsyncHostCopy::Enabled() && !c0_check && Staging().IsCoherent()) {
+			thread_local std::vector<AsyncHostCopy::CopyItem> job_copies;
+			thread_local std::vector<RegionManager*>          no_regions;
+			job_copies.clear();
+			no_regions.clear();
+			job_copies.reserve(copies.size());
+			for (auto& copy: copies) {
+				const auto address = buffer.CpuAddress() + copy.dstOffset;
+				job_copies.push_back({mapped + copy.srcOffset, address, copy.size});
+				copy.srcOffset += base_offset;
+			}
+			Staging().Commit();
+			if (!AsyncHostCopy::GetWorker().EnqueueImpl(nullptr, job_copies, no_regions, false)) {
+				for (const auto& item: job_copies) {
+					LibKernel::Memory::ReadGuestPlain(item.dst, item.src_vaddr, item.size);
+				}
+				job_copies.clear();
+			}
+			return Staging().Handle();
+		}
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
 			if (c0_check) {

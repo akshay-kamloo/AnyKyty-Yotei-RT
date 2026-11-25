@@ -1204,7 +1204,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	// changes anything, when its bytes still wait for the GPU: the faulting thread then waits for that tick itself
 	// and sends the request again, which is decided again from scratch. At most CallerMaxDeferrals hand-backs;
 	// after them the request is served as before (the GPU thread waits).
-	constexpr uint32_t CallerMaxDeferrals = 2;
+	constexpr uint32_t CallerMaxDeferrals = 3;
 	const bool         caller_eligible    = InRetriedFault() && !GuestGpu::IsGpuThread();
 	if (caller_eligible) m_caller_stats.eligible.fetch_add(1, std::memory_order_relaxed);
 	// BDA sync epoch: a guest thread's write fault (RenderContext::HandleFault) defers its CPU-dirty
@@ -1423,7 +1423,41 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			// against the page download: 0 different bytes in 4.1 GB). A published neighbour holds the GPU bytes a later
 			// fault would download (a GPU write recorded later marks it again), and a CPU-dirty page is never GPU-modified.
 			const auto [lo, hi] = ReadRange(buffer, vaddr, size);
-			if (lo < hi && lo <= vaddr && vaddr + size <= hi) {
+			const bool has_window = lo < hi && lo <= vaddr && vaddr + size <= hi;
+			const uint64_t dl_lo  = has_window ? lo : vaddr;
+			const uint64_t dl_hi  = has_window ? hi : vaddr + size;
+			// v32c: For a faulting guest thread (caller_eligible && allow_defer) reading/invalidating a device-local
+			// buffer, issue the copy asynchronously via DownloadBufferMemory<true>, flush without waiting on the GPU
+			// thread, and hand the tick back so the faulting guest thread waits off the GPU thread (like ServeImageRead).
+			static const bool async_caller_dl = [] {
+				const char* v = std::getenv("KYTY_PERF_ASYNC_CALLER_DL");
+				return v == nullptr || v[0] != '0';
+			}();
+			if (async_caller_dl && allow_defer && !census.active && buffer.Mapped().empty()) {
+				std::vector<std::pair<uint64_t, uint64_t>> bytes;
+				m_gpu_modified_ranges.ForEachInRange(dl_lo, dl_hi - dl_lo,
+				                                     [&](uint64_t start, uint64_t end) { bytes.emplace_back(start, end); });
+				if (!bytes.empty() && DownloadBufferMemory<true>(buffer, dl_lo, dl_hi - dl_lo)) {
+					auto           done      = std::make_shared<std::atomic_bool>(false);
+					const uint64_t copy_tick = m_scheduler.CurrentTick();
+					m_scheduler.DeferPriorityOperation([done] { done->store(true, std::memory_order_release); });
+					const uint64_t eager_lo = Common::AlignDown(dl_lo, TRACKER_PAGE_SIZE);
+					const uint64_t eager_hi = Common::AlignUp(dl_hi, TRACKER_PAGE_SIZE);
+					m_eager_readbacks.push_back({.start      = eager_lo,
+					                             .end        = eager_hi,
+					                             .generation = 0,
+					                             .tick       = copy_tick,
+					                             .done       = std::move(done),
+					                             .bytes      = std::move(bytes)});
+					if (eager_lo < m_eager_min_start) m_eager_min_start = eager_lo;
+					if (eager_hi > m_eager_max_end) m_eager_max_end = eager_hi;
+					m_scheduler.Flush(CommandScheduler::FlushSite::BufReadback);
+					*defer                = copy_tick;
+					caller_timer.deferred = true;
+					return;
+				}
+			}
+			if (has_window) {
 				PerfCount(PerfKind::SyncRead);
 
 				census.path = RingCensus::Path::WindowDl; // KYTY_TRACE_RING_CENSUS

@@ -4792,7 +4792,8 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 		} else {
 			auto& list = *table_list; // found above
 			if (table_set == nullptr) {
-				if (list.size() >= 16u) {
+				constexpr size_t kMaxTableSetsPerProgram = 64u;
+				if (list.size() >= kMaxTableSetsPerProgram) {
 					// The least recently used set not used in this frame (a stage of this event may hold one).
 					auto oldest = list.end();
 					for (auto it = list.begin(); it != list.end(); ++it) {
@@ -4802,7 +4803,7 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 						list.erase(oldest);
 					}
 				}
-				if (list.size() < 16u) {
+				if (list.size() < kMaxTableSetsPerProgram) {
 					list.push_back(std::make_unique<TableSet>());
 					table_set = list.back().get();
 				}

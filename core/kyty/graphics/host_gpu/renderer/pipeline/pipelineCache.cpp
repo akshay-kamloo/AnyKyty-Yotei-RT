@@ -3128,7 +3128,9 @@ struct TableAsyncStats {
 uint32_t TableAsyncThreads() {
 	static const uint32_t threads = [] {
 		const char* value = std::getenv("KYTY_PERF_TABLE_ASYNC_THREADS");
-		return value == nullptr ? 4u : static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 16));
+		if (value != nullptr && value[0] != '\0') return static_cast<uint32_t>(std::clamp(std::atoi(value), 1, 16));
+		const uint32_t hw = std::thread::hardware_concurrency();
+		return hw > 0u ? std::clamp(hw / 3u, 4u, 12u) : 4u;
 	}();
 	return threads;
 }

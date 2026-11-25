@@ -184,6 +184,7 @@ public:
 	// Batch 1: a direct-range word no listed GPU write may cover (WaitDirectGpuWrites would return at once with no overlay):
 	// read plainly. False: today's wait and overlay.
 	[[nodiscard]] bool DirectWordQuiet(uint64_t vaddr) const { return m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, 4); }
+	[[nodiscard]] bool DirectRangeQuiet(uint64_t vaddr, uint64_t size) const { return m_direct_gpu_writes.empty() || !DirectWritesMayOverlap(vaddr, size); }
 	// P1: the plan's answer for a binding (the same condition and work as ObtainBuffer's plan branch: the proof, Direct's
 	// mode, the touch of a Ready buffer); true when it answered.
 	[[nodiscard]] bool PlanAnswerBinding(PlanBuffer& entry, uint64_t vaddr, uint64_t size);

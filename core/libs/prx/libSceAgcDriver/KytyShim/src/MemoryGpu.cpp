@@ -89,11 +89,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyHookImpl(
 				return Result::NeedsReader;
 			}
 		}
-		for (uint64_t offset = 0; offset < entry.size; offset += 4) {
-			if (!buffers.DirectWordQuiet(entry.address + offset)) {
-				stop = i;
-				return Result::NeedsReader;
-			}
+		if (!buffers.DirectRangeQuiet(entry.address, entry.size)) {
+			stop = i;
+			return Result::NeedsReader;
 		}
 		const int cmp = CompareBacking(entry.address, log.bytes.data() + entry.first, entry.size);
 		if (cmp == 1) {

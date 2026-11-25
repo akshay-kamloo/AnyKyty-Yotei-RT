@@ -2153,7 +2153,43 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 	}
 	g_ring_dead.faults.fetch_add(1, std::memory_order_relaxed);
 	g_ring_dead.dropped_bytes.fetch_add(bytes, std::memory_order_relaxed);
-	if (!live) g_ring_dead.freed.fetch_add(1, std::memory_order_relaxed);
+	if (!live) {
+		g_ring_dead.freed.fetch_add(1, std::memory_order_relaxed);
+		// v32b: Forward-coalesce consecutive all-dead data-ring pages (up to 63 extra pages = 256 KiB total)
+		// and unmark them GPU-modified in one batch, eliminating 63 consecutive SendCommandSync round-trips
+		// from the faulting game thread without falsely marking untouched pages CPU-dirty.
+		constexpr uint64_t kMaxLookaheadPages = 63u;
+		uint64_t           extra_bytes        = 0;
+		uint64_t           batch_end          = page + TRACKER_PAGE_SIZE;
+		for (uint64_t p = 0; p < kMaxLookaheadPages && batch_end < 0x2010000000ull; ++p) {
+			dead.clear();
+			bool page_any  = false;
+			bool page_live = false;
+			m_gpu_modified_ranges.ForEachInRange(batch_end, TRACKER_PAGE_SIZE, [&](uint64_t start, uint64_t end) {
+				page_any              = true;
+				const uint64_t frame1 = QueryTicks(m_write_frames, start, end);
+				if (frame1 != 0 && frame1 + 1u <= write_frame) {
+					dead.emplace_back(start, end);
+				} else {
+					page_live = true;
+				}
+			});
+			if (!page_any || page_live) break;
+			for (const auto& [start, end]: dead) {
+				GpuDirtySubtract(start, end - start);
+				extra_bytes += end - start;
+			}
+			if (UploadClobberCheck()) {
+				m_c0_dead_pages.insert(batch_end);
+				C0Note(batch_end, TRACKER_PAGE_SIZE, C0Event::RingDead);
+			}
+			batch_end += TRACKER_PAGE_SIZE;
+		}
+		if (batch_end > page + TRACKER_PAGE_SIZE) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page + TRACKER_PAGE_SIZE, batch_end - (page + TRACKER_PAGE_SIZE));
+			g_ring_dead.dropped_bytes.fetch_add(extra_bytes, std::memory_order_relaxed);
+		}
+	}
 	if (live && bytes != 0) g_ring_dead.partial.fetch_add(1, std::memory_order_relaxed);
 	static int64_t window_start = 0;
 	const int64_t  now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -5070,7 +5106,7 @@ std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t va
 			const uint64_t kb = std::strtoull(v, nullptr, 10);
 			if (kb >= 4 && kb <= 16384) return kb << 10u;
 		}
-		return uint64_t {2048} << 10u;
+		return uint64_t {256} << 10u;
 	}();
 	const bool     no_bar = buffer.Mapped().empty() || !BarReadsOn();
 	const uint64_t win    = no_bar ? device_local_window : ReadWindowBytes;

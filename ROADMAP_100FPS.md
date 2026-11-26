@@ -67,4 +67,9 @@
 | `v33a` | `3d3222a74c` | `900p` | `37.5 ms` Past / `45 ms` Present | Shared-lock `TableReplayStage`/`TableTexturesReady` |
 | `v34a` | `f2e318dda1` | `900p` | `40.1–42.1 ms` Present (`24–25 FPS`) | `VK_EXT_memory_priority` (1.0/0.5) + dedicated VMA `device_buffer_pool` (`-739 MiB` frag, `-9 ms/f` GPU) |
 | `v34c` | `5cf39b30f8` | `900p` | `41.6–52.4 ms` Present (`19–24 FPS`) | Adaptive BCn mip-cap (`-3.51 GiB` VRAM -> **`68.6%`**) + Recycler `32->256` (`0.0 ms` allocs/frees) |
-| `v35` | *next* | `900p` | *target: `-5 to -8 ms/f`* | **Phase 1**: Widen `GpuPipeline` resolved ring + dynamic P-core `ReserveCores` topology |
+| `v35` | `dd1af51675` | `900p` | `42.1` Past / `64.6` Present (`11.23 us/cmd`) | **Phase 1**: Widen `GpuPipeline` resolved/snapshot rings (`256->2048`) + `ResolveHelper` priority (`resolved_full -65%`, `slot_wait -65%`) |
+| `v36` | `0e18319130` | `900p` | `62.8` Present (`10.14 us/cmd`, `p95 -15.6 ms`) | **Phase 2**: Dedicated `AsyncHostCopy` + `VirtualProtect` worker synced by `copy_epoch` (`protect_batch.commit_ms 161 -> 4 ms/5s`, `-97%`) |
+| `v37b` | `009ac07f90` | `900p` | `60.8` Present (`9.77 us/cmd`, `p95 75.7 ms`) | **Phase 3**: `FastVerify` 8-page backing cache + `ResolveHelper` BDA/SRT `PlanBuffer` (`89.3%` buffer plan hits, `99.6%` adoption, `helper_writes=0`) |
+| `v38b` | `84e3bd27d8` | `900p` | `44.8` Past / `73.9` Present (stale PGO) | **Phase 4**: `TableSet` tick epoch cache + cross-draw 64-entry `FastVerify` cache + `scalar_reads` fast path (exposed stale `yotei-v3.profdata` hash mismatches) |
+| `v39` | `84e3bd27d8` | `900p` | `41.5` Past (`p95 59.3 ms`, `7.01 us/cmd` act) | **Phase 5**: Fresh 6-min PGO profile (`yotei-v5.profdata`, hash mismatches `31+ -> 1`) |
+| `v40b` | `7b4da04f3d` | `900p` | `39.2` Steady (`25.5 FPS`) / `60.3` Present (`8.58-8.76 us/cmd`) | Gate `Commit::OverlapScan` (`commit -38% to -55%`) + keep 4-core GPU P-core reserve (`slot_wait 219 ms`, `resolved_full 280 ms`, `< 7.0 us/cmd` active) |

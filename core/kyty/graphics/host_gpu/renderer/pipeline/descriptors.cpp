@@ -6391,8 +6391,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	const bool packet = RecordPacketsCommit();
 	census_part.emplace(DispatchSub::BScan);
 	std::optional<ChunkLead::FloorTimer> floor_scan(std::in_place, ChunkLead::FpScanTransit); // KYTY_TRACE_PEEK_CENSUS (W0 A13)
-	// Nothing to scan unless a stage reads scalar resources (the scan skips the others anyway).
-	if (has_scalar_reads) {
+	// v40: Commit::OverlapScan is a diagnostic EXIT check (0 hits across all sessions since D6 K5);
+	// gate behind KYTY_CHECK_SCALAR_OVERLAP=1 so steady-state draws skip scanning bound images & written buffers.
+	static const bool check_scalar_overlap = [] {
+		const char* v = std::getenv("KYTY_CHECK_SCALAR_OVERLAP");
+		return v != nullptr && v[0] == '1';
+	}();
+	if (check_scalar_overlap && has_scalar_reads) {
 		DrawCoverage::t_scans++; // (way B W0 Table B)
 		KYTY_PROFILER_BLOCK("Commit::OverlapScan");
 		scan_scalar_reads(report_image_overlap, report_buffer_overlap);

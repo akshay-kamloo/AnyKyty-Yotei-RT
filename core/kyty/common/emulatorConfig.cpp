@@ -355,16 +355,11 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	// 8-core processor reserves, a 6-core one does not).
 	static std::once_flag reserved;
 	std::call_once(reserved, [] {
-		const char*  value       = std::getenv("KYTY_GPU_THREAD_MIN_CORES");
-		const size_t min_cores   = value != nullptr ? std::strtoul(value, nullptr, 10) : 4u;
-		const char*  res_all_env = std::getenv("KYTY_RESERVE_ALL_GPU_CORES");
-		const bool   reserve_all = res_all_env != nullptr && res_all_env[0] == '1';
-		std::array<int, 2> heavy_cpus {cpus[0], cpus[2]};
-		const auto result = reserve_all
-		                        ? Common::Thread::ReserveCores(cpus, min_cores)
-		                        : Common::Thread::ReserveCores(heavy_cpus, min_cores);
-		std::fprintf(stderr, "GPU_THREAD_CPUS execution=%d recording=%d resolve=%d command_processor=%d (reserve=%s): %s\n",
-		             cpus[0], cpus[1], cpus[2], cpus[3], reserve_all ? "4" : "2(exec+resolve)", result.c_str());
+		const char*  value     = std::getenv("KYTY_GPU_THREAD_MIN_CORES");
+		const size_t min_cores = value != nullptr ? std::strtoul(value, nullptr, 10) : 4u;
+		const auto   result    = Common::Thread::ReserveCores(cpus, min_cores);
+		std::fprintf(stderr, "GPU_THREAD_CPUS execution=%d recording=%d resolve=%d command_processor=%d: %s\n", cpus[0],
+		             cpus[1], cpus[2], cpus[3], result.c_str());
 	});
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
 }

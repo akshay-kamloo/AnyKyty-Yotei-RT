@@ -611,9 +611,8 @@ private:
 		std::vector<ImageId> ids;
 		uint64_t             registry = 0;
 		uint64_t             layouts  = 0;
-		uint64_t             ids_hash = 0;
 	};
-	std::array<BindlessLayoutMemo, 32> m_bindless_layout_memos {};
+	std::array<BindlessLayoutMemo, 8> m_bindless_layout_memos {};
 	uint32_t                          m_bindless_layout_memo_next = 0;
 	// A running hash of this draw's image binds (BindImage / BindRenderTarget: id and order), reset by ResetBindings.
 	uint64_t                          m_bound_hash = 0;

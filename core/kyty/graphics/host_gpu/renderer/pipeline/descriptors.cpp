@@ -1810,7 +1810,7 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto bytes  = data.size_bytes();
 	// v19-rebind-dedup-opt: O(1) 64-slot per-tick content-dedup cache for small SRT / shader_data uploads (<= 256 B).
-	if (bytes <= 512u) {
+	if (bytes <= 256u) {
 		struct UploadDedupSlot {
 			uint64_t   tick       = 0;
 			uint64_t   wrap_epoch = 0;
@@ -1818,13 +1818,13 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 			vk::Buffer handle {};
 			uint64_t   offset     = 0;
 			uint32_t   bytes      = 0;
-			uint32_t   words[128] {};
+			uint32_t   words[64] {};
 		};
-		thread_local std::array<UploadDedupSlot, 128> t_upload_dedup {};
+		thread_local std::array<UploadDedupSlot, 64> t_upload_dedup {};
 		const uint64_t tick       = scheduler.CurrentTick();
 		const uint64_t wrap_epoch = buffer.WrapEpoch();
 		const uint64_t hash       = XXH3_64bits(data.data(), bytes);
-		auto&          slot       = t_upload_dedup[static_cast<size_t>(hash & 127u)];
+		auto&          slot       = t_upload_dedup[static_cast<size_t>(hash & 63u)];
 		if (slot.tick == tick && slot.wrap_epoch == wrap_epoch && slot.hash == hash &&
 		    slot.bytes == bytes && slot.handle == buffer.Handle() &&
 		    std::memcmp(slot.words, data.data(), bytes) == 0) {
@@ -2796,7 +2796,7 @@ bool RenderExecutor::PrepareBindlessTable(uint64_t shader_hash, const ShaderReco
 	                                       retranslate || table.region == 0);
 	// Tables over 1 MiB: guest bytes equal in place to those of the last check (whose hash is the translation's) need no
 	// copy and hash: the hash would be the same.
-	const bool in_place_check = check_due && covered >= 4096u;
+	const bool in_place_check = check_due && large;
 	bool       in_place       = false;
 	if (in_place_check && table.region != 0 && covered == table.covered && !fields_changed &&
 	    !retranslate && table.hash != 0u && table.check_hash == table.hash && table.check_words.size() == covered / 4u) {
@@ -2806,7 +2806,7 @@ bool RenderExecutor::PrepareBindlessTable(uint64_t shader_hash, const ShaderReco
 			const auto ns = static_cast<uint64_t>(
 			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - compare_start).count());
 			stats.check_ns += ns;
-			if (large) stats.large_check_ns += ns;
+			stats.large_check_ns += ns;
 		}
 	}
 	if (check_due && !in_place) {
@@ -6432,16 +6432,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// KYTY_BINDLESS: resolved bindless textures are sampled through set 1, read-only.
 		// The layout memo: a list walked before, with no image (un)registered and no walked image's layout changed since,
 		// still has every image in its read-only layout: the walk would do nothing.
-		bool     layout_known = false;
-		uint64_t ids_hash     = 0;
+		bool layout_known = false;
 		if (!descriptors.bindless_images.empty()) {
 			const uint64_t registry = DrawRepeat::g_image_registry_epoch.load(std::memory_order_relaxed);
 			const uint64_t layouts  = g_bindless_layout_epoch.load(std::memory_order_relaxed);
-			ids_hash                = XXH3_64bits(descriptors.bindless_images.data(),
-			                                      descriptors.bindless_images.size() * sizeof(ImageId));
 			for (const auto& memo: m_bindless_layout_memos) {
-				if (memo.registry == registry && memo.layouts == layouts && memo.ids_hash == ids_hash &&
-				    memo.ids.size() == descriptors.bindless_images.size() && memo.ids == descriptors.bindless_images) {
+				if (memo.registry == registry && memo.layouts == layouts && memo.ids == descriptors.bindless_images) {
 					layout_known = true;
 					break;
 				}
@@ -6464,7 +6460,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				auto& memo    = m_bindless_layout_memos[m_bindless_layout_memo_next++ % m_bindless_layout_memos.size()];
 				memo.registry = DrawRepeat::g_image_registry_epoch.load(std::memory_order_relaxed);
 				memo.layouts  = g_bindless_layout_epoch.load(std::memory_order_relaxed);
-				memo.ids_hash = ids_hash;
 				memo.ids.assign(descriptors.bindless_images.begin(), descriptors.bindless_images.end());
 			}
 		}
